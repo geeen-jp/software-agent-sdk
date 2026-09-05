@@ -16,6 +16,7 @@ from acp.schema import (
     LoadSessionResponse,
     ModelInfo,
     NewSessionResponse,
+    SessionConfigOptionBoolean,
     SessionConfigOptionSelect,
     SessionConfigSelectOption,
     SessionModelState,
@@ -27,6 +28,8 @@ from openhands.sdk.agent.acp_agent import (
     ACPSessionConfigError,
     SessionConfigOption,
     _apply_session_config_options,
+    _config_option_current_value,
+    _config_option_values,
     _estimate_cost_from_tokens,
     _extract_token_usage,
     _image_url_to_acp_block,
@@ -2663,7 +2666,10 @@ class TestMaybeSetSessionModel:
         )
 
     @pytest.mark.asyncio
-    async def test_non_codex_agent_skips_protocol_override(self):
+    async def test_claude_agent_uses_protocol_model_override(self):
+        """claude-agent-acp registers ``supports_set_session_model`` so the init
+        path pushes ``acp_model`` via the protocol call as well as session _meta.
+        """
         conn = AsyncMock()
         await _maybe_set_session_model(
             conn,
@@ -2671,7 +2677,10 @@ class TestMaybeSetSessionModel:
             "session-1",
             "claude-opus-4-6",
         )
-        conn.set_session_model.assert_not_called()
+        conn.set_session_model.assert_awaited_once_with(
+            model_id="claude-opus-4-6",
+            session_id="session-1",
+        )
 
     @pytest.mark.asyncio
     async def test_missing_model_skips_protocol_override(self):
@@ -3404,7 +3413,7 @@ class TestACPSessionIdPersistence:
             session_id="stored-sess",
         )
         conn.set_session_mode.assert_awaited_once_with(
-            mode_id="full-access",
+            mode_id="agent-full-access",
             session_id="stored-sess",
         )
 
@@ -3791,6 +3800,36 @@ def _config_option(
     )
 
 
+def _boolean_config_option(option_id: str, current_value: bool) -> SessionConfigOption:
+    """Build one ACP boolean config option sitting at *current_value*."""
+    return SessionConfigOptionBoolean(
+        id=option_id,
+        name=option_id,
+        type="boolean",
+        current_value=current_value,
+    )
+
+
+class TestConfigOptionCurrentValue:
+    def test_boolean_true_normalizes_to_lowercase_string(self):
+        option = _boolean_config_option("fast", True)
+        assert _config_option_current_value(option) == "true"
+
+    def test_boolean_false_normalizes_to_lowercase_string(self):
+        option = _boolean_config_option("fast", False)
+        assert _config_option_current_value(option) == "false"
+
+    def test_config_option_values_maps_boolean_and_select_options(self):
+        options = [
+            _boolean_config_option("fast", True),
+            _config_option("effort", "low", ["low", "medium", "high"]),
+        ]
+        assert _config_option_values(options) == {
+            "fast": "true",
+            "effort": "low",
+        }
+
+
 def _config_update(**options: str) -> ConfigOptionUpdate:
     """Build a ``config_option_update`` notification for a complete state."""
     return ConfigOptionUpdate(
@@ -4048,10 +4087,10 @@ class TestACPSessionConfigOptions:
         conn.set_config_option.assert_not_awaited()
         assert agent._session_id == "sess-new"
 
-    def test_claude_fresh_session_uses_meta_not_set_session_model(self, tmp_path):
-        """claude-agent-acp selects its model via new_session's ``claudeCode``
-        _meta, not the set_session_model protocol call used by other
-        providers.
+    def test_claude_fresh_session_sends_meta_and_protocol_model(self, tmp_path):
+        """claude-agent-acp still sends ``claudeCode`` session _meta and also
+        applies ``acp_model`` via ``set_session_model`` because the provider
+        registry marks it as protocol-capable.
         """
         agent = _make_agent(acp_model="claude-opus-4-6")
         state = _make_state(tmp_path)
@@ -4063,7 +4102,10 @@ class TestACPSessionConfigOptions:
             cwd=str(tmp_path),
             claudeCode={"options": {"model": "claude-opus-4-6"}},
         )
-        conn.set_session_model.assert_not_called()
+        conn.set_session_model.assert_awaited_once_with(
+            model_id="claude-opus-4-6",
+            session_id="sess-new",
+        )
         conn.set_config_option.assert_not_called()
 
     def test_missing_option_fails_init_state_and_cleans_up(self, tmp_path):
