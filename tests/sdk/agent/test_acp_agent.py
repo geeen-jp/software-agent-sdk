@@ -50,6 +50,7 @@ from openhands.sdk.event import (
     MessageEvent,
     SystemPromptEvent,
 )
+from openhands.sdk.event.conversation_error import ConversationErrorEvent
 from openhands.sdk.llm import ImageContent, Message, TextContent
 from openhands.sdk.mcp.config import MCPServer
 from openhands.sdk.skills import KeywordTrigger, Skill
@@ -1211,6 +1212,7 @@ class TestACPAgentCleanup:
     def test_close_terminates_process(self):
         agent = _make_agent()
         mock_process = MagicMock()
+        mock_process.returncode = None
         agent._process = mock_process
         agent._executor = MagicMock()
         agent._conn = None
@@ -1218,6 +1220,19 @@ class TestACPAgentCleanup:
         agent.close()
 
         mock_process.terminate.assert_called_once()
+        mock_process.kill.assert_not_called()
+
+    def test_close_kills_when_terminate_fails(self):
+        agent = _make_agent()
+        mock_process = MagicMock()
+        mock_process.returncode = None
+        mock_process.terminate.side_effect = OSError("already dead")
+        agent._process = mock_process
+        agent._executor = MagicMock()
+        agent._conn = None
+
+        agent.close()
+
         mock_process.kill.assert_called_once()
 
     def test_close_is_idempotent(self):
@@ -1255,6 +1270,100 @@ class TestACPAgentCleanup:
 
         # Should not raise
         agent.close()
+
+    def test_has_live_acp_session_false_before_init(self):
+        agent = _make_agent()
+        assert not agent.has_live_acp_session
+
+    def test_has_live_acp_session_true_when_fully_wired(self):
+        agent = _make_agent()
+        agent._conn = MagicMock()
+        agent._session_id = "sess-1"
+        agent._executor = MagicMock()
+        assert agent.has_live_acp_session
+
+    def test_has_live_acp_session_false_after_close(self):
+        agent = _make_agent()
+        agent._conn = MagicMock()
+        agent._session_id = "sess-1"
+        agent._executor = MagicMock()
+        agent._process = MagicMock()
+        agent.close()
+        assert not agent.has_live_acp_session
+
+    def test_release_runtime_disarms_close_without_tearing_down_conn(self):
+        agent = _make_agent()
+        live_conn = MagicMock()
+        live_executor = MagicMock()
+        agent._conn = live_conn
+        agent._session_id = "sess-1"
+        agent._executor = live_executor
+        agent._process = MagicMock()
+        agent._register_atexit_cleanup()
+
+        agent.release_runtime()
+
+        assert agent._closed is True
+        assert agent._atexit_callback is None
+        assert agent._conn is live_conn
+        assert agent._executor is live_executor
+        live_executor.run_async.reset_mock()
+        agent.close()
+        live_executor.run_async.assert_not_called()
+
+    def test_atexit_cleanup_uses_weakref(self):
+        import gc
+        import weakref
+
+        import openhands.sdk.agent.acp_agent as acp_agent_module
+
+        with patch.object(acp_agent_module.atexit, "register") as register:
+            agent = _make_agent()
+            agent._register_atexit_cleanup()
+            callback = register.call_args.args[0]
+            agent_ref = weakref.ref(agent)
+
+            del agent
+            gc.collect()
+
+        assert agent_ref() is None
+        assert callback() is None
+
+    def test_startup_timeout_bounds_handshake(self, tmp_path):
+        agent = _make_agent(acp_startup_timeout=0.05)
+        state = _make_state(tmp_path)
+        conn = MagicMock()
+
+        async def _hang(*_args, **_kwargs):
+            await asyncio.sleep(10)
+
+        conn.initialize = _hang
+
+        with pytest.raises(TimeoutError, match="ACP startup timed out after 0s"):
+            TestACPSessionIdPersistence._patched_start_acp_server(
+                agent, state, conn=conn
+            )
+
+    def test_init_state_surfaces_startup_timeout(self, tmp_path):
+        agent = _make_agent(acp_startup_timeout=0.05)
+        state = _make_state(tmp_path)
+        conn = MagicMock()
+
+        async def _hang(*_args, **_kwargs):
+            await asyncio.sleep(10)
+
+        conn.initialize = _hang
+        events: list = []
+
+        with TestACPSessionIdPersistence._transport_patches(conn):
+            with pytest.raises(TimeoutError):
+                agent.init_state(state, on_event=events.append)
+
+        errors = [e for e in events if isinstance(e, ConversationErrorEvent)]
+        assert len(errors) == 1
+        assert errors[0].code == "ACPStartupTimeout"
+        assert "ACP startup timed out after 0s" in errors[0].detail
+        assert state.execution_status == ConversationExecutionStatus.ERROR
 
 
 # ---------------------------------------------------------------------------
