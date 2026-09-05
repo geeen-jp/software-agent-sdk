@@ -38,7 +38,8 @@ from acp.schema import (
     ImageContentBlock,
     PromptResponse,
     RequestPermissionResponse,
-    SessionConfigOption,
+    SessionConfigOptionBoolean,
+    SessionConfigOptionSelect,
     SessionModelState,
     TextContentBlock,
     ToolCallProgress,
@@ -70,6 +71,11 @@ from openhands.sdk.tool import Tool  # noqa: TC002
 from openhands.sdk.tool.builtins.finish import FinishAction, FinishObservation
 from openhands.sdk.utils import maybe_truncate
 from openhands.sdk.utils.pydantic_secrets import serialize_secret
+
+
+# Released ACP exposes select/boolean option variants directly, not a generic
+# SessionConfigOption RootModel wrapper.
+SessionConfigOption = SessionConfigOptionSelect | SessionConfigOptionBoolean
 
 
 logger = get_logger(__name__)
@@ -252,13 +258,23 @@ async def _maybe_set_session_model(
         await conn.set_session_model(model_id=acp_model, session_id=session_id)
 
 
+def _config_option_current_value(
+    option: SessionConfigOption,
+) -> str:
+    """Normalize an ACP config option's current value to a string."""
+    value = option.current_value
+    if isinstance(value, bool):
+        return str(value).lower()
+    return str(value)
+
+
 def _config_option_values(
     options: list[SessionConfigOption] | None,
 ) -> dict[str, str]:
     """Map ``option id -> current value`` for a complete config option state."""
     if not options:
         return {}
-    return {option.root.id: option.root.current_value for option in options}
+    return {option.id: _config_option_current_value(option) for option in options}
 
 
 async def _apply_session_config_options(

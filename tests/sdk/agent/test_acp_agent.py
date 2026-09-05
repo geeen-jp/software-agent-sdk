@@ -16,7 +16,6 @@ from acp.schema import (
     LoadSessionResponse,
     ModelInfo,
     NewSessionResponse,
-    SessionConfigOption,
     SessionConfigOptionSelect,
     SessionConfigSelectOption,
     SessionModelState,
@@ -26,6 +25,7 @@ from acp.schema import (
 from openhands.sdk.agent.acp_agent import (
     ACPAgent,
     ACPSessionConfigError,
+    SessionConfigOption,
     _apply_session_config_options,
     _estimate_cost_from_tokens,
     _extract_token_usage,
@@ -48,6 +48,7 @@ from openhands.sdk.event import (
     SystemPromptEvent,
 )
 from openhands.sdk.llm import ImageContent, Message, TextContent
+from openhands.sdk.mcp.config import MCPServer
 from openhands.sdk.skills import KeywordTrigger, Skill
 from openhands.sdk.tool.builtins.finish import FinishAction
 from openhands.sdk.utils.pydantic_secrets import REDACTED_SECRET_VALUE
@@ -76,6 +77,22 @@ def _make_state(tmp_path) -> ConversationState:
 # ---------------------------------------------------------------------------
 # Instantiation
 # ---------------------------------------------------------------------------
+
+
+def test_acp_agent_clean_import_gate():
+    """ACP session config types and ACPAgent import in a clean environment."""
+    from acp.schema import (
+        ConfigOptionUpdate,
+        SessionConfigOptionBoolean,
+        SessionConfigOptionSelect,
+        SessionModelState,
+    )
+
+    assert SessionConfigOptionSelect is not None
+    assert SessionConfigOptionBoolean is not None
+    assert ConfigOptionUpdate is not None
+    assert SessionModelState is not None
+    assert ACPAgent is not None
 
 
 class TestACPAgentInstantiation:
@@ -276,7 +293,7 @@ class TestACPAgentValidation:
     def test_rejects_mcp_config(self, tmp_path):
         agent = ACPAgent(
             acp_command=["echo"],
-            mcp_config={"mcpServers": {"test": {"command": "echo"}}},
+            mcp_config={"test": MCPServer(command="echo")},
         )
         with pytest.raises(NotImplementedError, match="mcp_config"):
             self._init_with_patches(agent, tmp_path)
@@ -3765,14 +3782,12 @@ def _config_option(
 ) -> SessionConfigOption:
     """Build one ACP select config option sitting at *current_value*."""
     choices = values or [current_value]
-    return SessionConfigOption(
-        SessionConfigOptionSelect(
-            id=option_id,
-            name=option_id,
-            type="select",
-            current_value=current_value,
-            options=[SessionConfigSelectOption(name=v, value=v) for v in choices],
-        )
+    return SessionConfigOptionSelect(
+        id=option_id,
+        name=option_id,
+        type="select",
+        current_value=current_value,
+        options=[SessionConfigSelectOption(name=v, value=v) for v in choices],
     )
 
 
@@ -3826,7 +3841,7 @@ def _make_config_conn(
 
     async def _set_config_option(*, config_id: str, session_id: str, value: str):
         for i, option in enumerate(current):
-            if option.root.id == config_id:
+            if option.id == config_id:
                 current[i] = _config_option(config_id, value)
                 return SetSessionConfigOptionResponse(config_options=list(current))
         raise ACPRequestError(-32602, f"unknown config option {config_id}")
@@ -4108,9 +4123,7 @@ class TestACPSessionConfigOptions:
         """A stale load_session id must not skip model/config setup on the
         replacement session created via new_session.
         """
-        agent = _make_agent(
-            acp_model=acp_model, acp_config_options=acp_config_options
-        )
+        agent = _make_agent(acp_model=acp_model, acp_config_options=acp_config_options)
         state = _make_state(tmp_path)
         state.agent_state = {
             **state.agent_state,
