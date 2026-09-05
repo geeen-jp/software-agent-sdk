@@ -8,7 +8,7 @@ import threading
 import uuid
 from concurrent.futures import Future
 from typing import Any, cast
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 from acp.exceptions import RequestError as ACPRequestError
@@ -2821,7 +2821,7 @@ class TestMaybeSetSessionModel:
             "some-custom-acp",
             "session-1",
             "grok-4.6",
-            SessionModelState(
+            model_state=SessionModelState(
                 available_models=[ModelInfo(model_id="grok-4.6", name="Grok 4.6")],
                 current_model_id="auto",
             ),
@@ -3123,6 +3123,137 @@ class TestGeminiSessionModel:
             model_id="gemini-3-flash",
             session_id="session-1",
         )
+
+
+# ---------------------------------------------------------------------------
+# Live session detection + runtime model switching
+# ---------------------------------------------------------------------------
+
+
+class TestHasLiveACPSession:
+    def test_false_before_session(self):
+        agent = _make_agent()
+        assert agent.has_live_acp_session is False
+
+    def test_true_when_fully_wired(self):
+        agent = _make_agent()
+        agent._conn = MagicMock()
+        agent._session_id = "sess-1"
+        agent._executor = MagicMock()
+        assert agent.has_live_acp_session is True
+
+    @pytest.mark.parametrize(
+        "conn,session_id,executor",
+        [
+            (None, "sess-1", "exec"),
+            ("conn", None, "exec"),
+            ("conn", "sess-1", None),
+        ],
+    )
+    def test_false_when_partially_wired(self, conn, session_id, executor):
+        agent = _make_agent()
+        agent._conn = MagicMock() if conn else None
+        agent._session_id = session_id
+        agent._executor = MagicMock() if executor else None
+        assert agent.has_live_acp_session is False
+
+    def test_set_acp_model_raises_when_no_live_session(self):
+        agent = _make_agent()
+        assert not agent.has_live_acp_session
+        with pytest.raises(RuntimeError, match="not initialized"):
+            agent.set_acp_model("gpt-5.4")
+
+
+class TestSetACPModel:
+    @staticmethod
+    def _wire(
+        agent: ACPAgent, agent_name: str, *, via_config_option: bool = False
+    ) -> ACPAgent:
+        conn = MagicMock()
+        conn.set_session_model = AsyncMock()
+        conn.set_config_option = AsyncMock()
+        agent._conn = conn
+        agent._session_id = "sess-1"
+        agent._agent_name = agent_name
+        agent._model_via_config_option = via_config_option
+        executor = MagicMock()
+
+        def _run(coro: Any, timeout: Any = None) -> Any:
+            loop = asyncio.new_event_loop()
+            try:
+                return loop.run_until_complete(coro)
+            finally:
+                loop.close()
+
+        executor.run_async = MagicMock(side_effect=_run)
+        agent._executor = executor
+        return agent
+
+    def test_switches_model_on_live_codex_session(self):
+        agent = self._wire(_make_agent(), "codex-acp")
+        agent.set_acp_model("gpt-5.5")
+        _agent_conn(agent).set_session_model.assert_awaited_once_with(
+            model_id="gpt-5.5", session_id="sess-1"
+        )
+        _agent_conn(agent).set_config_option.assert_not_called()
+        assert agent.llm.model == "gpt-5.5"
+        assert agent.current_model_id == "gpt-5.5"
+
+    def test_switches_codex_via_config_option_single_call(self):
+        agent = self._wire(_make_agent(), "codex-acp", via_config_option=True)
+        agent.set_acp_model("gpt-5.5")
+        _agent_conn(agent).set_config_option.assert_awaited_once_with(
+            config_id="model", value="gpt-5.5", session_id="sess-1"
+        )
+        assert agent.current_model_id == "gpt-5.5"
+
+    def test_switches_codex_via_config_option_splits_reasoning_effort(self):
+        agent = self._wire(_make_agent(), "codex-acp", via_config_option=True)
+        agent.set_acp_model("gpt-5.5/high")
+        _agent_conn(agent).set_config_option.assert_has_awaits(
+            [
+                call(config_id="model", value="gpt-5.5", session_id="sess-1"),
+                call(
+                    config_id="reasoning_effort",
+                    value="high",
+                    session_id="sess-1",
+                ),
+            ]
+        )
+        assert agent.current_model_id == "gpt-5.5/high"
+
+    def test_switch_method_not_found_raises_no_fallback(self):
+        agent = self._wire(_make_agent(), "codex-acp", via_config_option=False)
+        _agent_conn(agent).set_session_model.side_effect = ACPRequestError(
+            code=-32601, message="Method not found"
+        )
+        with pytest.raises(ValueError, match="rejected set_session_model"):
+            agent.set_acp_model("gpt-5.5")
+        assert agent.llm.model != "gpt-5.5"
+        assert agent.current_model_id != "gpt-5.5"
+
+    def test_translates_acp_request_error_to_value_error(self):
+        agent = self._wire(_make_agent(), "codex-acp")
+        _agent_conn(agent).set_session_model.side_effect = ACPRequestError(
+            code=-32601, message="method not found"
+        )
+        with pytest.raises(ValueError, match="rejected set_session_model"):
+            agent.set_acp_model("bogus-model")
+        assert agent.llm.model != "bogus-model"
+
+    def test_propagates_server_internal_error(self):
+        agent = self._wire(_make_agent(), "codex-acp")
+        _agent_conn(agent).set_session_model.side_effect = ACPRequestError(
+            code=-32603, message="internal error"
+        )
+        with pytest.raises(ACPRequestError):
+            agent.set_acp_model("some-model")
+
+    def test_passes_timeout_to_run_async(self):
+        agent = self._wire(_make_agent(acp_prompt_timeout=42.0), "codex-acp")
+        agent.set_acp_model("gpt-5.5")
+        _, kwargs = agent._executor.run_async.call_args
+        assert kwargs["timeout"] == 42.0
 
 
 # ---------------------------------------------------------------------------
@@ -3599,6 +3730,104 @@ class TestACPSessionIdPersistence:
         assert kwargs["cwd"] == str(workspace)
         conn2.new_session.assert_not_awaited()
         assert agent2._session_id == "roundtrip-sess"
+
+
+class TestACPModelStatePersistence(TestACPSessionIdPersistence):
+    def test_resume_without_models_preserves_persisted_model_state(self, tmp_path):
+        from openhands.sdk.utils.async_executor import AsyncExecutor
+
+        agent = _make_agent()
+        state = _make_state(tmp_path)
+        state.agent_state = {
+            **state.agent_state,
+            "acp_session_id": "resumable-sess",
+            "acp_session_cwd": str(tmp_path),
+            "acp_current_model_id": "claude-opus-4-1",
+            "acp_available_models": [
+                {
+                    "model_id": "claude-opus-4-1",
+                    "name": "Opus 4.1",
+                    "description": None,
+                }
+            ],
+        }
+        conn = self._make_conn()
+        load_response = MagicMock(spec=["config_options"])
+        load_response.config_options = None
+        conn.load_session = AsyncMock(return_value=load_response)
+
+        agent._executor = AsyncExecutor()
+        with self._transport_patches(conn):
+            agent.init_state(state, on_event=lambda _: None)
+
+        assert state.agent_state["acp_current_model_id"] == "claude-opus-4-1"
+        assert state.agent_state["acp_available_models"] == [
+            {"model_id": "claude-opus-4-1", "name": "Opus 4.1", "description": None}
+        ]
+
+    def test_resume_rejected_override_with_absent_models_clears_stale_id(
+        self, tmp_path
+    ):
+        from openhands.sdk.utils.async_executor import AsyncExecutor
+
+        agent = _make_agent(acp_model="model-x")
+        state = _make_state(tmp_path)
+        state.agent_state = {
+            **state.agent_state,
+            "acp_session_id": "resumable-sess",
+            "acp_session_cwd": str(tmp_path),
+            "acp_current_model_id": "model-x",
+        }
+        conn = self._make_conn()
+        conn.initialize.return_value.agent_info.name = "codex-acp"
+        conn.initialize.return_value.auth_methods = []
+        load_response = MagicMock(spec=["config_options"])
+        load_response.config_options = None
+        conn.load_session = AsyncMock(return_value=load_response)
+        conn.set_session_model = AsyncMock(
+            side_effect=ACPRequestError(code=-32601, message="method not found")
+        )
+
+        agent._executor = AsyncExecutor()
+        with self._transport_patches(conn):
+            agent.init_state(state, on_event=lambda _: None)
+
+        assert state.agent_state["acp_session_id"] == "resumable-sess"
+        assert agent.current_model_id is None
+        assert agent._model_override_applied is False
+        assert "acp_current_model_id" not in state.agent_state
+
+    def test_fresh_replacement_clears_stale_model_when_new_session_omits_models(
+        self, tmp_path
+    ):
+        from openhands.sdk.utils.async_executor import AsyncExecutor
+
+        agent = _make_agent()
+        state = _make_state(tmp_path)
+        state.agent_state = {
+            **state.agent_state,
+            "acp_session_id": "stale-sess",
+            "acp_session_cwd": str(tmp_path),
+            "acp_current_model_id": "claude-opus-4-1",
+            "acp_available_models": [
+                {"model_id": "claude-opus-4-1", "name": "Opus 4.1"}
+            ],
+        }
+        new_session_response = MagicMock(spec=["session_id", "config_options"])
+        new_session_response.session_id = "replacement-sess"
+        new_session_response.config_options = None
+        conn = self._make_conn(
+            load_exc=ACPRequestError(-32602, "unknown session"),
+        )
+        conn.new_session = AsyncMock(return_value=new_session_response)
+
+        agent._executor = AsyncExecutor()
+        with self._transport_patches(conn):
+            agent.init_state(state, on_event=lambda _: None)
+
+        assert state.agent_state["acp_session_id"] == "replacement-sess"
+        assert "acp_current_model_id" not in state.agent_state
+        assert "acp_available_models" not in state.agent_state
 
 
 class TestACPSecretsEnvInjection:

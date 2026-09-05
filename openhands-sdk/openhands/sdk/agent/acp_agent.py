@@ -26,10 +26,10 @@ import threading
 import time
 import uuid
 import weakref
-from collections.abc import Callable, Collection, Generator
+from collections.abc import Callable, Collection, Generator, Iterable
 from concurrent.futures import Future
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, NamedTuple
+from typing import TYPE_CHECKING, Any, Final, Literal, NamedTuple
 
 from acp.client.connection import ClientSideConnection
 from acp.exceptions import RequestError as ACPRequestError
@@ -59,6 +59,7 @@ from openhands.sdk.agent.acp_file_credentials import (
     create_file_credential_lifecycle,
     write_secret_file,
 )
+from openhands.sdk.agent.acp_models import ACPModelInfo
 from openhands.sdk.agent.base import AgentBase
 from openhands.sdk.conversation.state import ConversationExecutionStatus
 from openhands.sdk.credential import (
@@ -200,6 +201,19 @@ class _PromptDrainResult(NamedTuple):
 # actual model rather than "acp-managed".
 ACP_SENTINEL_USAGE_ID = "acp-managed"
 
+# Last N chars of an ACP session id shown in logs — enough entropy to correlate
+# across log lines for one conversation but not enough to brute-force the full id.
+_SESSION_ID_LOG_SUFFIX_LEN: Final[int] = 8
+
+
+def _fingerprint_session_id(session_id: str | None) -> str:
+    """Render an ACP session id as a short, non-reversible fingerprint."""
+    if session_id is None:
+        return "<none>"
+    if len(session_id) <= _SESSION_ID_LOG_SUFFIX_LEN:
+        return "<short>"
+    return f"...{session_id[-_SESSION_ID_LOG_SUFFIX_LEN:]}"
+
 
 def _make_dummy_llm() -> LLM:
     """Create a dummy LLM that should never be called directly."""
@@ -266,36 +280,174 @@ def _classify_acp_init_error(exc: BaseException) -> str:
     return "ACPInitError"
 
 
+# Session config-option id that selects the model on ACP servers that drive
+# model selection through ``configOptions`` / ``session/set_config_option``
+# (codex-acp, claude-agent-acp 0.44+) rather than the UNSTABLE ``models``
+# capability + ``session/set_model`` (gemini-cli, older codex/claude).
+_MODEL_CONFIG_OPTION_ID = "model"
+_CODEX_REASONING_EFFORTS: Final[frozenset[str]] = frozenset(
+    {"low", "medium", "high", "xhigh"}
+)
+
+
+def _codex_model_config_options(model: str) -> tuple[tuple[str, str], ...]:
+    """Map combined Canvas Codex model IDs to codex-acp config options."""
+    base_model, sep, effort = model.rpartition("/")
+    if sep and base_model and effort in _CODEX_REASONING_EFFORTS:
+        return (
+            (_MODEL_CONFIG_OPTION_ID, base_model),
+            ("reasoning_effort", effort),
+        )
+    return ((_MODEL_CONFIG_OPTION_ID, model),)
+
+
+def _model_config_options(
+    agent_name: str | None,
+    model: str,
+) -> tuple[tuple[str, str], ...]:
+    provider = detect_acp_provider_by_agent_name(agent_name or "")
+    if provider is not None and provider.key == "codex":
+        return _codex_model_config_options(model)
+    return ((_MODEL_CONFIG_OPTION_ID, model),)
+
+
+def _model_config_option(response: Any) -> Any | None:
+    """Return the ``model`` ``configOptions`` select off a session response."""
+    for raw in getattr(response, "config_options", None) or []:
+        opt = getattr(raw, "root", raw)
+        if (
+            getattr(opt, "type", None) == "select"
+            and getattr(opt, "id", None) == _MODEL_CONFIG_OPTION_ID
+        ):
+            return opt
+    return None
+
+
+async def _apply_acp_model(
+    conn: ClientSideConnection,
+    session_id: str,
+    model: str,
+    *,
+    agent_name: str | None = None,
+    via_config_option: bool,
+) -> None:
+    """Apply ``model`` to a live ACP session via the advertised mechanism."""
+    if via_config_option:
+        for config_id, value in _model_config_options(agent_name, model):
+            await conn.set_config_option(
+                config_id=config_id, value=value, session_id=session_id
+            )
+    else:
+        await conn.set_session_model(model_id=model, session_id=session_id)
+
+
+def _usable_models(infos: Iterable[ACPModelInfo]) -> list[ACPModelInfo]:
+    """Drop entries without a usable ``model_id``."""
+    return [info for info in infos if info.model_id]
+
+
+def _extract_session_models(
+    response: Any,
+    *,
+    default_via_config_option: bool = False,
+) -> tuple[str | None, list[ACPModelInfo] | None, bool]:
+    """Extract model state off a session response in a single scan."""
+    if response is None:
+        return None, None, default_via_config_option
+    opt = _model_config_option(response)
+    if opt is not None:
+        current = getattr(opt, "current_value", None)
+        current = current if isinstance(current, str) and current else None
+        options = getattr(opt, "options", None) or []
+        usable = _usable_models(
+            ACPModelInfo.from_protocol(o, id_attr="value") for o in options
+        )
+        return current, usable, True
+    models = getattr(response, "models", None)
+    if models is not None:
+        current = getattr(models, "current_model_id", None)
+        current = current if isinstance(current, str) and current else None
+        raw = getattr(models, "available_models", None) or []
+        usable = _usable_models(ACPModelInfo.from_protocol(m) for m in raw)
+        return current, usable, False
+    return None, None, default_via_config_option
+
+
 async def _maybe_set_session_model(
     conn: ClientSideConnection,
     agent_name: str,
     session_id: str,
     acp_model: str | None,
+    *,
+    via_config_option: bool = False,
     model_state: SessionModelState | None = None,
-) -> None:
-    """Apply a protocol-level session model override when the server supports it.
+) -> bool:
+    """Apply the *initial* session model right after session creation.
 
-    Uses :func:`~openhands.sdk.settings.acp_providers.detect_acp_provider_by_agent_name`
-    to check whether the server supports ``set_session_model``.
-    claude-agent-acp uses session ``_meta`` via
-    :func:`~openhands.sdk.settings.acp_providers.build_session_model_meta` instead.
-
-    Servers outside the provider registry are routed by capability rather than
-    by name: *model_state* is the ``models`` field the ACP server returned from
-    ``new_session`` / ``load_session``, and its presence is the protocol-level
-    signal that the server supports ``session/set_model``.  Registry providers
-    keep their existing routing, and servers that advertise no model state are
-    left untouched.
+    Returns ``True`` only when a model-setting call succeeded.
     """
     if not acp_model:
-        return
+        return False
     provider = detect_acp_provider_by_agent_name(agent_name)
     if provider is not None:
-        if provider.supports_set_session_model:
-            await conn.set_session_model(model_id=acp_model, session_id=session_id)
-        return
+        if not provider.supports_set_session_model:
+            return False
+        try:
+            await _apply_acp_model(
+                conn,
+                session_id,
+                acp_model,
+                agent_name=agent_name,
+                via_config_option=via_config_option,
+            )
+            return True
+        except ACPRequestError as e:
+            logger.warning(
+                "Could not set model %r on ACP server %s (%s); "
+                "the session will use the server default",
+                acp_model,
+                agent_name,
+                e,
+            )
+            return False
     if model_state is not None:
         await conn.set_session_model(model_id=acp_model, session_id=session_id)
+        return True
+    return False
+
+
+async def _reapply_session_model_on_resume(
+    conn: ClientSideConnection,
+    agent_name: str,
+    session_id: str,
+    acp_model: str | None,
+    *,
+    via_config_option: bool,
+) -> bool:
+    """Reapply the persisted model to a *resumed* session."""
+    if not acp_model:
+        return False
+    provider = detect_acp_provider_by_agent_name(agent_name)
+    if provider is not None and not provider.supports_runtime_model_switch:
+        return False
+    try:
+        await _apply_acp_model(
+            conn,
+            session_id,
+            acp_model,
+            agent_name=agent_name,
+            via_config_option=via_config_option,
+        )
+        return True
+    except ACPRequestError as e:
+        logger.warning(
+            "Could not reapply model %r on resumed session %s (%s); the live "
+            "session may run on the server default until the next switch",
+            acp_model,
+            _fingerprint_session_id(session_id),
+            e,
+        )
+        return False
 
 
 def _config_option_current_value(
@@ -1175,6 +1327,11 @@ class ACPAgent(AgentBase):
     _agent_version: str = PrivateAttr(
         default=""
     )  # ACP server version from InitializeResponse
+    _model_via_config_option: bool = PrivateAttr(default=False)
+    _current_model_id: str | None = PrivateAttr(default=None)
+    _available_models: list[ACPModelInfo] | None = PrivateAttr(default=None)
+    _model_override_applied: bool = PrivateAttr(default=False)
+    _resumed_existing_session: bool = PrivateAttr(default=False)
     _restart_session_on_next_turn: bool = PrivateAttr(default=False)
     _file_credential_lifecycles: dict[str, ACPFileCredentialLifecycle] = PrivateAttr(
         default_factory=dict
@@ -1303,6 +1460,33 @@ class ACPAgent(AgentBase):
     def agent_version(self) -> str:
         """Version of the ACP server (from InitializeResponse.agent_info)."""
         return self._agent_version
+
+    @property
+    def current_model_id(self) -> str | None:
+        """The model the ACP server is currently using for this session."""
+        return self._current_model_id
+
+    @property
+    def available_models(self) -> list[ACPModelInfo]:
+        """Models the ACP server offers for this session."""
+        return list(self._available_models or [])
+
+    @property
+    def supports_runtime_model_switch(self) -> bool:
+        """Whether a live, mid-conversation model switch will be attempted."""
+        if self._session_id is None:
+            return False
+        provider = detect_acp_provider_by_agent_name(self._agent_name)
+        return provider is not None and provider.supports_runtime_model_switch
+
+    @property
+    def has_live_acp_session(self) -> bool:
+        """Whether a live ACP session exists to act on right now."""
+        return (
+            self._conn is not None
+            and self._session_id is not None
+            and self._executor is not None
+        )
 
     def get_all_llms(self) -> Generator[LLM]:
         yield self.llm
@@ -1584,15 +1768,6 @@ class ACPAgent(AgentBase):
             "create/load a session"
         )
 
-    @property
-    def has_live_acp_session(self) -> bool:
-        """Whether a live ACP session exists to act on right now."""
-        return (
-            self._conn is not None
-            and self._session_id is not None
-            and self._executor is not None
-        )
-
     # -- Lifecycle ---------------------------------------------------------
 
     def init_state(
@@ -1671,23 +1846,34 @@ class ACPAgent(AgentBase):
         self._register_atexit_cleanup(replace=True)
         self._initialized = True
 
-        # Persist agent info + the ACP session id + its cwd in agent_state.
-        # Keeping these here (rather than on the frozen ACPAgent model) means
-        # ConversationState's existing base_state.json persistence carries
-        # them across agent-server restarts, and ``_start_acp_server`` on the
-        # next launch reads them back to call ``load_session`` instead of
-        # starting from scratch.  We record ``acp_session_cwd`` alongside the
-        # id because ACP servers key their persistence by ``cwd``: resuming
-        # in a different working directory would at best silently miss the
-        # prior session and at worst load a different session that happens to
-        # exist at the new cwd.
-        state.agent_state = {
+        truly_resumed = self._resumed_existing_session
+        new_agent_state = {
             **state.agent_state,
             "acp_agent_name": self._agent_name,
             "acp_agent_version": self._agent_version,
             "acp_session_id": self._session_id,
             "acp_session_cwd": self._working_dir,
+            "acp_supports_runtime_model_switch": self.supports_runtime_model_switch,
+            "acp_model_via_config_option": self._model_via_config_option,
         }
+        override_attempted_not_applied = bool(self.acp_model) and (
+            not self._model_override_applied
+        )
+        if self._current_model_id is not None:
+            new_agent_state["acp_current_model_id"] = self._current_model_id
+        elif (
+            not truly_resumed
+            or self._available_models is not None
+            or override_attempted_not_applied
+        ):
+            new_agent_state.pop("acp_current_model_id", None)
+        if self._available_models is not None:
+            new_agent_state["acp_available_models"] = [
+                m.model_dump() for m in self._available_models
+            ]
+        elif not truly_resumed:
+            new_agent_state.pop("acp_available_models", None)
+        state.agent_state = new_agent_state
 
     def _start_acp_server(self, state: ConversationState) -> None:
         """Start the ACP subprocess and initialize the session."""
@@ -1732,6 +1918,8 @@ class ACPAgent(AgentBase):
 
         working_dir = str(state.workspace.working_dir)
 
+        self._resumed_existing_session = False
+
         # Prior ACP session id — survives agent-server restarts via
         # ConversationState.agent_state (serialized into base_state.json).
         # Its presence is the signal to resume; its absence means fresh start.
@@ -1753,7 +1941,17 @@ class ACPAgent(AgentBase):
             )
             prior_session_id = None
 
-        async def _init() -> tuple[Any, Any, Any, str, str, str]:
+        async def _init() -> tuple[
+            Any,
+            Any,
+            Any,
+            str,
+            str,
+            str,
+            str | None,
+            list[ACPModelInfo] | None,
+            bool,
+        ]:
             # Spawn the subprocess directly so we can install a
             # filtering reader that skips non-JSON-RPC lines some
             # ACP servers (e.g. claude-code-acp v0.1.x) write to
@@ -1858,10 +2056,9 @@ class ACPAgent(AgentBase):
                 # subprocess crash) propagate — there is no working connection to
                 # fall back on, and the outer init_state handler cleans up.
                 session_id: str | None = None
-                # Initial session state reported by load_session / new_session.
-                # Both are used to configure the session identically below.
+                reported_model_id: str | None = None
+                available_models: list[ACPModelInfo] | None = None
                 config_options: list[SessionConfigOption] | None = None
-                model_state: SessionModelState | None = None
                 if prior_session_id is not None:
                     try:
                         load_response = await conn.load_session(
@@ -1870,35 +2067,62 @@ class ACPAgent(AgentBase):
                             mcp_servers=[],
                         )
                         session_id = prior_session_id
+                        self._resumed_existing_session = True
+                        persisted_via_config_option = bool(
+                            state.agent_state.get("acp_model_via_config_option", False)
+                        )
+                        (
+                            reported_model_id,
+                            available_models,
+                            self._model_via_config_option,
+                        ) = _extract_session_models(
+                            load_response,
+                            default_via_config_option=persisted_via_config_option,
+                        )
                         config_options = load_response.config_options
-                        model_state = load_response.models
                         logger.info(
                             "Resumed ACP session: %s (cwd=%s)",
-                            session_id,
+                            _fingerprint_session_id(session_id),
                             working_dir,
                         )
                     except ACPRequestError as e:
                         logger.warning(
                             "ACP load_session(%s) failed (%s); starting fresh session",
-                            prior_session_id,
+                            _fingerprint_session_id(prior_session_id),
                             e,
                         )
 
+                override_applied = False
                 if session_id is None:
-                    # Build _meta content for session options (e.g. model selection).
-                    # Extra kwargs to new_session() become the _meta dict in the
-                    # JSON-RPC request — do NOT wrap in _meta= (that double-nests).
                     session_meta = build_session_model_meta(agent_name, self.acp_model)
                     response = await conn.new_session(cwd=working_dir, **session_meta)
                     session_id = response.session_id
                     config_options = response.config_options
-                    model_state = response.models
-                await _maybe_set_session_model(
-                    conn,
-                    agent_name,
-                    session_id,
-                    self.acp_model,
-                    model_state,
+                    (
+                        reported_model_id,
+                        available_models,
+                        self._model_via_config_option,
+                    ) = _extract_session_models(response)
+                    override_applied = await _maybe_set_session_model(
+                        conn,
+                        agent_name,
+                        session_id,
+                        self.acp_model,
+                        via_config_option=self._model_via_config_option,
+                    )
+                else:
+                    override_applied = await _reapply_session_model_on_resume(
+                        conn,
+                        agent_name,
+                        session_id,
+                        self.acp_model,
+                        via_config_option=self._model_via_config_option,
+                    )
+
+                current_model_id = (
+                    self.acp_model
+                    if (self.acp_model and override_applied)
+                    else reported_model_id
                 )
 
                 # Resolve the permission mode.  Known providers each have their
@@ -1934,6 +2158,9 @@ class ACPAgent(AgentBase):
                     session_id,
                     agent_name,
                     agent_version,
+                    current_model_id,
+                    available_models,
+                    override_applied,
                 )
             except BaseException:
                 # The subprocess is already running, but its handles have not
@@ -1967,6 +2194,9 @@ class ACPAgent(AgentBase):
                 self._session_id,
                 self._agent_name,
                 self._agent_version,
+                self._current_model_id,
+                self._available_models,
+                self._model_override_applied,
             ) = self._executor.run_async(_init, timeout=self.acp_startup_timeout)
         except TimeoutError:
             raise TimeoutError(self._startup_timeout_message()) from None
@@ -2865,6 +3095,59 @@ class ACPAgent(AgentBase):
 
         with client._fork_lock:
             return self._executor.run_async(_fork_and_prompt)
+
+    def set_acp_model(self, model: str) -> None:
+        """Switch the model on the running ACP session (mid-conversation)."""
+        if not model or not model.strip():
+            raise ValueError("model must be a non-empty string")
+        if not self.has_live_acp_session:
+            raise RuntimeError(
+                "ACP session is not initialized; the model can only be switched "
+                "after the conversation has started (first run())."
+            )
+        provider = detect_acp_provider_by_agent_name(self._agent_name)
+        if provider is not None and not provider.supports_runtime_model_switch:
+            raise ValueError(
+                f"ACP provider '{provider.key}' does not support runtime model "
+                "switching."
+            )
+        assert self._conn is not None
+        assert self._session_id is not None
+        conn = self._conn
+        session_id = self._session_id
+        try:
+            self._executor.run_async(
+                _apply_acp_model(
+                    conn,
+                    session_id,
+                    model,
+                    agent_name=self._agent_name,
+                    via_config_option=self._model_via_config_option,
+                ),
+                timeout=self.acp_prompt_timeout,
+            )
+        except ACPRequestError as e:
+            if e.code in _RETRIABLE_SERVER_ERROR_CODES:
+                raise
+            method = (
+                "set_config_option(model)"
+                if self._model_via_config_option
+                else "set_session_model"
+            )
+            raise ValueError(
+                f"ACP server rejected {method}(model={model!r}): {e}"
+            ) from e
+        self.llm.model = model
+        self.llm.metrics.model_name = model
+        if self.llm.metrics.accumulated_token_usage is not None:
+            self.llm.metrics.accumulated_token_usage.model = model
+        self._current_model_id = model
+        logger.info(
+            "Switched ACP session model to %s (provider=%s, session=%s)",
+            model,
+            provider.key if provider else "unknown",
+            _fingerprint_session_id(self._session_id),
+        )
 
     def close(self) -> None:
         """Terminate the ACP subprocess and clean up resources."""
