@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import atexit
 import contextlib
+import inspect
 import json
 import os
 import threading
@@ -26,8 +27,9 @@ import time
 import uuid
 import weakref
 from collections.abc import Callable, Collection, Generator
+from concurrent.futures import Future
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple
 
 from acp.client.connection import ClientSideConnection
 from acp.exceptions import RequestError as ACPRequestError
@@ -171,11 +173,24 @@ _ACP_INIT_ABORT_TIMEOUT: float = float(os.environ.get("ACP_INIT_ABORT_TIMEOUT", 
 # well below the ~20 min runtime-api kill threshold.
 _ACTIVITY_SIGNAL_INTERVAL: float = 30.0
 
+# After a timeout/cancellation, wait briefly for the ACP prompt task to react
+# to session/cancel before rewiring callbacks for the next turn.
+_ACP_CANCEL_DRAIN_TIMEOUT: float = float(
+    os.environ.get("ACP_CANCEL_DRAIN_TIMEOUT", "2.0")
+)
+
 # ACP tool-call statuses that represent a terminal outcome.  Non-terminal
 # statuses (``pending``, ``in_progress``) mean the call is still in flight
 # and, if the turn aborts before it reaches a terminal state, the live-
 # emitted event on state.events will otherwise be orphaned forever.
 _TERMINAL_TOOL_CALL_STATUSES: frozenset[str] = frozenset({"completed", "failed"})
+
+
+class _PromptDrainResult(NamedTuple):
+    drained: bool
+    completed: bool
+    response: PromptResponse | None
+    error: BaseException | None
 
 
 # Stable identifier stamped onto the sentinel LLM so downstream code
@@ -734,6 +749,11 @@ class _OpenHandsACPBridge:
         # ACPAgent.step() to keep the agent-server's idle timer alive.
         self.on_activity: Any = None  # Callable[[], None] | None
         self._last_activity_signal: float = float("-inf")
+        # Monotonic timestamp of the most recent ``session_update``. Unlike the
+        # throttled ``_last_activity_signal``, updated on *every* update so the
+        # prompt idle-timeout watchdog sees real progress. Armed per turn via
+        # ``arm_activity_clock``.
+        self._last_activity_monotonic: float = float("-inf")
         # Telemetry state from UsageUpdate (persists across turns)
         self._last_cost: float = 0.0  # last cumulative cost seen
         self._last_cost_by_session: dict[str, float] = {}
@@ -765,6 +785,14 @@ class _OpenHandsACPBridge:
         # etc.) is intentionally NOT cleared — it accumulates across turns.
         # Session config option state is likewise session-scoped, not per-turn.
 
+    def arm_activity_clock(self) -> None:
+        """Mark "now" as the last activity for the idle-timeout watchdog."""
+        self._last_activity_monotonic = time.monotonic()
+
+    def seconds_since_last_activity(self) -> float:
+        """Seconds since the last ``session_update`` (or ``arm_activity_clock``)."""
+        return time.monotonic() - self._last_activity_monotonic
+
     def prepare_usage_sync(self, session_id: str) -> asyncio.Event:
         """Prepare per-turn UsageUpdate synchronization for a session."""
         event = asyncio.Event()
@@ -794,6 +822,7 @@ class _OpenHandsACPBridge:
         **kwargs: Any,  # noqa: ARG002
     ) -> None:
         logger.debug("ACP session_update: type=%s", type(update).__name__)
+        self._last_activity_monotonic = time.monotonic()
 
         # Route fork session updates to the fork accumulator
         if self._fork_session_id is not None and session_id == self._fork_session_id:
@@ -1963,6 +1992,15 @@ class ACPAgent(AgentBase):
         self._client.on_token = on_token
         self._client.on_event = on_event
         self._client.on_activity = self._on_activity
+        self._client.arm_activity_clock()
+
+    def _clear_turn_callbacks(self) -> None:
+        """Unwire per-turn bridge callbacks so trailing updates are no-ops."""
+        if self._client is None:
+            return
+        self._client.on_event = None
+        self._client.on_token = None
+        self._client.on_activity = None
 
     def _cancel_inflight_tool_calls(self) -> None:
         """Emit a terminal ``failed`` ACPToolCallEvent for every tool call
@@ -1982,6 +2020,7 @@ class ACPAgent(AgentBase):
         set (e.g. during tests exercising the bridge in isolation).
         """
         on_event = self._client.on_event
+        self._clear_turn_callbacks()
         if on_event is None:
             return
         for tc in self._client.accumulated_tool_calls:
@@ -2029,6 +2068,511 @@ class ACPAgent(AgentBase):
         if not blocks:
             return None
         return blocks
+
+    async def _do_acp_prompt(
+        self, prompt_blocks: list[TextContentBlock | ImageContentBlock]
+    ) -> PromptResponse | None:
+        """One ACP ``conn.prompt`` round-trip + UsageUpdate sync on the portal loop."""
+        if self._conn is None or self._session_id is None:
+            msg = "ACPAgent has no live ACP session; call init_state() first"
+            raise RuntimeError(msg)
+        session_id = self._session_id
+        usage_sync = self._client.prepare_usage_sync(session_id)
+        response = await self._conn.prompt(prompt_blocks, session_id)
+        if self._client.get_turn_usage_update(session_id) is None:
+            try:
+                await asyncio.wait_for(usage_sync.wait(), timeout=_USAGE_UPDATE_TIMEOUT)
+            except TimeoutError:
+                logger.warning(
+                    "UsageUpdate not received within %.1fs for session %s",
+                    _USAGE_UPDATE_TIMEOUT,
+                    session_id,
+                )
+        return response
+
+    def _idle_timeout_message(self) -> str:
+        return (
+            f"ACP prompt timed out after {self.acp_prompt_timeout:.0f}s "
+            "with no activity from the ACP server"
+        )
+
+    async def _await_with_idle_deadline(
+        self,
+        awaitable: Any,
+        *,
+        cancel_on_exit: bool,
+    ) -> PromptResponse | None:
+        """Await *awaitable*, aborting only after a stretch of inactivity."""
+        idle_limit = self.acp_prompt_timeout
+        fut = asyncio.ensure_future(awaitable)
+        try:
+            while True:
+                remaining = idle_limit - self._client.seconds_since_last_activity()
+                if remaining <= 0:
+                    raise TimeoutError(self._idle_timeout_message())
+                await asyncio.wait({fut}, timeout=remaining)
+                if fut.done():
+                    return fut.result()
+                if self._client.seconds_since_last_activity() >= idle_limit:
+                    raise TimeoutError(self._idle_timeout_message())
+        finally:
+            if cancel_on_exit and not fut.done():
+                fut.cancel()
+
+    async def _await_prompt_response_with_timeout(
+        self,
+        prompt_future: Future[PromptResponse | None],
+    ) -> PromptResponse | None:
+        return await self._await_with_idle_deadline(
+            asyncio.wrap_future(prompt_future), cancel_on_exit=False
+        )
+
+    @staticmethod
+    def _prompt_response_was_cancelled(response: PromptResponse | None) -> bool:
+        return response is not None and response.stop_reason == "cancelled"
+
+    def _finalize_successful_turn(
+        self,
+        response: PromptResponse | None,
+        elapsed: float,
+        state: ConversationState,
+        on_event: ConversationCallbackType,
+    ) -> None:
+        session_id = self._session_id or ""
+        usage_update = self._client.pop_turn_usage_update(session_id)
+        self._record_usage(
+            response,
+            session_id,
+            elapsed=elapsed,
+            usage_update=usage_update,
+        )
+
+        response_text = "".join(self._client.accumulated_text)
+        thought_text = "".join(self._client.accumulated_thoughts)
+        if not response_text:
+            response_text = "(No response from ACP server)"
+
+        finish_action = FinishAction(message=response_text)
+        tc_id = str(uuid.uuid4())
+        action_event = ActionEvent(
+            source="agent",
+            thought=[],
+            reasoning_content=thought_text or None,
+            action=finish_action,
+            tool_name="finish",
+            tool_call_id=tc_id,
+            tool_call=MessageToolCall(
+                id=tc_id,
+                name="finish",
+                arguments=json.dumps({"message": response_text}),
+                origin="completion",
+            ),
+            llm_response_id=str(uuid.uuid4()),
+        )
+        on_event(action_event)
+        on_event(
+            ObservationEvent(
+                observation=FinishObservation.from_text(text=response_text),
+                action_id=action_event.id,
+                tool_name="finish",
+                tool_call_id=tc_id,
+            )
+        )
+        state.execution_status = ConversationExecutionStatus.FINISHED
+
+    def _emit_turn_timeout(
+        self,
+        elapsed: float,
+        state: ConversationState,
+        on_event: ConversationCallbackType,
+    ) -> None:
+        logger.error(
+            "ACP prompt timed out after %.1fs with no activity for the last "
+            "%.0fs. The ACP server may have stalled or failed to send the "
+            "JSON-RPC response. Accumulated %d text chunks, %d tool calls.",
+            elapsed,
+            self.acp_prompt_timeout,
+            len(self._client.accumulated_text),
+            len(self._client.accumulated_tool_calls),
+        )
+        error_message = Message(
+            role="assistant",
+            content=[
+                TextContent(
+                    text=(
+                        "ACP prompt timed out after "
+                        f"{self.acp_prompt_timeout:.0f}s with no activity from "
+                        "the agent. The agent may have stalled, or it may have "
+                        "completed its work but the response was not received."
+                    )
+                )
+            ],
+        )
+        self._cancel_inflight_tool_calls()
+        on_event(MessageEvent(source="agent", llm_message=error_message))
+        state.execution_status = ConversationExecutionStatus.ERROR
+
+    def _emit_turn_error(
+        self,
+        exc: BaseException,
+        state: ConversationState,
+        on_event: ConversationCallbackType,
+    ) -> None:
+        error_str = str(exc)
+        logger.error("ACP prompt failed: %s", exc, exc_info=True)
+        self._cancel_inflight_tool_calls()
+        on_event(
+            MessageEvent(
+                source="agent",
+                llm_message=Message(
+                    role="assistant",
+                    content=[TextContent(text=f"ACP error: {error_str}")],
+                ),
+            )
+        )
+        is_aup = (
+            "usage policy" in error_str.lower() or "content policy" in error_str.lower()
+        )
+        on_event(
+            ConversationErrorEvent(
+                source="agent",
+                code="UsagePolicyRefusal" if is_aup else "ACPPromptError",
+                detail=error_str[:500],
+            )
+        )
+        state.execution_status = ConversationExecutionStatus.ERROR
+
+    def _finalize_successful_turn_guarded(
+        self,
+        response: PromptResponse | None,
+        elapsed: float,
+        state: ConversationState,
+        on_event: ConversationCallbackType,
+    ) -> None:
+        try:
+            self._finalize_successful_turn(response, elapsed, state, on_event)
+        except CredentialBindingError as exc:
+            self._emit_turn_error(exc, state, on_event)
+            self._restart_session_on_next_turn = True
+            raise
+
+    def _handle_cancelled_cleanup_interruption(
+        self,
+        prompt_future: Future[PromptResponse | None] | None,
+        elapsed: float,
+        state: ConversationState,
+        on_event: ConversationCallbackType,
+    ) -> None:
+        if prompt_future is not None and prompt_future.done():
+            try:
+                response = prompt_future.result()
+            except BaseException:
+                self._cancel_inflight_tool_calls()
+                self._restart_session_on_next_turn = True
+            else:
+                if self._prompt_response_was_cancelled(response):
+                    self._cancel_inflight_tool_calls()
+                    self._restart_session_on_next_turn = True
+                else:
+                    self._finalize_successful_turn_guarded(
+                        response,
+                        elapsed,
+                        state,
+                        on_event,
+                    )
+            return
+
+        self._cancel_inflight_tool_calls()
+        if prompt_future is not None:
+            self._restart_session_on_next_turn = True
+
+    async def _arequest_session_cancel(self) -> None:
+        if self._conn is None or self._executor is None or self._session_id is None:
+            return
+        conn = self._conn
+        session_id = self._session_id
+
+        async def _cancel() -> None:
+            result = conn.cancel(session_id)
+            if inspect.isawaitable(result):
+                await result
+
+        try:
+            future = self._executor.portal.start_task_soon(_cancel)
+            await asyncio.wait_for(
+                asyncio.shield(asyncio.wrap_future(future)),
+                timeout=_ACP_CANCEL_DRAIN_TIMEOUT,
+            )
+        except TimeoutError:
+            logger.warning(
+                "Timed out sending ACP session cancel; restarting ACP session"
+            )
+            self._restart_session_on_next_turn = True
+        except Exception:
+            logger.warning("Failed to send ACP session cancel", exc_info=True)
+
+    async def _drain_cancelled_prompt(
+        self,
+        future: Future[PromptResponse | None] | None,
+    ) -> _PromptDrainResult:
+        if future is None:
+            return _PromptDrainResult(
+                drained=True, completed=False, response=None, error=None
+            )
+        if future.cancelled():
+            return _PromptDrainResult(
+                drained=True, completed=False, response=None, error=None
+            )
+        if future.done():
+            try:
+                return _PromptDrainResult(
+                    drained=True,
+                    completed=True,
+                    response=future.result(),
+                    error=None,
+                )
+            except BaseException as exc:
+                return _PromptDrainResult(
+                    drained=True, completed=True, response=None, error=exc
+                )
+        try:
+            response = await asyncio.wait_for(
+                asyncio.shield(asyncio.wrap_future(future)),
+                timeout=_ACP_CANCEL_DRAIN_TIMEOUT,
+            )
+            return _PromptDrainResult(
+                drained=True, completed=True, response=response, error=None
+            )
+        except asyncio.CancelledError:
+            if future.cancelled():
+                return _PromptDrainResult(
+                    drained=False, completed=False, response=None, error=None
+                )
+            raise
+        except TimeoutError:
+            logger.warning(
+                "Timed out waiting for cancelled ACP prompt to drain; "
+                "the ACP session will be restarted before the next turn"
+            )
+            return _PromptDrainResult(
+                drained=False, completed=False, response=None, error=None
+            )
+        except BaseException as exc:
+            return _PromptDrainResult(
+                drained=future.done(), completed=True, response=None, error=exc
+            )
+
+    def _restart_session_after_drain_timeout(
+        self,
+        state: ConversationState,
+        on_event: ConversationCallbackType,
+    ) -> None:
+        logger.warning("Restarting ACP session after cancelled prompt drain timeout")
+        self._clear_turn_callbacks()
+        self._cleanup()
+        self._initialized = False
+        self.init_state(state, on_event=on_event)
+        self._restart_session_on_next_turn = False
+
+    async def _arestart_session_after_drain_timeout(
+        self,
+        state: ConversationState,
+        on_event: ConversationCallbackType,
+    ) -> None:
+        await asyncio.to_thread(
+            self._restart_session_after_drain_timeout, state, on_event
+        )
+
+    def _request_session_cancel(self) -> None:
+        if self._conn is None or self._executor is None or self._session_id is None:
+            return
+        conn = self._conn
+        session_id = self._session_id
+
+        async def _cancel() -> None:
+            result = conn.cancel(session_id)
+            if inspect.isawaitable(result):
+                await result
+
+        try:
+            self._executor.portal.start_task_soon(_cancel)
+        except Exception:
+            logger.warning("Failed to send ACP session cancel", exc_info=True)
+
+    async def _flush_file_credentials(self) -> None:
+        await asyncio.to_thread(self._flush_file_credentials_blocking)
+
+    @observe(name="acp_agent.astep", ignore_inputs=["conversation", "on_event"])
+    async def astep(
+        self,
+        conversation: LocalConversation,
+        on_event: ConversationCallbackType,
+        on_token: ConversationTokenCallbackType | None = None,
+        prompt_message: MessageEvent | None = None,
+    ) -> None:
+        """Native-async variant of :meth:`step`.
+
+        Schedules the ACP ``conn.prompt`` round-trip on the portal loop and
+        awaits the result on the caller's event loop so post-prompt callbacks
+        and state updates stay on ``LocalConversation.arun``'s task.
+        """
+        state = conversation.state
+
+        if self._restart_session_on_next_turn:
+            await self._arestart_session_after_drain_timeout(state, on_event)
+
+        prompt_blocks: list[TextContentBlock | ImageContentBlock] | None = None
+        if prompt_message is not None:
+            prompt_blocks = self._build_acp_prompt(prompt_message)
+        else:
+            for event in reversed(list(state.events)):
+                if isinstance(event, MessageEvent) and event.source == "user":
+                    prompt_blocks = self._build_acp_prompt(event)
+                    if prompt_blocks:
+                        break
+        if prompt_blocks is None:
+            logger.warning("No user message found; finishing conversation")
+            state.execution_status = ConversationExecutionStatus.FINISHED
+            return
+
+        self._reset_client_for_turn(on_token, on_event)
+
+        t0 = time.monotonic()
+        prompt_future: Future[PromptResponse | None] | None = None
+        try:
+            logger.info(
+                "Sending ACP prompt (idle_timeout=%.0fs, blocks=%d, async)",
+                self.acp_prompt_timeout,
+                len(prompt_blocks),
+            )
+            portal = self._executor.portal
+
+            response: PromptResponse | None = None
+            max_retries = _ACP_PROMPT_MAX_RETRIES
+            for attempt in range(max_retries + 1):
+                try:
+                    current_prompt_future: Future[PromptResponse | None] = (
+                        portal.start_task_soon(
+                            self._do_acp_prompt,
+                            prompt_blocks,
+                        )
+                    )
+                    prompt_future = current_prompt_future
+                    response = await self._await_prompt_response_with_timeout(
+                        current_prompt_future
+                    )
+                    break
+                except TimeoutError:
+                    raise
+                except _RETRIABLE_CONNECTION_ERRORS as e:
+                    if attempt < max_retries:
+                        delay = _ACP_PROMPT_RETRY_DELAYS[
+                            min(attempt, len(_ACP_PROMPT_RETRY_DELAYS) - 1)
+                        ]
+                        logger.warning(
+                            "ACP prompt failed with retriable error "
+                            "(attempt %d/%d), retrying in %.0fs: %s",
+                            attempt + 1,
+                            max_retries + 1,
+                            delay,
+                            e,
+                        )
+                        await asyncio.sleep(delay)
+                        self._cancel_inflight_tool_calls()
+                        self._reset_client_for_turn(on_token, on_event)
+                    else:
+                        raise
+                except ACPRequestError as e:
+                    if (
+                        e.code in _RETRIABLE_SERVER_ERROR_CODES
+                        and attempt < max_retries
+                    ):
+                        delay = _ACP_PROMPT_RETRY_DELAYS[
+                            min(attempt, len(_ACP_PROMPT_RETRY_DELAYS) - 1)
+                        ]
+                        logger.warning(
+                            "ACP prompt failed with server error "
+                            "(attempt %d/%d), retrying in %.0fs: [%d] %s",
+                            attempt + 1,
+                            max_retries + 1,
+                            delay,
+                            e.code,
+                            e,
+                        )
+                        await asyncio.sleep(delay)
+                        self._cancel_inflight_tool_calls()
+                        self._reset_client_for_turn(on_token, on_event)
+                    else:
+                        raise
+
+            elapsed = time.monotonic() - t0
+            logger.info("ACP prompt returned in %.1fs (async)", elapsed)
+            with state:
+                self._finalize_successful_turn(response, elapsed, state, on_event)
+        except asyncio.CancelledError:
+            try:
+                await self._arequest_session_cancel()
+                drain_result = await self._drain_cancelled_prompt(prompt_future)
+            except asyncio.CancelledError:
+                with state:
+                    elapsed = time.monotonic() - t0
+                    self._handle_cancelled_cleanup_interruption(
+                        prompt_future, elapsed, state, on_event
+                    )
+                raise
+            with state:
+                elapsed = time.monotonic() - t0
+                if drain_result.completed and drain_result.error is None:
+                    if self._prompt_response_was_cancelled(drain_result.response):
+                        self._cancel_inflight_tool_calls()
+                        self._restart_session_on_next_turn = True
+                    else:
+                        self._finalize_successful_turn_guarded(
+                            drain_result.response, elapsed, state, on_event
+                        )
+                    raise
+                if drain_result.completed and drain_result.error is not None:
+                    self._cancel_inflight_tool_calls()
+                    self._restart_session_on_next_turn = True
+                    raise
+                self._cancel_inflight_tool_calls()
+            if not drain_result.drained:
+                self._restart_session_on_next_turn = True
+            raise
+        except TimeoutError:
+            try:
+                await self._arequest_session_cancel()
+                drain_result = await self._drain_cancelled_prompt(prompt_future)
+            except asyncio.CancelledError:
+                with state:
+                    elapsed = time.monotonic() - t0
+                    self._handle_cancelled_cleanup_interruption(
+                        prompt_future, elapsed, state, on_event
+                    )
+                raise
+            with state:
+                elapsed = time.monotonic() - t0
+                if drain_result.completed and drain_result.error is None:
+                    if self._prompt_response_was_cancelled(drain_result.response):
+                        self._emit_turn_timeout(elapsed, state, on_event)
+                        self._restart_session_on_next_turn = True
+                    else:
+                        self._finalize_successful_turn_guarded(
+                            drain_result.response, elapsed, state, on_event
+                        )
+                elif drain_result.completed and drain_result.error is not None:
+                    self._emit_turn_error(drain_result.error, state, on_event)
+                    self._restart_session_on_next_turn = True
+                else:
+                    self._emit_turn_timeout(elapsed, state, on_event)
+                    self._restart_session_on_next_turn = True
+        except Exception as e:
+            with state:
+                self._emit_turn_error(e, state, on_event)
+            raise
+        finally:
+            self._clear_turn_callbacks()
+            await self._flush_file_credentials()
 
     @observe(name="acp_agent.step", ignore_inputs=["conversation", "on_event"])
     def step(
@@ -2264,16 +2808,7 @@ class ACPAgent(AgentBase):
             # ConversationRunError — matching how the regular Agent works
             raise
         finally:
-            # Unwire the per-turn callbacks now that this step has finished
-            # emitting everything it's going to emit.  If the ACP subprocess
-            # later dispatches a trailing ``session_update`` (e.g. between
-            # turns), it fires on the portal thread with no FIFOLock held
-            # by anyone — firing a stale ``on_event`` there would race
-            # with other threads mutating ``state.events``.  Clearing the
-            # callbacks turns any such late update into a no-op emit.
-            self._client.on_event = None
-            self._client.on_token = None
-            self._client.on_activity = None
+            self._clear_turn_callbacks()
 
     def ask_agent(self, question: str) -> str | None:
         """Fork the ACP session, prompt the fork, and return the response."""

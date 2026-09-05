@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 import uuid
-from typing import Any
+from concurrent.futures import Future
+from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -40,6 +42,7 @@ from openhands.sdk.agent.acp_agent import (
 )
 from openhands.sdk.agent.base import AgentBase
 from openhands.sdk.context import AgentContext
+from openhands.sdk.conversation.impl.local_conversation import LocalConversation
 from openhands.sdk.conversation.state import (
     ConversationExecutionStatus,
     ConversationState,
@@ -76,6 +79,11 @@ def _make_state(tmp_path) -> ConversationState:
         agent=agent,
         workspace=workspace,
     )
+
+
+def _agent_conn(agent: ACPAgent) -> Any:
+    assert agent._conn is not None
+    return cast(Any, agent._conn)
 
 
 # ---------------------------------------------------------------------------
@@ -4645,3 +4653,314 @@ class TestFailedInitReapsSubprocess:
         assert agent._process is process
         assert agent._conn is conn
         assert state.agent_state["acp_session_id"] == "sess-new"
+
+
+# ---------------------------------------------------------------------------
+# Async step (astep) — RC-2b native async / interrupt lifecycle
+# ---------------------------------------------------------------------------
+
+
+class TestACPAgentAstep:
+    """Native ``ACPAgent.astep`` must not fall back to ``AgentBase.astep``."""
+
+    def _make_conversation_with_message(self, tmp_path, text="Hello"):
+        state = _make_state(tmp_path)
+        state.events.append(
+            SystemPromptEvent(
+                source="agent",
+                system_prompt=TextContent(text="ACP-managed agent"),
+                tools=[],
+            )
+        )
+        state.events.append(
+            MessageEvent(
+                source="user",
+                llm_message=Message(role="user", content=[TextContent(text=text)]),
+            )
+        )
+        conversation = MagicMock()
+        conversation.state = state
+        return conversation
+
+    def test_astep_overrides_default_agentbase_implementation(self):
+        assert ACPAgent.astep is not AgentBase.astep
+
+    def test_astep_runs_post_prompt_callbacks_on_caller_thread(self, tmp_path):
+        from openhands.sdk.utils.async_executor import AsyncExecutor
+
+        agent = _make_agent()
+        conversation = self._make_conversation_with_message(tmp_path)
+
+        caller_thread_id = threading.get_ident()
+        prompt_thread_id: list[int] = []
+        on_event_thread_ids: list[int] = []
+
+        mock_client = _OpenHandsACPBridge()
+        mock_client.get_turn_usage_update = MagicMock(return_value=object())
+        agent._client = mock_client
+        agent._conn = MagicMock()
+
+        async def _fake_prompt(prompt, session_id):  # noqa: ARG001
+            prompt_thread_id.append(threading.get_ident())
+            mock_client.accumulated_text.append("answer")
+            return None
+
+        _agent_conn(agent).prompt = _fake_prompt
+        agent._session_id = "test-session"
+
+        executor = AsyncExecutor()
+        try:
+            agent._executor = executor
+
+            def _capture_event(event):
+                on_event_thread_ids.append(threading.get_ident())
+
+            asyncio.run(agent.astep(conversation, on_event=_capture_event))
+        finally:
+            executor.close()
+
+        assert len(prompt_thread_id) == 1
+        assert prompt_thread_id[0] != caller_thread_id
+        assert len(on_event_thread_ids) >= 2
+        for tid in on_event_thread_ids:
+            assert tid == caller_thread_id
+        assert (
+            conversation.state.execution_status == ConversationExecutionStatus.FINISHED
+        )
+
+    def test_astep_consumes_selected_prompt_message(self, tmp_path):
+        from openhands.sdk.utils.async_executor import AsyncExecutor
+
+        agent = _make_agent()
+        conversation = self._make_conversation_with_message(tmp_path, text="ignored")
+        selected = MessageEvent(
+            source="user",
+            llm_message=Message(
+                role="user", content=[TextContent(text="selected prompt")]
+            ),
+        )
+
+        mock_client = _OpenHandsACPBridge()
+        mock_client.get_turn_usage_update = MagicMock(return_value=object())
+        agent._client = mock_client
+        agent._conn = MagicMock()
+
+        async def _fake_prompt(prompt, session_id):  # noqa: ARG001
+            assert prompt[0].text == "selected prompt"
+            mock_client.accumulated_text.append("answer")
+            return None
+
+        _agent_conn(agent).prompt = _fake_prompt
+        agent._session_id = "test-session"
+
+        executor = AsyncExecutor()
+        try:
+            agent._executor = executor
+            asyncio.run(
+                agent.astep(
+                    conversation,
+                    on_event=lambda _: None,
+                    prompt_message=selected,
+                )
+            )
+        finally:
+            executor.close()
+
+        assert (
+            conversation.state.execution_status == ConversationExecutionStatus.FINISHED
+        )
+
+    def test_astep_emits_failed_tool_calls_on_cancellation(self, tmp_path):
+        from openhands.sdk.utils.async_executor import AsyncExecutor
+
+        agent = _make_agent()
+        conversation = self._make_conversation_with_message(tmp_path)
+        emitted: list = []
+
+        mock_client = _OpenHandsACPBridge()
+        mock_client.get_turn_usage_update = MagicMock(return_value=object())
+        agent._client = mock_client
+        agent._conn = MagicMock()
+
+        executor = AsyncExecutor()
+
+        async def _run_with_cancel() -> None:
+            prompt_entered = asyncio.Event()
+            cancel_called = asyncio.Event()
+            prompt_released = threading.Event()
+            caller_loop = asyncio.get_running_loop()
+
+            async def _fake_prompt(prompt, session_id):  # noqa: ARG001
+                mock_client.accumulated_tool_calls.append(
+                    {
+                        "tool_call_id": "tc-cancel-1",
+                        "title": "in-flight tool",
+                        "status": "in_progress",
+                        "tool_kind": None,
+                        "raw_input": None,
+                        "raw_output": None,
+                        "content": None,
+                    }
+                )
+                caller_loop.call_soon_threadsafe(prompt_entered.set)
+                released = await asyncio.to_thread(prompt_released.wait, 10.0)
+                assert released
+                return None
+
+            async def _fake_cancel(session_id):
+                assert session_id == "test-session"
+                caller_loop.call_soon_threadsafe(cancel_called.set)
+
+            _agent_conn(agent).prompt = _fake_prompt
+            _agent_conn(agent).cancel = _fake_cancel
+            agent._session_id = "test-session"
+
+            task = asyncio.create_task(
+                agent.astep(conversation, on_event=emitted.append)
+            )
+            await asyncio.wait_for(prompt_entered.wait(), timeout=5.0)
+            task.cancel()
+            try:
+                with pytest.raises(asyncio.CancelledError):
+                    with patch(
+                        "openhands.sdk.agent.acp_agent._ACP_CANCEL_DRAIN_TIMEOUT",
+                        0.01,
+                    ):
+                        await task
+                await asyncio.wait_for(cancel_called.wait(), timeout=5.0)
+            finally:
+                prompt_released.set()
+
+        try:
+            agent._executor = executor
+            asyncio.run(_run_with_cancel())
+        finally:
+            executor.close()
+
+        failed_tool_events = [
+            e
+            for e in emitted
+            if isinstance(e, ACPToolCallEvent)
+            and e.tool_call_id == "tc-cancel-1"
+            and e.status == "failed"
+        ]
+        assert len(failed_tool_events) == 1
+        assert failed_tool_events[0].is_error is True
+
+    def test_astep_times_out_when_idle_with_inflight_tool_call(self, tmp_path):
+        agent = _make_agent(acp_prompt_timeout=0.02)
+        conversation = self._make_conversation_with_message(tmp_path)
+        emitted: list = []
+        cancel_called = threading.Event()
+
+        mock_client = _OpenHandsACPBridge()
+        mock_client.get_turn_usage_update = MagicMock(return_value=object())
+        agent._client = mock_client
+        agent._conn = MagicMock()
+        agent._session_id = "test-session"
+
+        class _FakePortal:
+            def __init__(self) -> None:
+                self.prompt_future: Future = Future()
+
+            def start_task_soon(self, fn, *args):  # noqa: ANN001, ANN202
+                if args:
+                    entry = {
+                        "tool_call_id": "git-1",
+                        "title": "git status",
+                        "tool_kind": "execute",
+                        "status": "in_progress",
+                        "raw_input": None,
+                        "raw_output": None,
+                        "content": None,
+                    }
+                    mock_client.accumulated_tool_calls.append(entry)
+                    mock_client._emit_tool_call_event(entry)
+                    return self.prompt_future
+
+                cancel_called.set()
+                cancel_future: Future = Future()
+                cancel_future.set_result(None)
+                return cancel_future
+
+        mock_executor = MagicMock()
+        mock_executor.portal = _FakePortal()
+        agent._executor = mock_executor
+
+        with patch("openhands.sdk.agent.acp_agent._ACP_CANCEL_DRAIN_TIMEOUT", 0.01):
+            asyncio.run(agent.astep(conversation, on_event=emitted.append))
+
+        assert cancel_called.is_set()
+        assert conversation.state.execution_status == ConversationExecutionStatus.ERROR
+        assert any(
+            isinstance(e, ACPToolCallEvent)
+            and e.tool_call_id == "git-1"
+            and e.status == "failed"
+            and e.is_error
+            for e in emitted
+        )
+
+    def test_cleanup_interruption_finalizes_completed_prompt(self, tmp_path):
+        agent = _make_agent()
+        conversation = self._make_conversation_with_message(tmp_path)
+        mock_client = _OpenHandsACPBridge()
+        mock_client.get_turn_usage_update = MagicMock(return_value=object())
+        agent._client = mock_client
+        agent._session_id = "test-session"
+
+        prompt_future: Future = Future()
+        prompt_future.set_result(None)
+        emitted = []
+
+        with conversation.state as state:
+            agent._handle_cancelled_cleanup_interruption(
+                prompt_future,
+                0.1,
+                state,
+                emitted.append,
+            )
+
+        assert (
+            conversation.state.execution_status == ConversationExecutionStatus.FINISHED
+        )
+        assert agent._restart_session_on_next_turn is False
+        assert any(isinstance(event, ActionEvent) for event in emitted)
+
+
+@pytest.mark.asyncio
+async def test_local_conversation_arun_interrupts_real_acp_astep(tmp_path):
+    """LocalConversation must cancel an in-flight native ACP prompt."""
+    agent = _make_agent()
+    conversation = LocalConversation(
+        agent=agent,
+        workspace=str(tmp_path),
+        max_iteration_per_run=3,
+        stuck_detection=False,
+    )
+    conversation.send_message("cancel me")
+
+    prompt_started = asyncio.Event()
+
+    async def _fake_prompt(prompt, session_id):  # noqa: ARG001
+        prompt_started.set()
+        await asyncio.Event().wait()
+
+    mock_client = _OpenHandsACPBridge()
+    mock_client.get_turn_usage_update = MagicMock(return_value=object())
+    agent._client = mock_client
+    agent._conn = MagicMock()
+    _agent_conn(agent).prompt = _fake_prompt
+    agent._session_id = "test-session"
+
+    from openhands.sdk.utils.async_executor import AsyncExecutor
+
+    executor = AsyncExecutor()
+    agent._executor = executor
+    with patch.object(ACPAgent, "init_state", autospec=True):
+        task = asyncio.create_task(conversation.arun())
+        await asyncio.wait_for(prompt_started.wait(), timeout=1.0)
+        conversation.interrupt()
+        await asyncio.wait_for(task, timeout=1.0)
+    executor.close()
+
+    assert conversation.state.execution_status == ConversationExecutionStatus.PAUSED
