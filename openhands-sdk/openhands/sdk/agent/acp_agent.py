@@ -381,8 +381,17 @@ async def _maybe_set_session_model(
     *,
     via_config_option: bool = False,
     model_state: SessionModelState | None = None,
+    apply_requested: bool = False,
 ) -> bool:
     """Apply the *initial* session model right after session creation.
+
+    Registry providers are routed by name.  Servers outside the registry are
+    routed by capability: *model_state* is the ``models`` field the ACP server
+    returned from ``new_session`` / ``load_session``, and its presence is the
+    protocol-level signal that the server supports ``session/set_model``.
+    When *apply_requested* is set (session init with an explicit ``acp_model``),
+    the requested model is pushed even if the server did not advertise model
+    state in the session response.
 
     Returns ``True`` only when a model-setting call succeeded.
     """
@@ -410,9 +419,25 @@ async def _maybe_set_session_model(
                 e,
             )
             return False
-    if model_state is not None:
-        await conn.set_session_model(model_id=acp_model, session_id=session_id)
-        return True
+    if model_state is not None or apply_requested:
+        try:
+            await _apply_acp_model(
+                conn,
+                session_id,
+                acp_model,
+                agent_name=agent_name,
+                via_config_option=via_config_option,
+            )
+            return True
+        except ACPRequestError as e:
+            logger.warning(
+                "Could not set model %r on ACP server %s (%s); "
+                "the session will use the server default",
+                acp_model,
+                agent_name,
+                e,
+            )
+            return False
     return False
 
 
@@ -2109,6 +2134,8 @@ class ACPAgent(AgentBase):
                         session_id,
                         self.acp_model,
                         via_config_option=self._model_via_config_option,
+                        model_state=getattr(response, "models", None),
+                        apply_requested=True,
                     )
                 else:
                     override_applied = await _reapply_session_model_on_resume(
@@ -3117,13 +3144,12 @@ class ACPAgent(AgentBase):
         session_id = self._session_id
         try:
             self._executor.run_async(
-                _apply_acp_model(
-                    conn,
-                    session_id,
-                    model,
-                    agent_name=self._agent_name,
-                    via_config_option=self._model_via_config_option,
-                ),
+                _apply_acp_model,
+                conn,
+                session_id,
+                model,
+                agent_name=self._agent_name,
+                via_config_option=self._model_via_config_option,
                 timeout=self.acp_prompt_timeout,
             )
         except ACPRequestError as e:

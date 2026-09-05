@@ -2831,6 +2831,39 @@ class TestMaybeSetSessionModel:
             session_id="session-1",
         )
 
+    @pytest.mark.asyncio
+    async def test_unregistered_agent_with_apply_requested_uses_protocol_override(
+        self,
+    ):
+        """Session init with an explicit ``acp_model`` pushes via set_model."""
+        conn = AsyncMock()
+        await _maybe_set_session_model(
+            conn,
+            "cursor-agent",
+            "session-1",
+            "grok-4.6",
+            apply_requested=True,
+        )
+        conn.set_session_model.assert_awaited_once_with(
+            model_id="grok-4.6",
+            session_id="session-1",
+        )
+
+    @pytest.mark.asyncio
+    async def test_unregistered_rejected_requested_model_returns_false(self):
+        conn = AsyncMock()
+        conn.set_session_model.side_effect = ACPRequestError(
+            code=-32601, message="method not found"
+        )
+        applied = await _maybe_set_session_model(
+            conn,
+            "cursor-agent",
+            "session-1",
+            "grok-4.6",
+            apply_requested=True,
+        )
+        assert applied is False
+
 
 # ---------------------------------------------------------------------------
 # acp_session_mode field
@@ -3178,7 +3211,17 @@ class TestSetACPModel:
         agent._model_via_config_option = via_config_option
         executor = MagicMock()
 
-        def _run(coro: Any, timeout: Any = None) -> Any:
+        def _run(
+            awaitable_or_fn: Any, *args: Any, timeout: Any = None, **kwargs: Any
+        ) -> Any:
+            import inspect
+
+            if inspect.iscoroutine(awaitable_or_fn):
+                coro = awaitable_or_fn
+            elif inspect.iscoroutinefunction(awaitable_or_fn):
+                coro = awaitable_or_fn(*args, **kwargs)
+            else:
+                raise TypeError("run_async expects a coroutine or async function")
             loop = asyncio.new_event_loop()
             try:
                 return loop.run_until_complete(coro)
@@ -4349,6 +4392,31 @@ class TestACPSessionConfigOptions:
             {"config_id": "effort", "session_id": "sess-new", "value": "medium"},
             {"config_id": "fast", "session_id": "sess-new", "value": False},
         ]
+
+    def test_fresh_session_applies_requested_model_without_advertised_state(
+        self, tmp_path
+    ):
+        """``acp_model`` is pushed via set_session_model even when the server
+        omits ``models`` from the session response (parameterizedModelPicker).
+        """
+        agent = _make_agent(
+            acp_model="grok-4.6",
+            acp_client_capabilities=ClientCapabilities(
+                field_meta={"parameterizedModelPicker": True}
+            ),
+        )
+        state = _make_state(tmp_path)
+        conn = _make_config_conn(
+            options=[_config_option("effort", "low", ["low", "medium", "high"])],
+            models=None,
+        )
+
+        TestACPSessionIdPersistence._patched_start_acp_server(agent, state, conn=conn)
+
+        conn.set_session_model.assert_awaited_once_with(
+            model_id="grok-4.6",
+            session_id="sess-new",
+        )
 
     def test_composer_model_and_fast_disabled(self, tmp_path):
         agent = _make_agent(
