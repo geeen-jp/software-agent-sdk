@@ -302,6 +302,80 @@ def _config_option_values(
     return {option.id: _config_option_current_value(option) for option in options}
 
 
+_CANONICAL_BOOLEAN_REQUESTS = frozenset({"true", "false"})
+
+
+def _config_options_index(
+    options: list[SessionConfigOption] | None,
+) -> dict[str, SessionConfigOption]:
+    if not options:
+        return {}
+    return {option.id: option for option in options}
+
+
+def _parse_boolean_request(value: str) -> bool:
+    normalized = value.lower()
+    if normalized not in _CANONICAL_BOOLEAN_REQUESTS:
+        raise ACPSessionConfigError(
+            f"Invalid boolean configuration request {value!r}; "
+            "expected 'true' or 'false'."
+        )
+    return normalized == "true"
+
+
+def _config_option_wire_value(
+    option: SessionConfigOption,
+    requested: str,
+) -> str | bool:
+    if isinstance(option, SessionConfigOptionBoolean):
+        return _parse_boolean_request(requested)
+    return requested
+
+
+def _config_option_matches_request(
+    option: SessionConfigOption,
+    requested: str,
+) -> bool:
+    observed = _config_option_current_value(option)
+    if isinstance(option, SessionConfigOptionBoolean):
+        return observed == requested.lower()
+    return observed == requested
+
+
+def _resolve_config_options_state(
+    client: _OpenHandsACPBridge,
+    session_id: str,
+    response_options: list[SessionConfigOption] | None,
+) -> dict[str, SessionConfigOption]:
+    by_id = _config_options_index(response_options)
+    if by_id:
+        return by_id
+    return _config_options_index(client.get_config_options(session_id))
+
+
+def _verify_requested_config_options(
+    agent_name: str,
+    session_id: str,
+    requested: dict[str, str],
+    state_by_id: dict[str, SessionConfigOption],
+) -> None:
+    for config_id, requested_value in requested.items():
+        option = state_by_id.get(config_id)
+        if option is None:
+            raise ACPSessionConfigError(
+                f"ACP server {agent_name!r} session {session_id} final "
+                f"configuration state is missing requested option {config_id!r}; "
+                f"available options: {sorted(state_by_id)}."
+            )
+        if not _config_option_matches_request(option, requested_value):
+            current = _config_option_current_value(option)
+            raise ACPSessionConfigError(
+                f"ACP server {agent_name!r} session {session_id} final "
+                f"configuration option {config_id!r}={current!r} does not match "
+                f"requested {requested_value!r}."
+            )
+
+
 async def _apply_session_config_options(
     conn: ClientSideConnection,
     client: _OpenHandsACPBridge,
@@ -321,7 +395,9 @@ async def _apply_session_config_options(
     returned by the response is preferred; the ``ConfigOptionUpdate``
     notification recorded for this exact session is only consulted when the
     response does not describe the option (some servers publish the new state
-    asynchronously, and selecting one option can reveal another).
+    asynchronously, and selecting one option can reveal another).  After all
+    writes complete, every requested option is checked again against the final
+    complete state for that same session.
 
     Raises:
         ACPSessionConfigError: if the server exposes no config options, a
@@ -333,56 +409,92 @@ async def _apply_session_config_options(
     if not requested:
         return
 
-    state = _config_option_values(initial_options)
-    observed = _config_option_values(client.get_config_options(session_id))
-    if not state and not observed:
+    state_by_id = _config_options_index(initial_options)
+    observed_by_id = _config_options_index(client.get_config_options(session_id))
+    if not state_by_id and not observed_by_id:
         raise ACPSessionConfigError(
             f"ACP server {agent_name!r} session {session_id} reported no session "
             f"configuration options, but {sorted(requested)} were requested."
         )
 
-    for config_id, value in requested.items():
-        if config_id not in state and config_id in observed:
-            state = observed
-        if config_id not in state:
+    last_response_options: list[SessionConfigOption] | None = None
+
+    for config_id, requested_value in requested.items():
+        option = state_by_id.get(config_id) or observed_by_id.get(config_id)
+        if option is None:
+            available = sorted(state_by_id or observed_by_id)
             raise ACPSessionConfigError(
                 f"ACP server {agent_name!r} session {session_id} does not expose "
                 f"configuration option {config_id!r}; available options: "
-                f"{sorted(state)}."
+                f"{available}."
             )
+
+        wire_value = _config_option_wire_value(option, requested_value)
         try:
             response = await conn.set_config_option(
                 config_id=config_id,
                 session_id=session_id,
-                value=value,
+                value=wire_value,
             )
+        except ACPSessionConfigError:
+            raise
         except Exception as e:
             raise ACPSessionConfigError(
                 f"ACP server {agent_name!r} session {session_id} failed to set "
-                f"configuration option {config_id!r}={value!r}: {e}"
+                f"configuration option {config_id!r}={requested_value!r}: {e}"
             ) from e
 
-        observed = _config_option_values(client.get_config_options(session_id))
-        state = _config_option_values(response.config_options) or observed
-        if not state:
+        last_response_options = response.config_options
+        state_by_id = _resolve_config_options_state(
+            client,
+            session_id,
+            response.config_options,
+        )
+        if not state_by_id:
             raise ACPSessionConfigError(
                 f"ACP server {agent_name!r} session {session_id} returned no "
-                f"configuration state after setting {config_id!r}={value!r}; "
-                "the requested configuration cannot be verified."
+                f"configuration state after setting {config_id!r}="
+                f"{requested_value!r}; the requested configuration cannot be "
+                "verified."
             )
-        current = state.get(config_id)
-        if current != value:
+
+        current_option = state_by_id.get(config_id)
+        if current_option is None or not _config_option_matches_request(
+            current_option, requested_value
+        ):
+            current = (
+                _config_option_current_value(current_option)
+                if current_option is not None
+                else None
+            )
             raise ACPSessionConfigError(
                 f"ACP server {agent_name!r} session {session_id} reports "
                 f"configuration option {config_id!r}={current!r} after "
-                f"requesting {value!r}."
+                f"requesting {requested_value!r}."
             )
         logger.info(
             "ACP session config option verified: %s=%s (session %s)",
             config_id,
-            value,
+            requested_value,
             session_id,
         )
+
+    final_state = _resolve_config_options_state(
+        client,
+        session_id,
+        last_response_options,
+    )
+    if not final_state:
+        raise ACPSessionConfigError(
+            f"ACP server {agent_name!r} session {session_id} returned no final "
+            "configuration state; the requested configuration cannot be verified."
+        )
+    _verify_requested_config_options(
+        agent_name,
+        session_id,
+        requested,
+        final_state,
+    )
 
 
 def _extract_token_usage(

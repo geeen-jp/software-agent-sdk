@@ -3939,6 +3939,31 @@ class TestConfigOptionCurrentValue:
         }
 
 
+def _config_option_with_value(
+    option: SessionConfigOption, value: str | bool
+) -> SessionConfigOption:
+    """Return a copy of *option* with *value* as its current value."""
+    if isinstance(option, SessionConfigOptionBoolean):
+        bool_value = value if isinstance(value, bool) else value.lower() == "true"
+        return SessionConfigOptionBoolean(
+            id=option.id,
+            name=option.name,
+            type="boolean",
+            current_value=bool_value,
+        )
+    str_value = str(value).lower() if isinstance(value, bool) else str(value)
+    choices = [select_option.value for select_option in option.options]
+    if str_value not in choices:
+        choices = [*choices, str_value]
+    return SessionConfigOptionSelect(
+        id=option.id,
+        name=option.name,
+        type="select",
+        current_value=str_value,
+        options=[SessionConfigSelectOption(name=v, value=v) for v in choices],
+    )
+
+
 def _config_update(**options: str) -> ConfigOptionUpdate:
     """Build a ``config_option_update`` notification for a complete state."""
     return ConfigOptionUpdate(
@@ -3987,10 +4012,10 @@ def _make_config_conn(
 
     current = list(options or [])
 
-    async def _set_config_option(*, config_id: str, session_id: str, value: str):
+    async def _set_config_option(*, config_id: str, session_id: str, value: str | bool):
         for i, option in enumerate(current):
             if option.id == config_id:
-                current[i] = _config_option(config_id, value)
+                current[i] = _config_option_with_value(option, value)
                 return SetSessionConfigOptionResponse(config_options=list(current))
         raise ACPRequestError(-32602, f"unknown config option {config_id}")
 
@@ -4072,7 +4097,7 @@ class TestACPSessionConfigOptions:
         conn = _make_config_conn(
             options=[
                 _config_option("effort", "low", ["low", "medium", "high"]),
-                _config_option("fast", "true", ["true", "false"]),
+                _boolean_config_option("fast", True),
             ],
             models=_GROK_MODELS,
         )
@@ -4085,7 +4110,7 @@ class TestACPSessionConfigOptions:
         )
         assert [call.kwargs for call in conn.set_config_option.await_args_list] == [
             {"config_id": "effort", "session_id": "sess-new", "value": "medium"},
-            {"config_id": "fast", "session_id": "sess-new", "value": "false"},
+            {"config_id": "fast", "session_id": "sess-new", "value": False},
         ]
 
     def test_composer_model_and_fast_disabled(self, tmp_path):
@@ -4095,7 +4120,7 @@ class TestACPSessionConfigOptions:
         )
         state = _make_state(tmp_path)
         conn = _make_config_conn(
-            options=[_config_option("fast", "true", ["true", "false"])],
+            options=[_boolean_config_option("fast", True)],
             models=SessionModelState(
                 available_models=[
                     ModelInfo(model_id="composer-2.5", name="Composer 2.5")
@@ -4113,7 +4138,7 @@ class TestACPSessionConfigOptions:
         conn.set_config_option.assert_awaited_once_with(
             config_id="fast",
             session_id="sess-new",
-            value="false",
+            value=False,
         )
 
     def test_resumed_session_applies_same_config(self, tmp_path):
@@ -4131,7 +4156,7 @@ class TestACPSessionConfigOptions:
         conn = _make_config_conn(
             options=[
                 _config_option("effort", "low", ["low", "medium", "high"]),
-                _config_option("fast", "true", ["true", "false"]),
+                _boolean_config_option("fast", True),
             ],
             models=_GROK_MODELS,
         )
@@ -4146,7 +4171,7 @@ class TestACPSessionConfigOptions:
         )
         assert [call.kwargs for call in conn.set_config_option.await_args_list] == [
             {"config_id": "effort", "session_id": "stored-sess", "value": "medium"},
-            {"config_id": "fast", "session_id": "stored-sess", "value": "false"},
+            {"config_id": "fast", "session_id": "stored-sess", "value": False},
         ]
 
     def test_composer_resumed_session_applies_same_config(self, tmp_path):
@@ -4162,7 +4187,7 @@ class TestACPSessionConfigOptions:
             "acp_session_cwd": str(tmp_path),
         }
         conn = _make_config_conn(
-            options=[_config_option("fast", "true", ["true", "false"])],
+            options=[_boolean_config_option("fast", True)],
             models=SessionModelState(
                 available_models=[
                     ModelInfo(model_id="composer-2.5", name="Composer 2.5")
@@ -4182,7 +4207,7 @@ class TestACPSessionConfigOptions:
         conn.set_config_option.assert_awaited_once_with(
             config_id="fast",
             session_id="stored-sess",
-            value="false",
+            value=False,
         )
 
     def test_no_requested_options_leaves_session_untouched(self, tmp_path):
@@ -4251,7 +4276,7 @@ class TestACPSessionConfigOptions:
                     {
                         "config_id": "fast",
                         "session_id": "replacement-sess",
-                        "value": "false",
+                        "value": False,
                     },
                 ],
             ),
@@ -4262,7 +4287,7 @@ class TestACPSessionConfigOptions:
                     {
                         "config_id": "fast",
                         "session_id": "replacement-sess",
-                        "value": "false",
+                        "value": False,
                     }
                 ],
             ),
@@ -4285,7 +4310,7 @@ class TestACPSessionConfigOptions:
             session_id="replacement-sess",
             options=[
                 _config_option("effort", "low", ["low", "medium", "high"]),
-                _config_option("fast", "true", ["true", "false"]),
+                _boolean_config_option("fast", True),
             ],
             models=SessionModelState(
                 available_models=[ModelInfo(model_id=acp_model, name=acp_model)],
@@ -4427,6 +4452,64 @@ class TestApplySessionConfigOptions:
                 "sess-1",
                 {"effort": "medium"},
                 [_config_option("effort", "low")],
+            )
+
+    async def test_invalid_boolean_request_fails_before_set(self):
+        conn = self._conn()
+        with pytest.raises(ACPSessionConfigError, match="Invalid boolean"):
+            await _apply_session_config_options(
+                conn,
+                _OpenHandsACPBridge(),
+                "cursor",
+                "sess-1",
+                {"fast": "no"},
+                [_boolean_config_option("fast", True)],
+            )
+        conn.set_config_option.assert_not_awaited()
+
+    async def test_boolean_option_sent_as_python_bool(self):
+        conn = self._conn(
+            SetSessionConfigOptionResponse(
+                config_options=[_boolean_config_option("fast", False)]
+            )
+        )
+        await _apply_session_config_options(
+            conn,
+            _OpenHandsACPBridge(),
+            "cursor",
+            "sess-1",
+            {"fast": "false"},
+            [_boolean_config_option("fast", True)],
+        )
+        assert conn.set_config_option.await_args.kwargs["value"] is False
+
+    async def test_later_write_reverting_earlier_option_fails_final_check(self):
+        """A later write must not silently undo an earlier requested option."""
+        conn = self._conn(
+            SetSessionConfigOptionResponse(
+                config_options=[
+                    _config_option("effort", "medium"),
+                    _boolean_config_option("fast", True),
+                ]
+            ),
+            SetSessionConfigOptionResponse(
+                config_options=[
+                    _config_option("effort", "low"),
+                    _boolean_config_option("fast", False),
+                ]
+            ),
+        )
+        with pytest.raises(ACPSessionConfigError, match="final configuration"):
+            await _apply_session_config_options(
+                conn,
+                _OpenHandsACPBridge(),
+                "cursor",
+                "sess-1",
+                {"effort": "medium", "fast": "false"},
+                [
+                    _config_option("effort", "low"),
+                    _boolean_config_option("fast", True),
+                ],
             )
 
 
