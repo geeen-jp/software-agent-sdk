@@ -315,6 +315,34 @@ def test_switch_profile_disarms_discarded_acp_agent_finalizer(
     live_executor.run_async.assert_not_called()
 
 
+def test_switch_acp_model_new_owner_close_is_idempotent(tmp_path):
+    conv, old_agent = _make_acp_conversation(tmp_path)
+    live_executor = old_agent._executor
+    old_agent._register_atexit_cleanup()
+
+    conv.switch_acp_model("model-b")
+
+    switched = conv.agent
+    assert isinstance(switched, ACPAgent)
+    switched.close()
+    switched.close()
+    assert live_executor.run_async.call_count >= 1
+
+
+def test_switch_acp_model_old_atexit_callback_is_noop(tmp_path):
+    conv, old_agent = _make_acp_conversation(tmp_path)
+    live_executor = old_agent._executor
+    old_agent._register_atexit_cleanup()
+    old_callback = old_agent._atexit_callback
+    assert old_callback is not None
+
+    conv.switch_acp_model("model-b")
+
+    live_executor.run_async.reset_mock()
+    old_callback()
+    live_executor.run_async.assert_not_called()
+
+
 def test_switch_profile(profile_store):
     """switch_profile switches the agent's LLM."""
     conv = _make_conversation()

@@ -29,6 +29,7 @@ from acp.schema import (
 from openhands.sdk.agent.acp_agent import (
     ACPAgent,
     ACPSessionConfigError,
+    ACPSessionModelError,
     SessionConfigOption,
     _apply_session_config_options,
     _config_option_current_value,
@@ -1358,6 +1359,106 @@ class TestACPAgentCleanup:
         live_executor.run_async.reset_mock()
         agent.close()
         live_executor.run_async.assert_not_called()
+
+    def test_release_runtime_then_close_is_idempotent(self):
+        agent = _make_agent()
+        live_conn = MagicMock()
+        live_executor = MagicMock()
+        agent._conn = live_conn
+        agent._session_id = "sess-1"
+        agent._executor = live_executor
+        agent._process = MagicMock()
+        agent._register_atexit_cleanup()
+
+        agent.release_runtime()
+        agent.close()
+        agent.close()
+        live_executor.run_async.assert_not_called()
+
+    def test_assume_runtime_ownership_transfers_single_cleanup_owner(self):
+        predecessor = _make_agent()
+        successor = _make_agent()
+        live_conn = MagicMock()
+        live_executor = MagicMock()
+        predecessor._conn = live_conn
+        predecessor._session_id = "sess-1"
+        predecessor._executor = live_executor
+        predecessor._process = MagicMock()
+        predecessor._client = _OpenHandsACPBridge()
+        predecessor._register_atexit_cleanup()
+
+        successor._conn = live_conn
+        successor._session_id = "sess-1"
+        successor._executor = live_executor
+        successor._process = predecessor._process
+        successor._client = predecessor._client
+
+        successor.assume_runtime_ownership_from(predecessor)
+
+        assert predecessor._closed is True
+        assert predecessor._atexit_callback is None
+        assert successor._atexit_callback is not None
+
+        live_executor.run_async.reset_mock()
+        predecessor.close()
+        live_executor.run_async.assert_not_called()
+
+        successor.close()
+        assert live_executor.run_async.called
+
+    def test_assume_runtime_ownership_rollback_on_failed_release(self):
+        predecessor = _make_agent()
+        successor = _make_agent()
+        predecessor._conn = MagicMock()
+        predecessor._session_id = "sess-1"
+        predecessor._executor = MagicMock()
+        predecessor._process = MagicMock()
+        predecessor._client = _OpenHandsACPBridge()
+        predecessor._register_atexit_cleanup()
+        old_cleanup = predecessor._atexit_callback
+
+        successor._conn = predecessor._conn
+        successor._session_id = predecessor._session_id
+        successor._executor = predecessor._executor
+        successor._process = predecessor._process
+        successor._client = predecessor._client
+
+        with patch.object(
+            ACPAgent,
+            "release_runtime",
+            side_effect=RuntimeError("release failed"),
+        ):
+            with pytest.raises(RuntimeError, match="release failed"):
+                successor.assume_runtime_ownership_from(predecessor)
+
+        assert predecessor._atexit_callback is old_cleanup
+        assert successor._atexit_callback is None
+
+    def test_masking_callback_follows_runtime_owner_after_handoff(self):
+        predecessor = _make_agent()
+        successor = _make_agent()
+        client = _OpenHandsACPBridge()
+        lifecycle = MagicMock()
+        lifecycle.track_current = MagicMock()
+        predecessor._conn = MagicMock()
+        predecessor._session_id = "sess-1"
+        predecessor._executor = MagicMock()
+        predecessor._process = MagicMock()
+        predecessor._client = client
+        predecessor._file_credential_lifecycles["CODEX_AUTH_JSON"] = lifecycle
+
+        successor._conn = predecessor._conn
+        successor._session_id = predecessor._session_id
+        successor._executor = predecessor._executor
+        successor._process = predecessor._process
+        successor._client = client
+        successor._file_credential_lifecycles["CODEX_AUTH_JSON"] = lifecycle
+
+        successor.assume_runtime_ownership_from(predecessor)
+        lifecycle.track_current.reset_mock()
+        assert client.before_mask is not None
+        client.before_mask()
+        lifecycle.track_current.assert_called_once_with()
 
     def test_atexit_cleanup_uses_weakref(self):
         import gc
@@ -2894,19 +2995,19 @@ class TestMaybeSetSessionModel:
         )
 
     @pytest.mark.asyncio
-    async def test_unregistered_rejected_requested_model_returns_false(self):
+    async def test_unregistered_rejected_requested_model_fails_closed(self):
         conn = AsyncMock()
         conn.set_session_model.side_effect = ACPRequestError(
             code=-32601, message="method not found"
         )
-        applied = await _maybe_set_session_model(
-            conn,
-            "cursor-agent",
-            "session-1",
-            "grok-4.6",
-            apply_requested=True,
-        )
-        assert applied is False
+        with pytest.raises(ACPSessionModelError, match="rejected model"):
+            await _maybe_set_session_model(
+                conn,
+                "cursor-agent",
+                "session-1",
+                "grok-4.6",
+                apply_requested=True,
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -3620,7 +3721,7 @@ class TestACPSessionIdPersistence:
             conn.load_session = AsyncMock(return_value=MagicMock())
 
         conn.set_session_mode = AsyncMock()
-        conn.set_session_model = AsyncMock()
+        conn.set_session_model = AsyncMock(side_effect=_verified_set_session_model)
         conn.authenticate = AsyncMock()
         conn.close = AsyncMock()
         return conn
@@ -3924,9 +4025,84 @@ class TestACPModelStatePersistence(TestACPSessionIdPersistence):
             {"model_id": "claude-opus-4-1", "name": "Opus 4.1", "description": None}
         ]
 
-    def test_resume_rejected_override_with_absent_models_clears_stale_id(
-        self, tmp_path
-    ):
+    def test_resume_effective_model_mismatch_fails_closed(self, tmp_path):
+        from openhands.sdk.utils.async_executor import AsyncExecutor
+
+        agent = _make_agent(acp_model="model-x")
+        state = _make_state(tmp_path)
+        state.agent_state = {
+            **state.agent_state,
+            "acp_session_id": "resumable-sess",
+            "acp_session_cwd": str(tmp_path),
+        }
+        conn = self._make_conn()
+        conn.initialize.return_value.agent_info.name = "codex-acp"
+        conn.initialize.return_value.auth_methods = []
+
+        async def _wrong_model(*, model_id: str, session_id: str, **kwargs: Any):
+            from acp.schema import SetSessionModelResponse
+
+            return SetSessionModelResponse(field_meta={"current_model_id": "other"})
+
+        conn.set_session_model = AsyncMock(side_effect=_wrong_model)
+
+        agent._executor = AsyncExecutor()
+        with self._transport_patches(conn):
+            with pytest.raises(ACPSessionModelError, match="reports effective"):
+                agent.init_state(state, on_event=lambda _: None)
+
+    def test_fresh_init_uses_verified_effective_model_not_requested(self, tmp_path):
+        from acp.schema import SetSessionConfigOptionResponse
+
+        from openhands.sdk.utils.async_executor import AsyncExecutor
+
+        agent = _make_agent(acp_model="gpt-5.5")
+        state = _make_state(tmp_path)
+        model_options = [
+            _config_option("model", "old-model", ["old-model", "gpt-5.5"]),
+            _config_option(
+                "reasoning_effort",
+                "medium",
+                ["low", "medium", "high", "xhigh"],
+            ),
+        ]
+        conn = self._make_conn(new_session_id="fresh-sess")
+        conn.initialize.return_value.agent_info.name = "codex-acp"
+        conn.initialize.return_value.auth_methods = []
+        new_response = NewSessionResponse(
+            session_id="fresh-sess",
+            config_options=list(model_options),
+        )
+        conn.new_session = AsyncMock(return_value=new_response)
+
+        async def _set_config_option(
+            *, config_id: str, session_id: str, value: str | bool, **kwargs: Any
+        ) -> SetSessionConfigOptionResponse:
+            nonlocal model_options
+            updated: list[SessionConfigOption] = []
+            for option in model_options:
+                if option.id == config_id:
+                    updated.append(_config_option_with_value(option, value))
+                else:
+                    updated.append(option)
+            model_options = updated
+            return SetSessionConfigOptionResponse(config_options=list(model_options))
+
+        conn.set_config_option = AsyncMock(side_effect=_set_config_option)
+        conn.set_session_model = AsyncMock(
+            side_effect=ACPRequestError(code=-32601, message="method not found")
+        )
+
+        agent._executor = AsyncExecutor()
+        with self._transport_patches(conn):
+            agent.init_state(state, on_event=lambda _: None)
+
+        assert agent.acp_model == "gpt-5.5"
+        assert agent.current_model_id == "gpt-5.5/medium"
+        assert agent.llm.model == "gpt-5.5/medium"
+        assert state.agent_state["acp_current_model_id"] == "gpt-5.5/medium"
+
+    def test_resume_rejected_override_fails_closed_before_prompt(self, tmp_path):
         from openhands.sdk.utils.async_executor import AsyncExecutor
 
         agent = _make_agent(acp_model="model-x")
@@ -3949,12 +4125,11 @@ class TestACPModelStatePersistence(TestACPSessionIdPersistence):
 
         agent._executor = AsyncExecutor()
         with self._transport_patches(conn):
-            agent.init_state(state, on_event=lambda _: None)
+            with pytest.raises(ACPSessionModelError, match="rejected model"):
+                agent.init_state(state, on_event=lambda _: None)
 
-        assert state.agent_state["acp_session_id"] == "resumable-sess"
-        assert agent.current_model_id is None
-        assert agent._model_override_applied is False
-        assert "acp_current_model_id" not in state.agent_state
+        assert not agent._initialized
+        assert not agent.has_live_acp_session
 
     def test_fresh_replacement_clears_stale_model_when_new_session_omits_models(
         self, tmp_path
