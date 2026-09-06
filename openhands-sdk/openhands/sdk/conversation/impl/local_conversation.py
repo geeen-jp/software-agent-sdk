@@ -1753,8 +1753,9 @@ class LocalConversation(BaseConversation):
             # first run()), there is nothing to switch live — skip the call and
             # just persist; session creation applies the value (see docstring).
             live = self.agent.has_live_acp_session
+            verified_effective_model_id = model
             if live:
-                self.agent.set_acp_model(model)
+                verified_effective_model_id = self.agent.set_acp_model(model)
             # Persist the switched model as the authoritative value. ``acp_model``
             # is frozen, so we replace the agent with a copy carrying the new
             # value. This matters on two counts the in-place mutation missed:
@@ -1782,17 +1783,18 @@ class LocalConversation(BaseConversation):
             # persisted state agree on the switched model.
             self.agent = new_agent
             self._state.agent = new_agent
-            # Keep the persisted model hint in sync with the switch. The live
-            # agent's ``current_model_id`` (a PrivateAttr) already reflects the
-            # new model and wins on warm reads, but cold list reads after a
-            # process restart fall back to ``agent_state`` — which would
-            # otherwise still name the pre-switch model until the next resume.
-            # Write unconditionally: a successful switch is authoritative even
-            # for an older/custom server that reported no ``models`` at init
-            # (so the key may not exist yet).
+            # Keep the persisted effective-model hint in sync with the switch.
+            # ``acp_model`` on the copied agent holds the requested value; the
+            # live agent's ``current_model_id`` (a PrivateAttr) already
+            # reflects the verified effective model and wins on warm reads, but
+            # cold list reads after a process restart fall back to
+            # ``agent_state`` — which would otherwise still name the
+            # pre-switch effective model until the next resume. Persist only
+            # the verified effective id returned by ``set_acp_model``; never
+            # the requested model when they differ.
             self._state.agent_state = {
                 **self._state.agent_state,
-                "acp_current_model_id": model,
+                "acp_current_model_id": verified_effective_model_id,
             }
 
     @observe(name="conversation.send_message")

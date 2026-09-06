@@ -3412,20 +3412,22 @@ class TestSetACPModel:
 
     def test_switches_model_on_live_codex_session(self):
         agent = self._wire(_make_agent(), "codex-acp")
-        agent.set_acp_model("gpt-5.5")
+        effective = agent.set_acp_model("gpt-5.5")
         _agent_conn(agent).set_session_model.assert_awaited_once_with(
             model_id="gpt-5.5", session_id="sess-1"
         )
         _agent_conn(agent).set_config_option.assert_not_called()
+        assert effective == "gpt-5.5"
         assert agent.llm.model == "gpt-5.5"
         assert agent.current_model_id == "gpt-5.5"
 
     def test_switches_codex_via_config_option_single_call(self):
         agent = self._wire(_make_agent(), "codex-acp", via_config_option=True)
-        agent.set_acp_model("gpt-5.5")
+        effective = agent.set_acp_model("gpt-5.5")
         _agent_conn(agent).set_config_option.assert_awaited_once_with(
             config_id="model", value="gpt-5.5", session_id="sess-1"
         )
+        assert effective == "gpt-5.5/medium"
         assert agent.current_model_id == "gpt-5.5/medium"
 
     def test_switches_codex_via_config_option_splits_reasoning_effort(self):

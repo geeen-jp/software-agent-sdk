@@ -3607,8 +3607,12 @@ class ACPAgent(AgentBase):
                     atexit.register(saved_atexit)
             raise
 
-    def set_acp_model(self, model: str) -> None:
-        """Switch the model on the running ACP session (mid-conversation)."""
+    def set_acp_model(self, model: str) -> str:
+        """Switch the model on the running ACP session (mid-conversation).
+
+        Returns:
+            The verified effective model id reported by the ACP server/session.
+        """
         if not model or not model.strip():
             raise ValueError("model must be a non-empty string")
         if not self.has_live_acp_session:
@@ -3668,6 +3672,7 @@ class ACPAgent(AgentBase):
             provider.key if provider else "unknown",
             _fingerprint_session_id(self._session_id),
         )
+        return effective_model
 
     def close(self) -> None:
         """Terminate the ACP subprocess and clean up resources."""
