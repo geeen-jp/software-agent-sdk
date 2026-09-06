@@ -87,7 +87,11 @@ def test_acp_conversation_create_query_final_response(
     trace = read_stub_trace(project_workspace)
     methods = trace_methods(project_workspace)
     assert "new_session" in methods
-    assert methods.count("set_session_model") >= 1
+    assert any(
+        event.get("method") == "set_session_model"
+        and event.get("model_id") == "composer-2.5"
+        for event in trace
+    )
     assert any(
         event.get("method") == "set_config_option"
         and event.get("config_id") == "fast"

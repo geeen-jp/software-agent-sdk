@@ -212,7 +212,9 @@ class DeterministicACPStubAgent:
             available_models=list(self._models.available_models),
             current_model_id=model_id,
         )
-        return SetSessionModelResponse()
+        return SetSessionModelResponse(
+            field_meta={"current_model_id": self._models.current_model_id}
+        )
 
     async def set_config_option(
         self, config_id: str, session_id: str, value: str | bool, **kwargs: Any
