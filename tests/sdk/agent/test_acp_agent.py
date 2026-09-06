@@ -1293,6 +1293,24 @@ class TestACPAgentCleanup:
         # Should not raise
         agent.close()
 
+    def test_close_awaits_async_connection_close(self):
+        import warnings
+
+        from openhands.sdk.utils.async_executor import AsyncExecutor
+
+        agent = _make_agent()
+        conn = MagicMock()
+        conn.close = AsyncMock()
+        agent._conn = conn
+        agent._executor = AsyncExecutor()
+        agent._process = None
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", RuntimeWarning)
+            agent.close()
+
+        conn.close.assert_awaited_once()
+
     def test_has_live_acp_session_false_before_init(self):
         agent = _make_agent()
         assert not agent.has_live_acp_session

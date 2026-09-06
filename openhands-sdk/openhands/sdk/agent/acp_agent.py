@@ -924,6 +924,19 @@ def _signal_acp_process(process: Any, method: Literal["terminate", "kill"]) -> N
         logger.debug("Error sending %s to ACP process: %s", method, e)
 
 
+async def _close_acp_connection(connection: Any) -> None:
+    """Close an ACP JSON-RPC connection from the executor portal loop.
+
+    ``connection.close()`` must run inside the scheduled coroutine, not on the
+    caller thread: ``run_async(conn.close)`` eagerly invokes ``close()`` while
+    building the coroutine and can leave an unawaited mock/real coroutine if
+    portal scheduling fails.
+    """
+    close_result = connection.close()
+    if inspect.isawaitable(close_result):
+        await close_result
+
+
 async def _await_bounded(awaitable: Any, what: str) -> bool:
     """Await *awaitable* under ``_ACP_INIT_ABORT_TIMEOUT``; report completion.
 
@@ -955,7 +968,7 @@ async def _abort_partial_acp_init(
     if filter_task is not None:
         filter_task.cancel()
     if conn is not None:
-        await _await_bounded(conn.close(), "closing the ACP connection")
+        await _await_bounded(_close_acp_connection(conn), "closing the ACP connection")
     _signal_acp_process(process, "terminate")
     if await _await_bounded(process.wait(), "waiting for the ACP process to exit"):
         return
@@ -3434,7 +3447,7 @@ class ACPAgent(AgentBase):
         if self._conn is not None and self._executor is not None:
             conn = self._conn
             try:
-                self._executor.run_async(conn.close, timeout=5.0)
+                self._executor.run_async(_close_acp_connection, conn, timeout=5.0)
             except Exception as e:
                 logger.debug("Error closing ACP connection: %s", e)
             self._conn = None
