@@ -1727,11 +1727,14 @@ class LocalConversation(BaseConversation):
           ``session/set_model`` call so the new model applies to subsequent
           turns of the *same* session, preserving conversation context.
         * **No live session yet** (created but not yet run): there is nothing to
-          switch live, so the new value is only persisted. Session creation on
-          the first ``run()`` then honors it — ``_maybe_set_session_model``
-          issues a one-shot ``set_session_model`` for every built-in provider
-          (codex, gemini, and claude-code) — so the first turn runs on the
-          switched model rather than silently using the construction-time one.
+          switch live, so the requested value is persisted on ``acp_model``
+          only. ``acp_current_model_id`` stays at the last server-verified
+          effective model (or absent if none has been observed). Session
+          creation on the first ``run()`` then honors the request —
+          ``_maybe_set_session_model`` issues a one-shot ``set_session_model``
+          for every built-in provider (codex, gemini, and claude-code) — so
+          the first turn runs on the switched model rather than silently
+          using the construction-time one.
 
         Args:
             model: Provider-specific model id to switch to.
@@ -1751,9 +1754,10 @@ class LocalConversation(BaseConversation):
             # With a live session, perform the protocol switch first; if it
             # fails we leave the persisted state untouched. Without one (pre
             # first run()), there is nothing to switch live — skip the call and
-            # just persist; session creation applies the value (see docstring).
+            # persist only the requested ``acp_model``; session creation
+            # applies and verifies the value (see docstring).
             live = self.agent.has_live_acp_session
-            verified_effective_model_id = model
+            verified_effective_model_id: str | None = None
             if live:
                 verified_effective_model_id = self.agent.set_acp_model(model)
             # Persist the switched model as the authoritative value. ``acp_model``
@@ -1783,19 +1787,16 @@ class LocalConversation(BaseConversation):
             # persisted state agree on the switched model.
             self.agent = new_agent
             self._state.agent = new_agent
-            # Keep the persisted effective-model hint in sync with the switch.
-            # ``acp_model`` on the copied agent holds the requested value; the
-            # live agent's ``current_model_id`` (a PrivateAttr) already
-            # reflects the verified effective model and wins on warm reads, but
-            # cold list reads after a process restart fall back to
-            # ``agent_state`` — which would otherwise still name the
-            # pre-switch effective model until the next resume. Persist only
-            # the verified effective id returned by ``set_acp_model``; never
-            # the requested model when they differ.
-            self._state.agent_state = {
-                **self._state.agent_state,
-                "acp_current_model_id": verified_effective_model_id,
-            }
+            # ``acp_current_model_id`` is the last server/session-verified
+            # effective model, not the requested ``acp_model``. Persist it
+            # only after a live ``set_acp_model`` returns a verified id.
+            # Pre-session switches leave any prior verified value in place
+            # (or leave the key absent if none has been observed).
+            if verified_effective_model_id is not None:
+                self._state.agent_state = {
+                    **self._state.agent_state,
+                    "acp_current_model_id": verified_effective_model_id,
+                }
 
     @observe(name="conversation.send_message")
     def send_message(self, message: str | Message, sender: str | None = None) -> None:

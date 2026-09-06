@@ -218,24 +218,25 @@ def test_switch_acp_model_before_session_defers_and_persists(tmp_path):
 
     conv.switch_acp_model("model-b")
 
-    # The authoritative model moved even though no live session was touched.
+    # The requested model moved even though no live session was touched.
     switched = conv.agent
     assert isinstance(switched, ACPAgent)
     assert switched.acp_model == "model-b"
     assert not switched.has_live_acp_session
     assert isinstance(conv.state.agent, ACPAgent)
     assert conv.state.agent.acp_model == "model-b"
-    # Cold-read hint updated for the chip/picker before any session exists.
-    assert conv.state.agent_state["acp_current_model_id"] == "model-b"
+    # No server/session has verified an effective model yet, so the
+    # effective-state key stays absent rather than copying the request.
+    assert "acp_current_model_id" not in conv.state.agent_state
 
     # Survives a restart before the first run: base_state.json carries the
-    # switched model, and model_post_init re-derives the sentinel LLM from it,
+    # requested model, and model_post_init re-derives the sentinel LLM from it,
     # so the first session starts on model-b (acceptance criterion #3).
-    base_text = conv.state._fs.read(BASE_STATE)
-    reloaded = ConversationState.model_validate(json.loads(base_text))
+    reloaded = _reload_persisted_state(conv)
     assert isinstance(reloaded.agent, ACPAgent)
     assert reloaded.agent.acp_model == "model-b"
     assert reloaded.agent.llm.model == "model-b"
+    assert "acp_current_model_id" not in reloaded.agent_state
 
 
 def test_switch_acp_model_persists_authoritative_model(tmp_path):
@@ -933,6 +934,43 @@ def test_switch_llm_to_subscription_profile_keeps_condenser(
 
 class TestSwitchACPModelEffectivePersistence:
     """MF-2 regression: persist verified effective model, not requested."""
+
+    def test_pre_session_requested_preserves_prior_verified_effective(self, tmp_path):
+        conv, agent = _make_pre_session_acp_conversation(tmp_path)
+        conv.state.agent_state = {
+            **conv.state.agent_state,
+            "acp_current_model_id": "model-y",
+        }
+        assert not agent.has_live_acp_session
+
+        conv.switch_acp_model("model-x")
+
+        switched = conv.agent
+        assert isinstance(switched, ACPAgent)
+        assert switched.acp_model == "model-x"
+        assert conv.state.agent_state["acp_current_model_id"] == "model-y"
+
+        reloaded = _reload_persisted_state(conv)
+        assert isinstance(reloaded.agent, ACPAgent)
+        assert reloaded.agent.acp_model == "model-x"
+        assert reloaded.agent_state["acp_current_model_id"] == "model-y"
+
+    def test_pre_session_requested_does_not_create_effective_key(self, tmp_path):
+        conv, agent = _make_pre_session_acp_conversation(tmp_path)
+        assert not agent.has_live_acp_session
+        assert "acp_current_model_id" not in conv.state.agent_state
+
+        conv.switch_acp_model("model-x")
+
+        switched = conv.agent
+        assert isinstance(switched, ACPAgent)
+        assert switched.acp_model == "model-x"
+        assert "acp_current_model_id" not in conv.state.agent_state
+
+        reloaded = _reload_persisted_state(conv)
+        assert isinstance(reloaded.agent, ACPAgent)
+        assert reloaded.agent.acp_model == "model-x"
+        assert "acp_current_model_id" not in reloaded.agent_state
 
     def test_requested_and_verified_effective_match_persists_effective(self, tmp_path):
         conv, agent = _wire_live_acp_conversation(tmp_path)
