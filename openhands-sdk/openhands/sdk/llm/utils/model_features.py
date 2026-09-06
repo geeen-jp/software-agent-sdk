@@ -112,6 +112,14 @@ REASONING_EFFORT_MODEL_OVERRIDES = {
     "kimi-k3": "moonshot/kimi-k3",
 }
 
+# Moonshot Kimi thinking models expose reasoning content but reject the
+# reasoning_effort parameter. LiteLLM may list the param for some routes.
+REASONING_EFFORT_FALSE_MODELS: list[str] = [
+    "kimi-k2-thinking",
+    "kimi-k2.5",
+    "kimi-k2.6",
+]
+
 
 EXTENDED_THINKING_MODELS: list[str] = [
     # Anthropic Claude models with useful agent performance gains.
@@ -364,6 +372,11 @@ def get_features(
             or "reasoning_effort" in supported_params
         ),
     )
+    if (
+        model_matches(model, REASONING_EFFORT_FALSE_MODELS)
+        and _optional_bool(overrides, "supports_reasoning_effort") is None
+    ):
+        supports_reasoning_effort = False
     thinking_mode = _thinking_mode(model, model_info, overrides)
     supports_sampling_params = _optional_bool(overrides, "supports_sampling_params")
     if supports_sampling_params is None:
