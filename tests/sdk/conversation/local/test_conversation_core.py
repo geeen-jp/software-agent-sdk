@@ -154,6 +154,7 @@ def test_conversation_event_id_validation():
 
 
 @maybe_mark_forked
+@pytest.mark.timeout(180)
 def test_conversation_large_event_handling():
     """Test conversation handling of many events with memory usage monitoring."""
     import gc
