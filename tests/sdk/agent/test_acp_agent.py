@@ -3702,7 +3702,7 @@ class TestACPSessionIdPersistence:
             with TestACPSessionIdPersistence._transport_patches(conn):
                 yield
         finally:
-            executor.close()
+            executor.close(timeout=1.0)
 
     @staticmethod
     def _patched_start_acp_server(agent, state, *, conn):
@@ -4235,7 +4235,7 @@ class TestACPSecretsEnvInjection:
                 )
                 agent._start_acp_server(state)
         finally:
-            agent._executor.close()
+            agent._executor.close(timeout=1.0)
 
         return captured
 
@@ -4385,7 +4385,7 @@ class TestACPEnvConflictSuppression:
                     )
                 agent._start_acp_server(state)
         finally:
-            agent._executor.close()
+            agent._executor.close(timeout=1.0)
 
         return captured
 

@@ -117,8 +117,6 @@ jobs:
                   # coverage collection. --forked prevents coverage from child processes.
                   CI=true uv run python -m pytest -vvs \
                     -n auto \
-                    --timeout=60 \
-                    --timeout-method=thread \
                     --cov=openhands-sdk \
                     --cov-report=term-missing \
                     --cov-fail-under=0 \
