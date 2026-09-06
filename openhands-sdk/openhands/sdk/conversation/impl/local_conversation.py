@@ -1664,7 +1664,11 @@ class LocalConversation(BaseConversation):
                 self.agent.llm,
                 new_llm,
             )
-            self.agent = self.agent.model_copy(update=update)
+            old_agent = self.agent
+            new_agent = old_agent.model_copy(update=update)
+            if isinstance(old_agent, ACPAgent) and isinstance(new_agent, ACPAgent):
+                new_agent.assume_runtime_ownership_from(old_agent)
+            self.agent = new_agent
             self._state.agent = self.agent
             self._bind_conversation_context(new_llm)
             # Invalidate the cached ask-agent LLM so it re-clones.
@@ -1771,9 +1775,7 @@ class LocalConversation(BaseConversation):
             old_agent = self.agent
             new_agent = old_agent.model_copy(update={"acp_model": model})
             if live:
-                new_agent._register_atexit_cleanup(replace=True)
-                new_agent._bind_file_credential_masking()
-                old_agent.release_runtime()
+                new_agent.assume_runtime_ownership_from(old_agent)
             # ``self.agent`` is the live reference used by subsequent ``step()``
             # calls; ``self._state.agent`` is what the autosave path serializes
             # to base_state.json. Update both so the running conversation and the

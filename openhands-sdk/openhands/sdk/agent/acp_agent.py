@@ -279,6 +279,14 @@ class ACPSessionConfigError(RuntimeError):
     """
 
 
+class ACPSessionModelError(RuntimeError):
+    """A requested ACP session model could not be applied or verified.
+
+    Raised when the server accepts a model switch but the authoritative
+    effective model cannot be confirmed or does not match the request.
+    """
+
+
 def _classify_acp_init_error(exc: BaseException) -> str:
     """Map a cold-start failure to a structured ``ConversationErrorEvent`` code."""
     if isinstance(exc, TimeoutError):
@@ -319,9 +327,13 @@ def _model_config_options(
     return ((_MODEL_CONFIG_OPTION_ID, model),)
 
 
-def _model_config_option(response: Any) -> Any | None:
-    """Return the ``model`` ``configOptions`` select off a session response."""
-    for raw in getattr(response, "config_options", None) or []:
+def _model_config_option_from_options(
+    options: list[SessionConfigOption] | None,
+) -> Any | None:
+    """Return the ``model`` select option from a complete config option state."""
+    if not options:
+        return None
+    for raw in options:
         opt = getattr(raw, "root", raw)
         if (
             getattr(opt, "type", None) == "select"
@@ -331,6 +343,127 @@ def _model_config_option(response: Any) -> Any | None:
     return None
 
 
+def _model_config_option(response: Any) -> Any | None:
+    """Return the ``model`` ``configOptions`` select off a session response."""
+    return _model_config_option_from_options(getattr(response, "config_options", None))
+
+
+_META_MODEL_ID_KEYS: Final[tuple[str, ...]] = (
+    "current_model_id",
+    "model_id",
+    "model",
+)
+
+
+def _effective_model_from_config_options(
+    options: list[SessionConfigOption] | None,
+    agent_name: str | None,
+) -> str | None:
+    """Reconstruct the effective model id from a complete config option state."""
+    opt = _model_config_option_from_options(options)
+    if opt is None:
+        return None
+    base = getattr(opt, "current_value", None)
+    if not isinstance(base, str) or not base:
+        return None
+    provider = detect_acp_provider_by_agent_name(agent_name or "")
+    if provider is not None and provider.key == "codex":
+        for raw in options or []:
+            effort_opt = getattr(raw, "root", raw)
+            if getattr(effort_opt, "id", None) != "reasoning_effort":
+                continue
+            effort = getattr(effort_opt, "current_value", None)
+            if isinstance(effort, str) and effort in _CODEX_REASONING_EFFORTS:
+                return f"{base}/{effort}"
+    return base
+
+
+def _requested_model_matches_observed(
+    requested: str,
+    observed: str,
+    *,
+    agent_name: str | None,
+    via_config_option: bool,
+) -> bool:
+    if requested == observed:
+        return True
+    if not via_config_option:
+        return False
+    provider = detect_acp_provider_by_agent_name(agent_name or "")
+    if provider is None or provider.key != "codex":
+        return False
+    base, sep, effort = requested.rpartition("/")
+    if sep and effort in _CODEX_REASONING_EFFORTS:
+        return False
+    observed_base, observed_sep, observed_effort = observed.rpartition("/")
+    return bool(
+        observed_sep
+        and observed_effort in _CODEX_REASONING_EFFORTS
+        and observed_base == requested
+    )
+
+
+def _resolve_effective_model(
+    *,
+    requested: str,
+    agent_name: str | None,
+    session_id: str,
+    via_config_option: bool,
+    response: Any | None = None,
+    config_options: list[SessionConfigOption] | None = None,
+    client: _OpenHandsACPBridge | None = None,
+) -> str:
+    """Return the authoritative effective model id or fail closed."""
+    effective: str | None = None
+
+    if response is not None:
+        extracted, _, _ = _extract_session_models(response)
+        if extracted:
+            effective = extracted
+
+    if effective is None and response is not None:
+        meta = getattr(response, "field_meta", None)
+        if isinstance(meta, dict):
+            models_block = meta.get("models")
+            if models_block is not None:
+                extracted, _, _ = _extract_session_models(
+                    type("_ModelCarrier", (), {"models": models_block})()
+                )
+                if extracted:
+                    effective = extracted
+            if effective is None:
+                for key in _META_MODEL_ID_KEYS:
+                    value = meta.get(key)
+                    if isinstance(value, str) and value:
+                        effective = value
+                        break
+
+    if effective is None:
+        options = config_options
+        if options is None and client is not None:
+            options = client.get_config_options(session_id)
+        if via_config_option or options:
+            effective = _effective_model_from_config_options(options, agent_name)
+
+    if effective is None:
+        raise ACPSessionModelError(
+            f"ACP server {agent_name!r} session {session_id} did not report an "
+            f"authoritative model after requesting {requested!r}; the requested "
+            "model cannot be verified."
+        )
+    if not _requested_model_matches_observed(
+        requested,
+        effective,
+        agent_name=agent_name,
+        via_config_option=via_config_option,
+    ):
+        raise ACPSessionModelError(
+            f"ACP server {agent_name!r} session {session_id} reports effective "
+            f"model {effective!r} after requesting {requested!r}."
+        )
+    return effective
+
+
 async def _apply_acp_model(
     conn: ClientSideConnection,
     session_id: str,
@@ -338,15 +471,34 @@ async def _apply_acp_model(
     *,
     agent_name: str | None = None,
     via_config_option: bool,
-) -> None:
-    """Apply ``model`` to a live ACP session via the advertised mechanism."""
+    client: _OpenHandsACPBridge | None = None,
+) -> str:
+    """Apply ``model`` to a live ACP session and return the verified effective id."""
     if via_config_option:
+        last_options: list[SessionConfigOption] | None = None
         for config_id, value in _model_config_options(agent_name, model):
-            await conn.set_config_option(
+            response = await conn.set_config_option(
                 config_id=config_id, value=value, session_id=session_id
             )
-    else:
-        await conn.set_session_model(model_id=model, session_id=session_id)
+            last_options = response.config_options
+        return _resolve_effective_model(
+            requested=model,
+            agent_name=agent_name,
+            session_id=session_id,
+            via_config_option=True,
+            config_options=last_options,
+            client=client,
+        )
+
+    response = await conn.set_session_model(model_id=model, session_id=session_id)
+    return _resolve_effective_model(
+        requested=model,
+        agent_name=agent_name,
+        session_id=session_id,
+        via_config_option=False,
+        response=response,
+        client=client,
+    )
 
 
 def _usable_models(infos: Iterable[ACPModelInfo]) -> list[ACPModelInfo]:
@@ -390,6 +542,7 @@ async def _maybe_set_session_model(
     via_config_option: bool = False,
     model_state: SessionModelState | None = None,
     apply_requested: bool = False,
+    client: _OpenHandsACPBridge | None = None,
 ) -> bool:
     """Apply the *initial* session model right after session creation.
 
@@ -401,7 +554,7 @@ async def _maybe_set_session_model(
     the requested model is pushed even if the server did not advertise model
     state in the session response.
 
-    Returns ``True`` only when a model-setting call succeeded.
+    Returns ``True`` only when the requested model was applied and verified.
     """
     if not acp_model:
         return False
@@ -416,8 +569,19 @@ async def _maybe_set_session_model(
                 acp_model,
                 agent_name=agent_name,
                 via_config_option=via_config_option,
+                client=client,
             )
             return True
+        except ACPSessionModelError:
+            if apply_requested:
+                raise
+            logger.warning(
+                "Could not verify model %r on ACP server %s; "
+                "the session will use the server default",
+                acp_model,
+                agent_name,
+            )
+            return False
         except ACPRequestError as e:
             logger.warning(
                 "Could not set model %r on ACP server %s (%s); "
@@ -435,8 +599,19 @@ async def _maybe_set_session_model(
                 acp_model,
                 agent_name=agent_name,
                 via_config_option=via_config_option,
+                client=client,
             )
             return True
+        except ACPSessionModelError:
+            if apply_requested:
+                raise
+            logger.warning(
+                "Could not verify model %r on ACP server %s; "
+                "the session will use the server default",
+                acp_model,
+                agent_name,
+            )
+            return False
         except ACPRequestError as e:
             logger.warning(
                 "Could not set model %r on ACP server %s (%s); "
@@ -456,6 +631,7 @@ async def _reapply_session_model_on_resume(
     acp_model: str | None,
     *,
     via_config_option: bool,
+    client: _OpenHandsACPBridge | None = None,
 ) -> bool:
     """Reapply the persisted model to a *resumed* session."""
     if not acp_model:
@@ -470,8 +646,18 @@ async def _reapply_session_model_on_resume(
             acp_model,
             agent_name=agent_name,
             via_config_option=via_config_option,
+            client=client,
         )
         return True
+    except ACPSessionModelError as e:
+        logger.warning(
+            "Could not verify model %r on resumed session %s (%s); the live "
+            "session may run on the server default until the next switch",
+            acp_model,
+            _fingerprint_session_id(session_id),
+            e,
+        )
+        return False
     except ACPRequestError as e:
         logger.warning(
             "Could not reapply model %r on resumed session %s (%s); the live "
@@ -2369,6 +2555,7 @@ class ACPAgent(AgentBase):
                         via_config_option=self._model_via_config_option,
                         model_state=getattr(response, "models", None),
                         apply_requested=True,
+                        client=client,
                     )
                 else:
                     override_applied = await _reapply_session_model_on_resume(
@@ -2377,6 +2564,7 @@ class ACPAgent(AgentBase):
                         session_id,
                         self.acp_model,
                         via_config_option=self._model_via_config_option,
+                        client=client,
                     )
 
                 current_model_id = (
@@ -3374,6 +3562,15 @@ class ACPAgent(AgentBase):
         with client._fork_lock:
             return self._executor.run_async(_fork_and_prompt)
 
+    def assume_runtime_ownership_from(self, predecessor: ACPAgent) -> None:
+        """Take sole cleanup ownership after a shallow :meth:`model_copy` handoff."""
+        if predecessor._closed:
+            return
+        if predecessor.has_live_acp_session or predecessor._has_runtime_resources():
+            self._register_atexit_cleanup(replace=True)
+            self._bind_file_credential_masking()
+            predecessor.release_runtime()
+
     def set_acp_model(self, model: str) -> None:
         """Switch the model on the running ACP session (mid-conversation)."""
         if not model or not model.strip():
@@ -3394,15 +3591,25 @@ class ACPAgent(AgentBase):
         conn = self._conn
         session_id = self._session_id
         try:
-            self._executor.run_async(
+            effective_model = self._executor.run_async(
                 _apply_acp_model,
                 conn,
                 session_id,
                 model,
                 agent_name=self._agent_name,
                 via_config_option=self._model_via_config_option,
+                client=self._client,
                 timeout=self.acp_prompt_timeout,
             )
+        except ACPSessionModelError as e:
+            method = (
+                "set_config_option(model)"
+                if self._model_via_config_option
+                else "set_session_model"
+            )
+            raise ValueError(
+                f"ACP server could not verify {method}(model={model!r}): {e}"
+            ) from e
         except ACPRequestError as e:
             if e.code in _RETRIABLE_SERVER_ERROR_CODES:
                 raise
@@ -3414,14 +3621,14 @@ class ACPAgent(AgentBase):
             raise ValueError(
                 f"ACP server rejected {method}(model={model!r}): {e}"
             ) from e
-        self.llm.model = model
-        self.llm.metrics.model_name = model
+        self.llm.model = effective_model
+        self.llm.metrics.model_name = effective_model
         if self.llm.metrics.accumulated_token_usage is not None:
-            self.llm.metrics.accumulated_token_usage.model = model
-        self._current_model_id = model
+            self.llm.metrics.accumulated_token_usage.model = effective_model
+        self._current_model_id = effective_model
         logger.info(
             "Switched ACP session model to %s (provider=%s, session=%s)",
-            model,
+            effective_model,
             provider.key if provider else "unknown",
             _fingerprint_session_id(self._session_id),
         )

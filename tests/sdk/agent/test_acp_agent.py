@@ -92,6 +92,14 @@ def _agent_conn(agent: ACPAgent) -> Any:
     return cast(Any, agent._conn)
 
 
+async def _verified_set_session_model(
+    *, model_id: str, session_id: str, **kwargs: Any
+) -> Any:
+    from acp.schema import SetSessionModelResponse
+
+    return SetSessionModelResponse(field_meta={"current_model_id": model_id})
+
+
 # ---------------------------------------------------------------------------
 # Instantiation
 # ---------------------------------------------------------------------------
@@ -2808,6 +2816,7 @@ class TestMaybeSetSessionModel:
     @pytest.mark.asyncio
     async def test_codex_agent_uses_protocol_model_override(self):
         conn = AsyncMock()
+        conn.set_session_model = AsyncMock(side_effect=_verified_set_session_model)
         await _maybe_set_session_model(conn, "codex-acp", "session-1", "gpt-5.4")
         conn.set_session_model.assert_awaited_once_with(
             model_id="gpt-5.4",
@@ -2820,6 +2829,7 @@ class TestMaybeSetSessionModel:
         path pushes ``acp_model`` via the protocol call as well as session _meta.
         """
         conn = AsyncMock()
+        conn.set_session_model = AsyncMock(side_effect=_verified_set_session_model)
         await _maybe_set_session_model(
             conn,
             "claude-agent-acp",
@@ -2848,6 +2858,7 @@ class TestMaybeSetSessionModel:
     async def test_unregistered_agent_with_model_state_uses_protocol_override(self):
         """``models`` in the session response is the signal to use set_model."""
         conn = AsyncMock()
+        conn.set_session_model = AsyncMock(side_effect=_verified_set_session_model)
         await _maybe_set_session_model(
             conn,
             "some-custom-acp",
@@ -2869,6 +2880,7 @@ class TestMaybeSetSessionModel:
     ):
         """Session init with an explicit ``acp_model`` pushes via set_model."""
         conn = AsyncMock()
+        conn.set_session_model = AsyncMock(side_effect=_verified_set_session_model)
         await _maybe_set_session_model(
             conn,
             "cursor-agent",
@@ -3181,6 +3193,7 @@ class TestGeminiSessionModel:
     @pytest.mark.asyncio
     async def test_gemini_cli_uses_protocol_model_override(self):
         conn = AsyncMock()
+        conn.set_session_model = AsyncMock(side_effect=_verified_set_session_model)
         await _maybe_set_session_model(
             conn, "gemini-cli", "session-1", "gemini-3-flash"
         )
@@ -3234,13 +3247,45 @@ class TestSetACPModel:
     def _wire(
         agent: ACPAgent, agent_name: str, *, via_config_option: bool = False
     ) -> ACPAgent:
+        from acp.schema import SetSessionConfigOptionResponse, SetSessionModelResponse
+
         conn = MagicMock()
-        conn.set_session_model = AsyncMock()
-        conn.set_config_option = AsyncMock()
+        model_options = [
+            _config_option(
+                "model", "old-model", ["old-model", "gpt-5.5", "gpt-5.5/high"]
+            ),
+            _config_option(
+                "reasoning_effort",
+                "medium",
+                ["low", "medium", "high", "xhigh"],
+            ),
+        ]
+
+        async def _set_config_option(
+            *, config_id: str, session_id: str, value: str | bool, **kwargs: Any
+        ) -> SetSessionConfigOptionResponse:
+            nonlocal model_options
+            updated: list[SessionConfigOption] = []
+            for option in model_options:
+                if option.id == config_id:
+                    updated.append(_config_option_with_value(option, value))
+                else:
+                    updated.append(option)
+            model_options = updated
+            return SetSessionConfigOptionResponse(config_options=list(model_options))
+
+        async def _set_session_model(
+            *, model_id: str, session_id: str, **kwargs: Any
+        ) -> SetSessionModelResponse:
+            return SetSessionModelResponse(field_meta={"current_model_id": model_id})
+
+        conn.set_session_model = AsyncMock(side_effect=_set_session_model)
+        conn.set_config_option = AsyncMock(side_effect=_set_config_option)
         agent._conn = conn
         agent._session_id = "sess-1"
         agent._agent_name = agent_name
         agent._model_via_config_option = via_config_option
+        agent._client = _OpenHandsACPBridge()
         executor = MagicMock()
 
         def _run(
@@ -3280,7 +3325,7 @@ class TestSetACPModel:
         _agent_conn(agent).set_config_option.assert_awaited_once_with(
             config_id="model", value="gpt-5.5", session_id="sess-1"
         )
-        assert agent.current_model_id == "gpt-5.5"
+        assert agent.current_model_id == "gpt-5.5/medium"
 
     def test_switches_codex_via_config_option_splits_reasoning_effort(self):
         agent = self._wire(_make_agent(), "codex-acp", via_config_option=True)
@@ -3329,6 +3374,45 @@ class TestSetACPModel:
         agent.set_acp_model("gpt-5.5")
         _, kwargs = agent._executor.run_async.call_args
         assert kwargs["timeout"] == 42.0
+
+    def test_rejected_switch_preserves_authoritative_model(self):
+        agent = self._wire(_make_agent(), "codex-acp")
+        agent._current_model_id = "model-a"
+        agent.llm.model = "model-a"
+        _agent_conn(agent).set_session_model.side_effect = ACPRequestError(
+            code=-32601, message="method not found"
+        )
+        with pytest.raises(ValueError, match="rejected set_session_model"):
+            agent.set_acp_model("model-b")
+        assert agent.current_model_id == "model-a"
+        assert agent.llm.model == "model-a"
+
+    def test_effective_model_mismatch_fails_closed(self):
+        agent = self._wire(_make_agent(), "codex-acp")
+
+        async def _wrong_model(*, model_id: str, session_id: str, **kwargs: Any):
+            from acp.schema import SetSessionModelResponse
+
+            return SetSessionModelResponse(
+                field_meta={"current_model_id": "other-model"}
+            )
+
+        _agent_conn(agent).set_session_model = AsyncMock(side_effect=_wrong_model)
+        with pytest.raises(ValueError, match="could not verify"):
+            agent.set_acp_model("gpt-5.5")
+        assert agent.current_model_id != "gpt-5.5"
+
+    def test_unverifiable_model_state_fails_closed(self):
+        agent = self._wire(_make_agent(), "codex-acp")
+
+        async def _empty_response(*, model_id: str, session_id: str, **kwargs: Any):
+            from acp.schema import SetSessionModelResponse
+
+            return SetSessionModelResponse()
+
+        _agent_conn(agent).set_session_model = AsyncMock(side_effect=_empty_response)
+        with pytest.raises(ValueError, match="could not verify"):
+            agent.set_acp_model("gpt-5.5")
 
 
 # ---------------------------------------------------------------------------
@@ -4333,7 +4417,20 @@ def _make_config_conn(
 
     conn.set_config_option = AsyncMock(side_effect=_set_config_option)
     conn.set_session_mode = AsyncMock()
-    conn.set_session_model = AsyncMock()
+
+    models_state = {"value": models}
+
+    async def _set_session_model(*, model_id: str, session_id: str, **kwargs):
+        from acp.schema import SetSessionModelResponse
+
+        if models_state["value"] is not None:
+            models_state["value"] = SessionModelState(
+                available_models=list(models_state["value"].available_models),
+                current_model_id=model_id,
+            )
+        return SetSessionModelResponse(field_meta={"current_model_id": model_id})
+
+    conn.set_session_model = AsyncMock(side_effect=_set_session_model)
     conn.authenticate = AsyncMock()
     conn.close = AsyncMock()
     return conn

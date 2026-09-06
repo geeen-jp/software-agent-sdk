@@ -1,6 +1,7 @@
 import asyncio
 import json
 from pathlib import Path
+from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
@@ -81,7 +82,13 @@ def _make_acp_conversation(tmp_path) -> tuple[LocalConversation, ACPAgent]:
     agent._session_id = "sess-1"
     agent._agent_name = "codex-acp"
     executor = MagicMock()
-    executor.run_async = MagicMock()
+
+    def _run_async(awaitable_or_fn: Any, *args: Any, **kwargs: Any) -> Any:
+        if len(args) >= 3 and isinstance(args[2], str):
+            return args[2]
+        return None
+
+    executor.run_async = MagicMock(side_effect=_run_async)
     agent._executor = executor
     conv = LocalConversation(
         agent=agent,
@@ -257,6 +264,55 @@ def test_switch_acp_model_disarms_discarded_agent_finalizer(tmp_path):
     live_executor.close.assert_not_called()
     switched.release_runtime()
     assert switched._atexit_callback is None
+
+
+def test_switch_llm_disarms_discarded_acp_agent_finalizer(tmp_path):
+    """switch_llm shallow-copies ACPAgent and must not leave two cleanup owners."""
+    conv, old_agent = _make_acp_conversation(tmp_path)
+    live_conn = old_agent._conn
+    live_executor = old_agent._executor
+    old_agent._register_atexit_cleanup()
+
+    conv.switch_llm(_make_llm("other-model", "other-llm"))
+
+    switched = conv.agent
+    assert isinstance(switched, ACPAgent)
+    assert switched._conn is live_conn
+    assert switched._executor is live_executor
+    assert old_agent._closed is True
+    assert old_agent._atexit_callback is None
+    assert switched._atexit_callback is not None
+
+    live_executor.run_async.reset_mock()
+    old_agent.close()
+    live_executor.run_async.assert_not_called()
+
+
+def test_switch_profile_disarms_discarded_acp_agent_finalizer(
+    tmp_path, profile_store, monkeypatch
+):
+    profile_dir = tmp_path / "profiles"
+    store = LLMProfileStore(profile_dir)
+    store.save("fast", _make_llm("fast-model", "fast"))
+    monkeypatch.setattr(llm_profile_store, "_DEFAULT_PROFILE_DIR", profile_dir)
+
+    conv, old_agent = _make_acp_conversation(tmp_path)
+    live_conn = old_agent._conn
+    live_executor = old_agent._executor
+    old_agent._register_atexit_cleanup()
+
+    conv.switch_profile("fast")
+
+    switched = conv.agent
+    assert isinstance(switched, ACPAgent)
+    assert switched._conn is live_conn
+    assert switched._executor is live_executor
+    assert old_agent._closed is True
+    assert switched._atexit_callback is not None
+
+    live_executor.run_async.reset_mock()
+    old_agent.close()
+    live_executor.run_async.assert_not_called()
 
 
 def test_switch_profile(profile_store):
