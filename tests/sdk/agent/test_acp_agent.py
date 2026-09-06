@@ -6,8 +6,9 @@ import asyncio
 import json
 import threading
 import uuid
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from concurrent.futures import Future
+from contextlib import contextmanager
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
@@ -3690,12 +3691,23 @@ class TestACPSessionIdPersistence:
         return stack
 
     @staticmethod
-    def _patched_start_acp_server(agent, state, *, conn):
-        """Invoke the real _start_acp_server with ACP transport layers mocked."""
+    @contextmanager
+    def _mocked_acp_runtime(agent, conn) -> Iterator[None]:
+        """Run ACP transport mocks on a real AsyncExecutor, then always close it."""
         from openhands.sdk.utils.async_executor import AsyncExecutor
 
-        agent._executor = AsyncExecutor()
-        with TestACPSessionIdPersistence._transport_patches(conn):
+        executor = AsyncExecutor()
+        agent._executor = executor
+        try:
+            with TestACPSessionIdPersistence._transport_patches(conn):
+                yield
+        finally:
+            executor.close()
+
+    @staticmethod
+    def _patched_start_acp_server(agent, state, *, conn):
+        """Invoke the real _start_acp_server with ACP transport layers mocked."""
+        with TestACPSessionIdPersistence._mocked_acp_runtime(agent, conn):
             agent._start_acp_server(state)
 
     @staticmethod
@@ -3871,8 +3883,6 @@ class TestACPSessionIdPersistence:
         overwrite state.agent_state['acp_session_id'] with the new id so
         the next restart doesn't keep trying to resume the stale one.
         """
-        from openhands.sdk.utils.async_executor import AsyncExecutor
-
         agent = _make_agent()
         state = _make_state(tmp_path)
         state.agent_state = {
@@ -3885,8 +3895,7 @@ class TestACPSessionIdPersistence:
             load_exc=ACPRequestError(-32602, "unknown session"),
         )
 
-        agent._executor = AsyncExecutor()
-        with self._transport_patches(conn):
+        with self._mocked_acp_runtime(agent, conn):
             agent.init_state(state, on_event=lambda _: None)
 
         conn.load_session.assert_awaited_once()
@@ -3941,7 +3950,6 @@ class TestACPSessionIdPersistence:
         import uuid as _uuid
 
         from openhands.sdk.conversation import Conversation
-        from openhands.sdk.utils.async_executor import AsyncExecutor
 
         persistence_dir = tmp_path / "persist"
         conv_id = _uuid.uuid4()
@@ -3950,8 +3958,7 @@ class TestACPSessionIdPersistence:
 
         conn1 = self._make_conn(new_session_id="roundtrip-sess")
         agent1 = _make_agent()
-        agent1._executor = AsyncExecutor()
-        with self._transport_patches(conn1):
+        with self._mocked_acp_runtime(agent1, conn1):
             conv1 = Conversation(
                 agent=agent1,
                 workspace=str(workspace),
@@ -3970,8 +3977,7 @@ class TestACPSessionIdPersistence:
         # Fresh ACPAgent with no runtime knowledge of the prior session.
         conn2 = self._make_conn()
         agent2 = _make_agent()
-        agent2._executor = AsyncExecutor()
-        with self._transport_patches(conn2):
+        with self._mocked_acp_runtime(agent2, conn2):
             conv2 = Conversation(
                 agent=agent2,
                 workspace=str(workspace),
@@ -3994,10 +4000,8 @@ class TestACPSessionIdPersistence:
         assert agent2._session_id == "roundtrip-sess"
 
 
-class TestACPModelStatePersistence(TestACPSessionIdPersistence):
+class TestACPModelStatePersistence:
     def test_resume_without_models_preserves_persisted_model_state(self, tmp_path):
-        from openhands.sdk.utils.async_executor import AsyncExecutor
-
         agent = _make_agent()
         state = _make_state(tmp_path)
         state.agent_state = {
@@ -4013,13 +4017,12 @@ class TestACPModelStatePersistence(TestACPSessionIdPersistence):
                 }
             ],
         }
-        conn = self._make_conn()
+        conn = TestACPSessionIdPersistence._make_conn()
         load_response = MagicMock(spec=["config_options"])
         load_response.config_options = None
         conn.load_session = AsyncMock(return_value=load_response)
 
-        agent._executor = AsyncExecutor()
-        with self._transport_patches(conn):
+        with TestACPSessionIdPersistence._mocked_acp_runtime(agent, conn):
             agent.init_state(state, on_event=lambda _: None)
 
         assert state.agent_state["acp_current_model_id"] == "claude-opus-4-1"
@@ -4028,8 +4031,6 @@ class TestACPModelStatePersistence(TestACPSessionIdPersistence):
         ]
 
     def test_resume_effective_model_mismatch_fails_closed(self, tmp_path):
-        from openhands.sdk.utils.async_executor import AsyncExecutor
-
         agent = _make_agent(acp_model="model-x")
         state = _make_state(tmp_path)
         state.agent_state = {
@@ -4037,7 +4038,7 @@ class TestACPModelStatePersistence(TestACPSessionIdPersistence):
             "acp_session_id": "resumable-sess",
             "acp_session_cwd": str(tmp_path),
         }
-        conn = self._make_conn()
+        conn = TestACPSessionIdPersistence._make_conn()
         conn.initialize.return_value.agent_info.name = "codex-acp"
         conn.initialize.return_value.auth_methods = []
 
@@ -4048,15 +4049,12 @@ class TestACPModelStatePersistence(TestACPSessionIdPersistence):
 
         conn.set_session_model = AsyncMock(side_effect=_wrong_model)
 
-        agent._executor = AsyncExecutor()
-        with self._transport_patches(conn):
+        with TestACPSessionIdPersistence._mocked_acp_runtime(agent, conn):
             with pytest.raises(ACPSessionModelError, match="reports effective"):
                 agent.init_state(state, on_event=lambda _: None)
 
     def test_fresh_init_uses_verified_effective_model_not_requested(self, tmp_path):
         from acp.schema import SetSessionConfigOptionResponse
-
-        from openhands.sdk.utils.async_executor import AsyncExecutor
 
         agent = _make_agent(acp_model="gpt-5.5")
         state = _make_state(tmp_path)
@@ -4068,7 +4066,7 @@ class TestACPModelStatePersistence(TestACPSessionIdPersistence):
                 ["low", "medium", "high", "xhigh"],
             ),
         ]
-        conn = self._make_conn(new_session_id="fresh-sess")
+        conn = TestACPSessionIdPersistence._make_conn(new_session_id="fresh-sess")
         conn.initialize.return_value.agent_info.name = "codex-acp"
         conn.initialize.return_value.auth_methods = []
         new_response = NewSessionResponse(
@@ -4095,8 +4093,7 @@ class TestACPModelStatePersistence(TestACPSessionIdPersistence):
             side_effect=ACPRequestError(code=-32601, message="method not found")
         )
 
-        agent._executor = AsyncExecutor()
-        with self._transport_patches(conn):
+        with TestACPSessionIdPersistence._mocked_acp_runtime(agent, conn):
             agent.init_state(state, on_event=lambda _: None)
 
         assert agent.acp_model == "gpt-5.5"
@@ -4105,8 +4102,6 @@ class TestACPModelStatePersistence(TestACPSessionIdPersistence):
         assert state.agent_state["acp_current_model_id"] == "gpt-5.5/medium"
 
     def test_resume_rejected_override_fails_closed_before_prompt(self, tmp_path):
-        from openhands.sdk.utils.async_executor import AsyncExecutor
-
         agent = _make_agent(acp_model="model-x")
         state = _make_state(tmp_path)
         state.agent_state = {
@@ -4115,7 +4110,7 @@ class TestACPModelStatePersistence(TestACPSessionIdPersistence):
             "acp_session_cwd": str(tmp_path),
             "acp_current_model_id": "model-x",
         }
-        conn = self._make_conn()
+        conn = TestACPSessionIdPersistence._make_conn()
         conn.initialize.return_value.agent_info.name = "codex-acp"
         conn.initialize.return_value.auth_methods = []
         load_response = MagicMock(spec=["config_options"])
@@ -4125,8 +4120,7 @@ class TestACPModelStatePersistence(TestACPSessionIdPersistence):
             side_effect=ACPRequestError(code=-32601, message="method not found")
         )
 
-        agent._executor = AsyncExecutor()
-        with self._transport_patches(conn):
+        with TestACPSessionIdPersistence._mocked_acp_runtime(agent, conn):
             with pytest.raises(ACPSessionModelError, match="rejected model"):
                 agent.init_state(state, on_event=lambda _: None)
 
@@ -4136,8 +4130,6 @@ class TestACPModelStatePersistence(TestACPSessionIdPersistence):
     def test_fresh_replacement_clears_stale_model_when_new_session_omits_models(
         self, tmp_path
     ):
-        from openhands.sdk.utils.async_executor import AsyncExecutor
-
         agent = _make_agent()
         state = _make_state(tmp_path)
         state.agent_state = {
@@ -4152,13 +4144,12 @@ class TestACPModelStatePersistence(TestACPSessionIdPersistence):
         new_session_response = MagicMock(spec=["session_id", "config_options"])
         new_session_response.session_id = "replacement-sess"
         new_session_response.config_options = None
-        conn = self._make_conn(
+        conn = TestACPSessionIdPersistence._make_conn(
             load_exc=ACPRequestError(-32602, "unknown session"),
         )
         conn.new_session = AsyncMock(return_value=new_session_response)
 
-        agent._executor = AsyncExecutor()
-        with self._transport_patches(conn):
+        with TestACPSessionIdPersistence._mocked_acp_runtime(agent, conn):
             agent.init_state(state, on_event=lambda _: None)
 
         assert state.agent_state["acp_session_id"] == "replacement-sess"
@@ -4216,33 +4207,35 @@ class TestACPSecretsEnvInjection:
 
         state = _make_state(tmp_path)
         agent._executor = AsyncExecutor()
-
-        with ExitStack() as stack:
-            stack.enter_context(
-                patch(
-                    "openhands.sdk.agent.acp_agent.asyncio.create_subprocess_exec",
-                    new=_fake_create_subprocess_exec,
+        try:
+            with ExitStack() as stack:
+                stack.enter_context(
+                    patch(
+                        "openhands.sdk.agent.acp_agent.asyncio.create_subprocess_exec",
+                        new=_fake_create_subprocess_exec,
+                    )
                 )
-            )
-            stack.enter_context(
-                patch(
-                    "openhands.sdk.agent.acp_agent.ClientSideConnection",
-                    return_value=conn,
+                stack.enter_context(
+                    patch(
+                        "openhands.sdk.agent.acp_agent.ClientSideConnection",
+                        return_value=conn,
+                    )
                 )
-            )
-            stack.enter_context(
-                patch(
-                    "openhands.sdk.agent.acp_agent._filter_jsonrpc_lines",
-                    new=_fake_filter,
+                stack.enter_context(
+                    patch(
+                        "openhands.sdk.agent.acp_agent._filter_jsonrpc_lines",
+                        new=_fake_filter,
+                    )
                 )
-            )
-            stack.enter_context(
-                patch(
-                    "openhands.sdk.agent.acp_agent.asyncio.StreamReader",
-                    return_value=MagicMock(),
+                stack.enter_context(
+                    patch(
+                        "openhands.sdk.agent.acp_agent.asyncio.StreamReader",
+                        return_value=MagicMock(),
+                    )
                 )
-            )
-            agent._start_acp_server(state)
+                agent._start_acp_server(state)
+        finally:
+            agent._executor.close()
 
         return captured
 
@@ -4360,35 +4353,39 @@ class TestACPEnvConflictSuppression:
 
         state = _make_state(tmp_path)
         agent._executor = AsyncExecutor()
-
-        with ExitStack() as stack:
-            stack.enter_context(
-                patch(
-                    "openhands.sdk.agent.acp_agent.asyncio.create_subprocess_exec",
-                    new=_fake_create_subprocess_exec,
+        try:
+            with ExitStack() as stack:
+                stack.enter_context(
+                    patch(
+                        "openhands.sdk.agent.acp_agent.asyncio.create_subprocess_exec",
+                        new=_fake_create_subprocess_exec,
+                    )
                 )
-            )
-            stack.enter_context(
-                patch(
-                    "openhands.sdk.agent.acp_agent.ClientSideConnection",
-                    return_value=conn,
+                stack.enter_context(
+                    patch(
+                        "openhands.sdk.agent.acp_agent.ClientSideConnection",
+                        return_value=conn,
+                    )
                 )
-            )
-            stack.enter_context(
-                patch(
-                    "openhands.sdk.agent.acp_agent._filter_jsonrpc_lines",
-                    new=_fake_filter,
+                stack.enter_context(
+                    patch(
+                        "openhands.sdk.agent.acp_agent._filter_jsonrpc_lines",
+                        new=_fake_filter,
+                    )
                 )
-            )
-            stack.enter_context(
-                patch(
-                    "openhands.sdk.agent.acp_agent.asyncio.StreamReader",
-                    return_value=MagicMock(),
+                stack.enter_context(
+                    patch(
+                        "openhands.sdk.agent.acp_agent.asyncio.StreamReader",
+                        return_value=MagicMock(),
+                    )
                 )
-            )
-            if extra_os_env:
-                stack.enter_context(patch.dict("os.environ", extra_os_env, clear=False))
-            agent._start_acp_server(state)
+                if extra_os_env:
+                    stack.enter_context(
+                        patch.dict("os.environ", extra_os_env, clear=False)
+                    )
+                agent._start_acp_server(state)
+        finally:
+            agent._executor.close()
 
         return captured
 
@@ -4856,14 +4853,11 @@ class TestACPSessionConfigOptions:
 
     def test_missing_option_fails_init_state_and_cleans_up(self, tmp_path):
         """A requested option the server does not expose aborts initialization."""
-        from openhands.sdk.utils.async_executor import AsyncExecutor
-
         agent = _make_agent(acp_config_options={"effort": "medium"})
         state = _make_state(tmp_path)
         conn = _make_config_conn(options=[_config_option("fast", "true")])
 
-        agent._executor = AsyncExecutor()
-        with TestACPSessionIdPersistence._transport_patches(conn):
+        with TestACPSessionIdPersistence._mocked_acp_runtime(agent, conn):
             with pytest.raises(ACPSessionConfigError, match="effort"):
                 agent.init_state(state, on_event=lambda _: None)
 
