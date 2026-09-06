@@ -19,6 +19,7 @@ from typing import (
 )
 from uuid import UUID
 
+from acp.schema import ClientCapabilities
 from pydantic import (
     BaseModel,
     Discriminator,
@@ -1535,6 +1536,33 @@ class ACPAgentSettings(AgentSettingsBase):
             ).model_dump(),
         },
     )
+    acp_env: dict[str, str] = Field(
+        default_factory=dict,
+        description=(
+            "Additional environment variables for the ACP server subprocess. "
+            "Forwarded to :attr:`~openhands.sdk.agent.ACPAgent.acp_env`."
+        ),
+    )
+
+    @field_serializer("acp_env", when_used="always")
+    def _serialize_acp_env(self, value: dict[str, str], info: SerializationInfo):
+        return {k: serialize_secret(SecretStr(v), info) for k, v in value.items()}
+
+    acp_config_options: dict[str, str] = Field(
+        default_factory=dict,
+        description=(
+            "Session configuration options applied before the first prompt "
+            "(e.g. ``{'effort': 'medium', 'fast': 'false'}``). Forwarded to "
+            ":attr:`~openhands.sdk.agent.ACPAgent.acp_config_options`."
+        ),
+    )
+    acp_client_capabilities: ClientCapabilities | None = Field(
+        default=None,
+        description=(
+            "Explicit ACP client capabilities for initialize(). Forwarded to "
+            ":attr:`~openhands.sdk.agent.ACPAgent.acp_client_capabilities`."
+        ),
+    )
     acp_model: str | None = Field(
         default=None,
         description=(
@@ -1849,7 +1877,10 @@ class ACPAgentSettings(AgentSettingsBase):
             # read it from ConversationInfo.agent.acp_server.
             acp_server=self.acp_server,
             acp_args=list(self.acp_args),
+            acp_env=dict(self.acp_env),
             acp_model=self.acp_model,
+            acp_config_options=dict(self.acp_config_options),
+            acp_client_capabilities=self.acp_client_capabilities,
             acp_session_mode=self.acp_session_mode,
             acp_prompt_timeout=self.acp_prompt_timeout,
             acp_startup_timeout=self.acp_startup_timeout,

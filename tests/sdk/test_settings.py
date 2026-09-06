@@ -3,6 +3,7 @@ import shutil
 from typing import Any
 
 import pytest
+from acp.schema import ClientCapabilities
 from pydantic import SecretStr, ValidationError
 
 from openhands.agent_server.models import StartConversationRequest
@@ -1469,6 +1470,115 @@ def test_acp_create_agent_forwards_isolate_data_dir() -> None:
         acp_server="codex", acp_isolate_data_dir=True
     ).create_agent()
     assert isolated.acp_isolate_data_dir is True
+
+
+def test_acp_create_agent_forwards_config_env_and_capabilities() -> None:
+    capabilities = ClientCapabilities(field_meta={"parameterizedModelPicker": True})
+    settings = ACPAgentSettings(
+        acp_server="custom",
+        acp_command=["cursor-agent"],
+        acp_env={"CURSOR_API_KEY": "sk-test"},
+        acp_config_options={"effort": "medium", "fast": "false"},
+        acp_client_capabilities=capabilities,
+        acp_prompt_timeout=42.0,
+        acp_startup_timeout=7.0,
+        acp_session_mode="bypassPermissions",
+    )
+    agent = settings.create_agent()
+    assert isinstance(agent, ACPAgent)
+    assert agent.acp_env == {"CURSOR_API_KEY": "sk-test"}
+    assert agent.acp_config_options == {"effort": "medium", "fast": "false"}
+    assert agent.acp_client_capabilities == capabilities
+    assert agent.acp_prompt_timeout == 42.0
+    assert agent.acp_startup_timeout == 7.0
+    assert agent.acp_session_mode == "bypassPermissions"
+
+
+def test_acp_agent_settings_serialization_preserves_config_fields() -> None:
+    settings = ACPAgentSettings(
+        acp_command=["cursor-agent"],
+        acp_config_options={"fast": "false"},
+        acp_client_capabilities=ClientCapabilities(
+            field_meta={"parameterizedModelPicker": True}
+        ),
+        acp_env={"SECRET": "value"},
+        acp_startup_timeout=11.0,
+        acp_prompt_timeout=22.0,
+    )
+    restored = ACPAgentSettings.model_validate_json(
+        settings.model_dump_json(context={"expose_secrets": True})
+    )
+    assert restored.acp_config_options == {"fast": "false"}
+    assert restored.acp_client_capabilities is not None
+    assert restored.acp_client_capabilities.field_meta == {
+        "parameterizedModelPicker": True
+    }
+    assert restored.acp_env == {"SECRET": "value"}
+    assert restored.acp_startup_timeout == 11.0
+    assert restored.acp_prompt_timeout == 22.0
+
+
+def test_acp_agent_settings_acp_env_redacted_by_default() -> None:
+    settings = ACPAgentSettings(
+        acp_command=["echo"],
+        acp_env={"OPENAI_API_KEY": "sk-real-secret"},
+    )
+    blob = settings.model_dump_json()
+    assert "sk-real-secret" not in blob
+    exposed = settings.model_dump(context={"expose_secrets": True})
+    assert exposed["acp_env"]["OPENAI_API_KEY"] == "sk-real-secret"
+
+
+def test_start_conversation_request_preserves_acp_config_fields() -> None:
+    request = StartConversationRequest(
+        agent_settings={
+            "agent_kind": "acp",
+            "acp_server": "custom",
+            "acp_command": ["cursor-agent"],
+            "acp_env": {"FOO": "bar"},
+            "acp_config_options": {"fast": "false"},
+            "acp_client_capabilities": {
+                "field_meta": {"parameterizedModelPicker": True}
+            },
+            "acp_startup_timeout": 11.0,
+            "acp_prompt_timeout": 22.0,
+            "acp_session_mode": "full-access",
+            "acp_isolate_data_dir": True,
+        },
+        workspace=LocalWorkspace(working_dir="/tmp"),
+    )
+    agent = request.agent
+    assert isinstance(agent, ACPAgent)
+    assert agent.acp_env == {"FOO": "bar"}
+    assert agent.acp_config_options == {"fast": "false"}
+    assert agent.acp_client_capabilities is not None
+    assert agent.acp_client_capabilities.field_meta == {
+        "parameterizedModelPicker": True
+    }
+    assert agent.acp_startup_timeout == 11.0
+    assert agent.acp_prompt_timeout == 22.0
+    assert agent.acp_session_mode == "full-access"
+    assert agent.acp_isolate_data_dir is True
+
+
+def test_validate_agent_settings_preserves_acp_config_fields() -> None:
+    settings = validate_agent_settings(
+        {
+            "agent_kind": "acp",
+            "acp_server": "custom",
+            "acp_command": ["cursor-agent"],
+            "acp_config_options": {"effort": "medium"},
+            "acp_client_capabilities": {
+                "field_meta": {"parameterizedModelPicker": True}
+            },
+            "acp_env": {"TOKEN": "secret"},
+        }
+    )
+    assert isinstance(settings, ACPAgentSettings)
+    agent = settings.create_agent()
+    assert agent.acp_config_options == {"effort": "medium"}
+    assert agent.acp_env == {"TOKEN": "secret"}
+    assert agent.acp_client_capabilities is not None
 
 
 def test_acp_custom_server_with_command_resolves() -> None:

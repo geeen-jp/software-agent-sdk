@@ -214,7 +214,9 @@ def test_openrouter_model_id_normalization():
 
 
 def test_effective_unchanged_before_resolution():
-    llm = _openrouter_llm()
+    # Use an OpenRouter model absent from the LiteLLM catalog so catalog
+    # metadata does not populate effective_max_input_tokens before resolution.
+    llm = _openrouter_llm(model="openrouter/acme/uncatalogued-runtime-metadata-test")
     assert llm.resolved_runtime_metadata is None
     # Property performs no network I/O.
     assert llm.effective_max_input_tokens is None

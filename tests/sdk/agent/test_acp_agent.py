@@ -4,9 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 import uuid
-from typing import Any
-from unittest.mock import AsyncMock, MagicMock, patch
+from collections.abc import Iterator, Mapping
+from concurrent.futures import Future
+from contextlib import contextmanager
+from typing import Any, cast
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 from acp.exceptions import RequestError as ACPRequestError
@@ -16,7 +20,7 @@ from acp.schema import (
     LoadSessionResponse,
     ModelInfo,
     NewSessionResponse,
-    SessionConfigOption,
+    SessionConfigOptionBoolean,
     SessionConfigOptionSelect,
     SessionConfigSelectOption,
     SessionModelState,
@@ -26,17 +30,23 @@ from acp.schema import (
 from openhands.sdk.agent.acp_agent import (
     ACPAgent,
     ACPSessionConfigError,
+    ACPSessionModelError,
+    SessionConfigOption,
     _apply_session_config_options,
+    _config_option_current_value,
+    _config_option_values,
     _estimate_cost_from_tokens,
     _extract_token_usage,
     _image_url_to_acp_block,
     _maybe_set_session_model,
+    _mcp_config_to_acp_servers,
     _OpenHandsACPBridge,
     _select_auth_method,
     _serialize_tool_content,
 )
 from openhands.sdk.agent.base import AgentBase
 from openhands.sdk.context import AgentContext
+from openhands.sdk.conversation.impl.local_conversation import LocalConversation
 from openhands.sdk.conversation.state import (
     ConversationExecutionStatus,
     ConversationState,
@@ -47,7 +57,9 @@ from openhands.sdk.event import (
     MessageEvent,
     SystemPromptEvent,
 )
+from openhands.sdk.event.conversation_error import ConversationErrorEvent
 from openhands.sdk.llm import ImageContent, Message, TextContent
+from openhands.sdk.mcp.config import coerce_mcp_config
 from openhands.sdk.skills import KeywordTrigger, Skill
 from openhands.sdk.tool.builtins.finish import FinishAction
 from openhands.sdk.utils.pydantic_secrets import REDACTED_SECRET_VALUE
@@ -60,6 +72,10 @@ from openhands.sdk.workspace.local import LocalWorkspace
 
 
 def _make_agent(**kwargs) -> ACPAgent:
+    if isinstance(kwargs.get("mcp_config"), dict):
+        mcp_config = kwargs["mcp_config"]
+        servers = mcp_config.get("mcpServers", mcp_config)
+        kwargs["mcp_config"] = coerce_mcp_config(servers)
     return ACPAgent(acp_command=["echo", "test"], **kwargs)
 
 
@@ -73,9 +89,38 @@ def _make_state(tmp_path) -> ConversationState:
     )
 
 
+def _agent_conn(agent: ACPAgent) -> Any:
+    assert agent._conn is not None
+    return cast(Any, agent._conn)
+
+
+async def _verified_set_session_model(
+    *, model_id: str, session_id: str, **kwargs: Any
+) -> Any:
+    from acp.schema import SetSessionModelResponse
+
+    return SetSessionModelResponse(field_meta={"current_model_id": model_id})
+
+
 # ---------------------------------------------------------------------------
 # Instantiation
 # ---------------------------------------------------------------------------
+
+
+def test_acp_agent_clean_import_gate():
+    """ACP session config types and ACPAgent import in a clean environment."""
+    from acp.schema import (
+        ConfigOptionUpdate,
+        SessionConfigOptionBoolean,
+        SessionConfigOptionSelect,
+        SessionModelState,
+    )
+
+    assert SessionConfigOptionSelect is not None
+    assert SessionConfigOptionBoolean is not None
+    assert ConfigOptionUpdate is not None
+    assert SessionModelState is not None
+    assert ACPAgent is not None
 
 
 class TestACPAgentInstantiation:
@@ -273,13 +318,12 @@ class TestACPAgentValidation:
             agent.init_state(state, on_event=events.append)
         return events
 
-    def test_rejects_mcp_config(self, tmp_path):
+    def test_allows_mcp_config(self, tmp_path):
         agent = ACPAgent(
             acp_command=["echo"],
-            mcp_config={"mcpServers": {"test": {"command": "echo"}}},
+            mcp_config=coerce_mcp_config({"test": {"command": "echo"}}),
         )
-        with pytest.raises(NotImplementedError, match="mcp_config"):
-            self._init_with_patches(agent, tmp_path)
+        self._init_with_patches(agent, tmp_path)
 
     def test_allows_agent_context_for_prompt_extensions(self, tmp_path):
         agent = ACPAgent(
@@ -930,6 +974,9 @@ class TestACPAgentStep:
         conversation = MagicMock()
         conversation.state = state
         self._wire_passthrough_mocks(agent)
+        assert agent.agent_context is not None
+        agent._installed_suffix = agent.agent_context.to_acp_prompt_context()
+        agent._suffix_install_state = "pending_first_prompt"
 
         agent.step(conversation, on_event=lambda _: None)
 
@@ -977,6 +1024,9 @@ class TestACPAgentStep:
         conversation = MagicMock()
         conversation.state = state
         self._wire_passthrough_mocks(agent)
+        assert agent.agent_context is not None
+        agent._installed_suffix = agent.agent_context.to_acp_prompt_context()
+        agent._suffix_install_state = "pending_first_prompt"
 
         agent.step(conversation, on_event=lambda _: None)
 
@@ -1032,6 +1082,9 @@ class TestACPAgentStep:
         conversation = MagicMock()
         conversation.state = state
         self._wire_passthrough_mocks(agent)
+        assert agent.agent_context is not None
+        agent._installed_suffix = agent.agent_context.to_acp_prompt_context()
+        agent._suffix_install_state = "pending_first_prompt"
 
         agent.step(conversation, on_event=lambda _: None)
 
@@ -1191,6 +1244,7 @@ class TestACPAgentCleanup:
     def test_close_terminates_process(self):
         agent = _make_agent()
         mock_process = MagicMock()
+        mock_process.returncode = None
         agent._process = mock_process
         agent._executor = MagicMock()
         agent._conn = None
@@ -1198,6 +1252,19 @@ class TestACPAgentCleanup:
         agent.close()
 
         mock_process.terminate.assert_called_once()
+        mock_process.kill.assert_not_called()
+
+    def test_close_kills_when_terminate_fails(self):
+        agent = _make_agent()
+        mock_process = MagicMock()
+        mock_process.returncode = None
+        mock_process.terminate.side_effect = OSError("already dead")
+        agent._process = mock_process
+        agent._executor = MagicMock()
+        agent._conn = None
+
+        agent.close()
+
         mock_process.kill.assert_called_once()
 
     def test_close_is_idempotent(self):
@@ -1235,6 +1302,218 @@ class TestACPAgentCleanup:
 
         # Should not raise
         agent.close()
+
+    def test_close_awaits_async_connection_close(self):
+        import warnings
+
+        from openhands.sdk.utils.async_executor import AsyncExecutor
+
+        agent = _make_agent()
+        conn = MagicMock()
+        conn.close = AsyncMock()
+        agent._conn = conn
+        agent._executor = AsyncExecutor()
+        agent._process = None
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", RuntimeWarning)
+            agent.close()
+
+        conn.close.assert_awaited_once()
+
+    def test_has_live_acp_session_false_before_init(self):
+        agent = _make_agent()
+        assert not agent.has_live_acp_session
+
+    def test_has_live_acp_session_true_when_fully_wired(self):
+        agent = _make_agent()
+        agent._conn = MagicMock()
+        agent._session_id = "sess-1"
+        agent._executor = MagicMock()
+        assert agent.has_live_acp_session
+
+    def test_has_live_acp_session_false_after_close(self):
+        agent = _make_agent()
+        agent._conn = MagicMock()
+        agent._session_id = "sess-1"
+        agent._executor = MagicMock()
+        agent._process = MagicMock()
+        agent.close()
+        assert not agent.has_live_acp_session
+
+    def test_release_runtime_disarms_close_without_tearing_down_conn(self):
+        agent = _make_agent()
+        live_conn = MagicMock()
+        live_executor = MagicMock()
+        agent._conn = live_conn
+        agent._session_id = "sess-1"
+        agent._executor = live_executor
+        agent._process = MagicMock()
+        agent._register_atexit_cleanup()
+
+        agent.release_runtime()
+
+        assert agent._closed is True
+        assert agent._atexit_callback is None
+        assert agent._conn is live_conn
+        assert agent._executor is live_executor
+        live_executor.run_async.reset_mock()
+        agent.close()
+        live_executor.run_async.assert_not_called()
+
+    def test_release_runtime_then_close_is_idempotent(self):
+        agent = _make_agent()
+        live_conn = MagicMock()
+        live_executor = MagicMock()
+        agent._conn = live_conn
+        agent._session_id = "sess-1"
+        agent._executor = live_executor
+        agent._process = MagicMock()
+        agent._register_atexit_cleanup()
+
+        agent.release_runtime()
+        agent.close()
+        agent.close()
+        live_executor.run_async.assert_not_called()
+
+    def test_assume_runtime_ownership_transfers_single_cleanup_owner(self):
+        predecessor = _make_agent()
+        successor = _make_agent()
+        live_conn = MagicMock()
+        live_executor = MagicMock()
+        predecessor._conn = live_conn
+        predecessor._session_id = "sess-1"
+        predecessor._executor = live_executor
+        predecessor._process = MagicMock()
+        predecessor._client = _OpenHandsACPBridge()
+        predecessor._register_atexit_cleanup()
+
+        successor._conn = live_conn
+        successor._session_id = "sess-1"
+        successor._executor = live_executor
+        successor._process = predecessor._process
+        successor._client = predecessor._client
+
+        successor.assume_runtime_ownership_from(predecessor)
+
+        assert predecessor._closed is True
+        assert predecessor._atexit_callback is None
+        assert successor._atexit_callback is not None
+
+        live_executor.run_async.reset_mock()
+        predecessor.close()
+        live_executor.run_async.assert_not_called()
+
+        successor.close()
+        assert live_executor.run_async.called
+
+    def test_assume_runtime_ownership_rollback_on_failed_release(self):
+        predecessor = _make_agent()
+        successor = _make_agent()
+        predecessor._conn = MagicMock()
+        predecessor._session_id = "sess-1"
+        predecessor._executor = MagicMock()
+        predecessor._process = MagicMock()
+        predecessor._client = _OpenHandsACPBridge()
+        predecessor._register_atexit_cleanup()
+        old_cleanup = predecessor._atexit_callback
+
+        successor._conn = predecessor._conn
+        successor._session_id = predecessor._session_id
+        successor._executor = predecessor._executor
+        successor._process = predecessor._process
+        successor._client = predecessor._client
+
+        with patch.object(
+            ACPAgent,
+            "release_runtime",
+            side_effect=RuntimeError("release failed"),
+        ):
+            with pytest.raises(RuntimeError, match="release failed"):
+                successor.assume_runtime_ownership_from(predecessor)
+
+        assert predecessor._atexit_callback is old_cleanup
+        assert successor._atexit_callback is None
+
+    def test_masking_callback_follows_runtime_owner_after_handoff(self):
+        predecessor = _make_agent()
+        successor = _make_agent()
+        client = _OpenHandsACPBridge()
+        lifecycle = MagicMock()
+        lifecycle.track_current = MagicMock()
+        predecessor._conn = MagicMock()
+        predecessor._session_id = "sess-1"
+        predecessor._executor = MagicMock()
+        predecessor._process = MagicMock()
+        predecessor._client = client
+        predecessor._file_credential_lifecycles["CODEX_AUTH_JSON"] = lifecycle
+
+        successor._conn = predecessor._conn
+        successor._session_id = predecessor._session_id
+        successor._executor = predecessor._executor
+        successor._process = predecessor._process
+        successor._client = client
+        successor._file_credential_lifecycles["CODEX_AUTH_JSON"] = lifecycle
+
+        successor.assume_runtime_ownership_from(predecessor)
+        lifecycle.track_current.reset_mock()
+        assert client.before_mask is not None
+        client.before_mask()
+        lifecycle.track_current.assert_called_once_with()
+
+    def test_atexit_cleanup_uses_weakref(self):
+        import gc
+        import weakref
+
+        import openhands.sdk.agent.acp_agent as acp_agent_module
+
+        with patch.object(acp_agent_module.atexit, "register") as register:
+            agent = _make_agent()
+            agent._register_atexit_cleanup()
+            callback = register.call_args.args[0]
+            agent_ref = weakref.ref(agent)
+
+            del agent
+            gc.collect()
+
+        assert agent_ref() is None
+        assert callback() is None
+
+    def test_startup_timeout_bounds_handshake(self, tmp_path):
+        agent = _make_agent(acp_startup_timeout=0.05)
+        state = _make_state(tmp_path)
+        conn = MagicMock()
+
+        async def _hang(*_args, **_kwargs):
+            await asyncio.sleep(10)
+
+        conn.initialize = _hang
+
+        with pytest.raises(TimeoutError, match="ACP startup timed out after 0s"):
+            TestACPSessionIdPersistence._patched_start_acp_server(
+                agent, state, conn=conn
+            )
+
+    def test_init_state_surfaces_startup_timeout(self, tmp_path):
+        agent = _make_agent(acp_startup_timeout=0.05)
+        state = _make_state(tmp_path)
+        conn = MagicMock()
+
+        async def _hang(*_args, **_kwargs):
+            await asyncio.sleep(10)
+
+        conn.initialize = _hang
+        events: list = []
+
+        with TestACPSessionIdPersistence._transport_patches(conn):
+            with pytest.raises(TimeoutError):
+                agent.init_state(state, on_event=events.append)
+
+        errors = [e for e in events if isinstance(e, ConversationErrorEvent)]
+        assert len(errors) == 1
+        assert errors[0].code == "ACPStartupTimeout"
+        assert "ACP startup timed out after 0s" in errors[0].detail
+        assert state.execution_status == ConversationExecutionStatus.ERROR
 
 
 # ---------------------------------------------------------------------------
@@ -2639,6 +2918,7 @@ class TestMaybeSetSessionModel:
     @pytest.mark.asyncio
     async def test_codex_agent_uses_protocol_model_override(self):
         conn = AsyncMock()
+        conn.set_session_model = AsyncMock(side_effect=_verified_set_session_model)
         await _maybe_set_session_model(conn, "codex-acp", "session-1", "gpt-5.4")
         conn.set_session_model.assert_awaited_once_with(
             model_id="gpt-5.4",
@@ -2646,15 +2926,22 @@ class TestMaybeSetSessionModel:
         )
 
     @pytest.mark.asyncio
-    async def test_non_codex_agent_skips_protocol_override(self):
+    async def test_claude_agent_uses_protocol_model_override(self):
+        """claude-agent-acp registers ``supports_set_session_model`` so the init
+        path pushes ``acp_model`` via the protocol call as well as session _meta.
+        """
         conn = AsyncMock()
+        conn.set_session_model = AsyncMock(side_effect=_verified_set_session_model)
         await _maybe_set_session_model(
             conn,
             "claude-agent-acp",
             "session-1",
             "claude-opus-4-6",
         )
-        conn.set_session_model.assert_not_called()
+        conn.set_session_model.assert_awaited_once_with(
+            model_id="claude-opus-4-6",
+            session_id="session-1",
+        )
 
     @pytest.mark.asyncio
     async def test_missing_model_skips_protocol_override(self):
@@ -2673,12 +2960,13 @@ class TestMaybeSetSessionModel:
     async def test_unregistered_agent_with_model_state_uses_protocol_override(self):
         """``models`` in the session response is the signal to use set_model."""
         conn = AsyncMock()
+        conn.set_session_model = AsyncMock(side_effect=_verified_set_session_model)
         await _maybe_set_session_model(
             conn,
             "some-custom-acp",
             "session-1",
             "grok-4.6",
-            SessionModelState(
+            model_state=SessionModelState(
                 available_models=[ModelInfo(model_id="grok-4.6", name="Grok 4.6")],
                 current_model_id="auto",
             ),
@@ -2687,6 +2975,40 @@ class TestMaybeSetSessionModel:
             model_id="grok-4.6",
             session_id="session-1",
         )
+
+    @pytest.mark.asyncio
+    async def test_unregistered_agent_with_apply_requested_uses_protocol_override(
+        self,
+    ):
+        """Session init with an explicit ``acp_model`` pushes via set_model."""
+        conn = AsyncMock()
+        conn.set_session_model = AsyncMock(side_effect=_verified_set_session_model)
+        await _maybe_set_session_model(
+            conn,
+            "cursor-agent",
+            "session-1",
+            "grok-4.6",
+            apply_requested=True,
+        )
+        conn.set_session_model.assert_awaited_once_with(
+            model_id="grok-4.6",
+            session_id="session-1",
+        )
+
+    @pytest.mark.asyncio
+    async def test_unregistered_rejected_requested_model_fails_closed(self):
+        conn = AsyncMock()
+        conn.set_session_model.side_effect = ACPRequestError(
+            code=-32601, message="method not found"
+        )
+        with pytest.raises(ACPSessionModelError, match="rejected model"):
+            await _maybe_set_session_model(
+                conn,
+                "cursor-agent",
+                "session-1",
+                "grok-4.6",
+                apply_requested=True,
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -2973,6 +3295,7 @@ class TestGeminiSessionModel:
     @pytest.mark.asyncio
     async def test_gemini_cli_uses_protocol_model_override(self):
         conn = AsyncMock()
+        conn.set_session_model = AsyncMock(side_effect=_verified_set_session_model)
         await _maybe_set_session_model(
             conn, "gemini-cli", "session-1", "gemini-3-flash"
         )
@@ -2980,6 +3303,220 @@ class TestGeminiSessionModel:
             model_id="gemini-3-flash",
             session_id="session-1",
         )
+
+
+# ---------------------------------------------------------------------------
+# Live session detection + runtime model switching
+# ---------------------------------------------------------------------------
+
+
+class TestHasLiveACPSession:
+    def test_false_before_session(self):
+        agent = _make_agent()
+        assert agent.has_live_acp_session is False
+
+    def test_true_when_fully_wired(self):
+        agent = _make_agent()
+        agent._conn = MagicMock()
+        agent._session_id = "sess-1"
+        agent._executor = MagicMock()
+        assert agent.has_live_acp_session is True
+
+    @pytest.mark.parametrize(
+        "conn,session_id,executor",
+        [
+            (None, "sess-1", "exec"),
+            ("conn", None, "exec"),
+            ("conn", "sess-1", None),
+        ],
+    )
+    def test_false_when_partially_wired(self, conn, session_id, executor):
+        agent = _make_agent()
+        agent._conn = MagicMock() if conn else None
+        agent._session_id = session_id
+        agent._executor = MagicMock() if executor else None
+        assert agent.has_live_acp_session is False
+
+    def test_set_acp_model_raises_when_no_live_session(self):
+        agent = _make_agent()
+        assert not agent.has_live_acp_session
+        with pytest.raises(RuntimeError, match="not initialized"):
+            agent.set_acp_model("gpt-5.4")
+
+
+class TestSetACPModel:
+    @staticmethod
+    def _wire(
+        agent: ACPAgent, agent_name: str, *, via_config_option: bool = False
+    ) -> ACPAgent:
+        from acp.schema import SetSessionConfigOptionResponse, SetSessionModelResponse
+
+        conn = MagicMock()
+        model_options = [
+            _config_option(
+                "model", "old-model", ["old-model", "gpt-5.5", "gpt-5.5/high"]
+            ),
+            _config_option(
+                "reasoning_effort",
+                "medium",
+                ["low", "medium", "high", "xhigh"],
+            ),
+        ]
+
+        async def _set_config_option(
+            *, config_id: str, session_id: str, value: str | bool, **kwargs: Any
+        ) -> SetSessionConfigOptionResponse:
+            nonlocal model_options
+            updated: list[SessionConfigOption] = []
+            for option in model_options:
+                if option.id == config_id:
+                    updated.append(_config_option_with_value(option, value))
+                else:
+                    updated.append(option)
+            model_options = updated
+            return SetSessionConfigOptionResponse(config_options=list(model_options))
+
+        async def _set_session_model(
+            *, model_id: str, session_id: str, **kwargs: Any
+        ) -> SetSessionModelResponse:
+            return SetSessionModelResponse(field_meta={"current_model_id": model_id})
+
+        conn.set_session_model = AsyncMock(side_effect=_set_session_model)
+        conn.set_config_option = AsyncMock(side_effect=_set_config_option)
+        agent._conn = conn
+        agent._session_id = "sess-1"
+        agent._agent_name = agent_name
+        agent._model_via_config_option = via_config_option
+        agent._client = _OpenHandsACPBridge()
+        executor = MagicMock()
+
+        def _run(
+            awaitable_or_fn: Any, *args: Any, timeout: Any = None, **kwargs: Any
+        ) -> Any:
+            import inspect
+
+            if inspect.iscoroutine(awaitable_or_fn):
+                coro = awaitable_or_fn
+            elif inspect.iscoroutinefunction(awaitable_or_fn):
+                coro = awaitable_or_fn(*args, **kwargs)
+            else:
+                raise TypeError("run_async expects a coroutine or async function")
+            loop = asyncio.new_event_loop()
+            try:
+                return loop.run_until_complete(coro)
+            finally:
+                loop.close()
+
+        executor.run_async = MagicMock(side_effect=_run)
+        agent._executor = executor
+        return agent
+
+    def test_switches_model_on_live_codex_session(self):
+        agent = self._wire(_make_agent(), "codex-acp")
+        effective = agent.set_acp_model("gpt-5.5")
+        _agent_conn(agent).set_session_model.assert_awaited_once_with(
+            model_id="gpt-5.5", session_id="sess-1"
+        )
+        _agent_conn(agent).set_config_option.assert_not_called()
+        assert effective == "gpt-5.5"
+        assert agent.llm.model == "gpt-5.5"
+        assert agent.current_model_id == "gpt-5.5"
+
+    def test_switches_codex_via_config_option_single_call(self):
+        agent = self._wire(_make_agent(), "codex-acp", via_config_option=True)
+        effective = agent.set_acp_model("gpt-5.5")
+        _agent_conn(agent).set_config_option.assert_awaited_once_with(
+            config_id="model", value="gpt-5.5", session_id="sess-1"
+        )
+        assert effective == "gpt-5.5/medium"
+        assert agent.current_model_id == "gpt-5.5/medium"
+
+    def test_switches_codex_via_config_option_splits_reasoning_effort(self):
+        agent = self._wire(_make_agent(), "codex-acp", via_config_option=True)
+        agent.set_acp_model("gpt-5.5/high")
+        _agent_conn(agent).set_config_option.assert_has_awaits(
+            [
+                call(config_id="model", value="gpt-5.5", session_id="sess-1"),
+                call(
+                    config_id="reasoning_effort",
+                    value="high",
+                    session_id="sess-1",
+                ),
+            ]
+        )
+        assert agent.current_model_id == "gpt-5.5/high"
+
+    def test_switch_method_not_found_raises_no_fallback(self):
+        agent = self._wire(_make_agent(), "codex-acp", via_config_option=False)
+        _agent_conn(agent).set_session_model.side_effect = ACPRequestError(
+            code=-32601, message="Method not found"
+        )
+        with pytest.raises(ValueError, match="rejected set_session_model"):
+            agent.set_acp_model("gpt-5.5")
+        assert agent.llm.model != "gpt-5.5"
+        assert agent.current_model_id != "gpt-5.5"
+
+    def test_translates_acp_request_error_to_value_error(self):
+        agent = self._wire(_make_agent(), "codex-acp")
+        _agent_conn(agent).set_session_model.side_effect = ACPRequestError(
+            code=-32601, message="method not found"
+        )
+        with pytest.raises(ValueError, match="rejected set_session_model"):
+            agent.set_acp_model("bogus-model")
+        assert agent.llm.model != "bogus-model"
+
+    def test_propagates_server_internal_error(self):
+        agent = self._wire(_make_agent(), "codex-acp")
+        _agent_conn(agent).set_session_model.side_effect = ACPRequestError(
+            code=-32603, message="internal error"
+        )
+        with pytest.raises(ACPRequestError):
+            agent.set_acp_model("some-model")
+
+    def test_passes_timeout_to_run_async(self):
+        agent = self._wire(_make_agent(acp_prompt_timeout=42.0), "codex-acp")
+        agent.set_acp_model("gpt-5.5")
+        _, kwargs = agent._executor.run_async.call_args
+        assert kwargs["timeout"] == 42.0
+
+    def test_rejected_switch_preserves_authoritative_model(self):
+        agent = self._wire(_make_agent(), "codex-acp")
+        agent._current_model_id = "model-a"
+        agent.llm.model = "model-a"
+        _agent_conn(agent).set_session_model.side_effect = ACPRequestError(
+            code=-32601, message="method not found"
+        )
+        with pytest.raises(ValueError, match="rejected set_session_model"):
+            agent.set_acp_model("model-b")
+        assert agent.current_model_id == "model-a"
+        assert agent.llm.model == "model-a"
+
+    def test_effective_model_mismatch_fails_closed(self):
+        agent = self._wire(_make_agent(), "codex-acp")
+
+        async def _wrong_model(*, model_id: str, session_id: str, **kwargs: Any):
+            from acp.schema import SetSessionModelResponse
+
+            return SetSessionModelResponse(
+                field_meta={"current_model_id": "other-model"}
+            )
+
+        _agent_conn(agent).set_session_model = AsyncMock(side_effect=_wrong_model)
+        with pytest.raises(ValueError, match="could not verify"):
+            agent.set_acp_model("gpt-5.5")
+        assert agent.current_model_id != "gpt-5.5"
+
+    def test_unverifiable_model_state_fails_closed(self):
+        agent = self._wire(_make_agent(), "codex-acp")
+
+        async def _empty_response(*, model_id: str, session_id: str, **kwargs: Any):
+            from acp.schema import SetSessionModelResponse
+
+            return SetSessionModelResponse()
+
+        _agent_conn(agent).set_session_model = AsyncMock(side_effect=_empty_response)
+        with pytest.raises(ValueError, match="could not verify"):
+            agent.set_acp_model("gpt-5.5")
 
 
 # ---------------------------------------------------------------------------
@@ -3154,12 +3691,23 @@ class TestACPSessionIdPersistence:
         return stack
 
     @staticmethod
-    def _patched_start_acp_server(agent, state, *, conn):
-        """Invoke the real _start_acp_server with ACP transport layers mocked."""
+    @contextmanager
+    def _mocked_acp_runtime(agent, conn) -> Iterator[None]:
+        """Run ACP transport mocks on a real AsyncExecutor, then always close it."""
         from openhands.sdk.utils.async_executor import AsyncExecutor
 
-        agent._executor = AsyncExecutor()
-        with TestACPSessionIdPersistence._transport_patches(conn):
+        executor = AsyncExecutor()
+        agent._executor = executor
+        try:
+            with TestACPSessionIdPersistence._transport_patches(conn):
+                yield
+        finally:
+            executor.close(timeout=1.0)
+
+    @staticmethod
+    def _patched_start_acp_server(agent, state, *, conn):
+        """Invoke the real _start_acp_server with ACP transport layers mocked."""
+        with TestACPSessionIdPersistence._mocked_acp_runtime(agent, conn):
             agent._start_acp_server(state)
 
     @staticmethod
@@ -3187,7 +3735,7 @@ class TestACPSessionIdPersistence:
             conn.load_session = AsyncMock(return_value=MagicMock())
 
         conn.set_session_mode = AsyncMock()
-        conn.set_session_model = AsyncMock()
+        conn.set_session_model = AsyncMock(side_effect=_verified_set_session_model)
         conn.authenticate = AsyncMock()
         conn.close = AsyncMock()
         return conn
@@ -3335,8 +3883,6 @@ class TestACPSessionIdPersistence:
         overwrite state.agent_state['acp_session_id'] with the new id so
         the next restart doesn't keep trying to resume the stale one.
         """
-        from openhands.sdk.utils.async_executor import AsyncExecutor
-
         agent = _make_agent()
         state = _make_state(tmp_path)
         state.agent_state = {
@@ -3349,8 +3895,7 @@ class TestACPSessionIdPersistence:
             load_exc=ACPRequestError(-32602, "unknown session"),
         )
 
-        agent._executor = AsyncExecutor()
-        with self._transport_patches(conn):
+        with self._mocked_acp_runtime(agent, conn):
             agent.init_state(state, on_event=lambda _: None)
 
         conn.load_session.assert_awaited_once()
@@ -3387,7 +3932,7 @@ class TestACPSessionIdPersistence:
             session_id="stored-sess",
         )
         conn.set_session_mode.assert_awaited_once_with(
-            mode_id="full-access",
+            mode_id="agent-full-access",
             session_id="stored-sess",
         )
 
@@ -3405,7 +3950,6 @@ class TestACPSessionIdPersistence:
         import uuid as _uuid
 
         from openhands.sdk.conversation import Conversation
-        from openhands.sdk.utils.async_executor import AsyncExecutor
 
         persistence_dir = tmp_path / "persist"
         conv_id = _uuid.uuid4()
@@ -3414,8 +3958,7 @@ class TestACPSessionIdPersistence:
 
         conn1 = self._make_conn(new_session_id="roundtrip-sess")
         agent1 = _make_agent()
-        agent1._executor = AsyncExecutor()
-        with self._transport_patches(conn1):
+        with self._mocked_acp_runtime(agent1, conn1):
             conv1 = Conversation(
                 agent=agent1,
                 workspace=str(workspace),
@@ -3434,8 +3977,7 @@ class TestACPSessionIdPersistence:
         # Fresh ACPAgent with no runtime knowledge of the prior session.
         conn2 = self._make_conn()
         agent2 = _make_agent()
-        agent2._executor = AsyncExecutor()
-        with self._transport_patches(conn2):
+        with self._mocked_acp_runtime(agent2, conn2):
             conv2 = Conversation(
                 agent=agent2,
                 workspace=str(workspace),
@@ -3456,6 +3998,163 @@ class TestACPSessionIdPersistence:
         assert kwargs["cwd"] == str(workspace)
         conn2.new_session.assert_not_awaited()
         assert agent2._session_id == "roundtrip-sess"
+
+
+class TestACPModelStatePersistence:
+    def test_resume_without_models_preserves_persisted_model_state(self, tmp_path):
+        agent = _make_agent()
+        state = _make_state(tmp_path)
+        state.agent_state = {
+            **state.agent_state,
+            "acp_session_id": "resumable-sess",
+            "acp_session_cwd": str(tmp_path),
+            "acp_current_model_id": "claude-opus-4-1",
+            "acp_available_models": [
+                {
+                    "model_id": "claude-opus-4-1",
+                    "name": "Opus 4.1",
+                    "description": None,
+                }
+            ],
+        }
+        conn = TestACPSessionIdPersistence._make_conn()
+        load_response = MagicMock(spec=["config_options"])
+        load_response.config_options = None
+        conn.load_session = AsyncMock(return_value=load_response)
+
+        with TestACPSessionIdPersistence._mocked_acp_runtime(agent, conn):
+            agent.init_state(state, on_event=lambda _: None)
+
+        assert state.agent_state["acp_current_model_id"] == "claude-opus-4-1"
+        assert state.agent_state["acp_available_models"] == [
+            {"model_id": "claude-opus-4-1", "name": "Opus 4.1", "description": None}
+        ]
+
+    def test_resume_effective_model_mismatch_fails_closed(self, tmp_path):
+        agent = _make_agent(acp_model="model-x")
+        state = _make_state(tmp_path)
+        state.agent_state = {
+            **state.agent_state,
+            "acp_session_id": "resumable-sess",
+            "acp_session_cwd": str(tmp_path),
+        }
+        conn = TestACPSessionIdPersistence._make_conn()
+        conn.initialize.return_value.agent_info.name = "codex-acp"
+        conn.initialize.return_value.auth_methods = []
+
+        async def _wrong_model(*, model_id: str, session_id: str, **kwargs: Any):
+            from acp.schema import SetSessionModelResponse
+
+            return SetSessionModelResponse(field_meta={"current_model_id": "other"})
+
+        conn.set_session_model = AsyncMock(side_effect=_wrong_model)
+
+        with TestACPSessionIdPersistence._mocked_acp_runtime(agent, conn):
+            with pytest.raises(ACPSessionModelError, match="reports effective"):
+                agent.init_state(state, on_event=lambda _: None)
+
+    def test_fresh_init_uses_verified_effective_model_not_requested(self, tmp_path):
+        from acp.schema import SetSessionConfigOptionResponse
+
+        agent = _make_agent(acp_model="gpt-5.5")
+        state = _make_state(tmp_path)
+        model_options = [
+            _config_option("model", "old-model", ["old-model", "gpt-5.5"]),
+            _config_option(
+                "reasoning_effort",
+                "medium",
+                ["low", "medium", "high", "xhigh"],
+            ),
+        ]
+        conn = TestACPSessionIdPersistence._make_conn(new_session_id="fresh-sess")
+        conn.initialize.return_value.agent_info.name = "codex-acp"
+        conn.initialize.return_value.auth_methods = []
+        new_response = NewSessionResponse(
+            session_id="fresh-sess",
+            config_options=list(model_options),
+        )
+        conn.new_session = AsyncMock(return_value=new_response)
+
+        async def _set_config_option(
+            *, config_id: str, session_id: str, value: str | bool, **kwargs: Any
+        ) -> SetSessionConfigOptionResponse:
+            nonlocal model_options
+            updated: list[SessionConfigOption] = []
+            for option in model_options:
+                if option.id == config_id:
+                    updated.append(_config_option_with_value(option, value))
+                else:
+                    updated.append(option)
+            model_options = updated
+            return SetSessionConfigOptionResponse(config_options=list(model_options))
+
+        conn.set_config_option = AsyncMock(side_effect=_set_config_option)
+        conn.set_session_model = AsyncMock(
+            side_effect=ACPRequestError(code=-32601, message="method not found")
+        )
+
+        with TestACPSessionIdPersistence._mocked_acp_runtime(agent, conn):
+            agent.init_state(state, on_event=lambda _: None)
+
+        assert agent.acp_model == "gpt-5.5"
+        assert agent.current_model_id == "gpt-5.5/medium"
+        assert agent.llm.model == "gpt-5.5/medium"
+        assert state.agent_state["acp_current_model_id"] == "gpt-5.5/medium"
+
+    def test_resume_rejected_override_fails_closed_before_prompt(self, tmp_path):
+        agent = _make_agent(acp_model="model-x")
+        state = _make_state(tmp_path)
+        state.agent_state = {
+            **state.agent_state,
+            "acp_session_id": "resumable-sess",
+            "acp_session_cwd": str(tmp_path),
+            "acp_current_model_id": "model-x",
+        }
+        conn = TestACPSessionIdPersistence._make_conn()
+        conn.initialize.return_value.agent_info.name = "codex-acp"
+        conn.initialize.return_value.auth_methods = []
+        load_response = MagicMock(spec=["config_options"])
+        load_response.config_options = None
+        conn.load_session = AsyncMock(return_value=load_response)
+        conn.set_session_model = AsyncMock(
+            side_effect=ACPRequestError(code=-32601, message="method not found")
+        )
+
+        with TestACPSessionIdPersistence._mocked_acp_runtime(agent, conn):
+            with pytest.raises(ACPSessionModelError, match="rejected model"):
+                agent.init_state(state, on_event=lambda _: None)
+
+        assert not agent._initialized
+        assert not agent.has_live_acp_session
+
+    def test_fresh_replacement_clears_stale_model_when_new_session_omits_models(
+        self, tmp_path
+    ):
+        agent = _make_agent()
+        state = _make_state(tmp_path)
+        state.agent_state = {
+            **state.agent_state,
+            "acp_session_id": "stale-sess",
+            "acp_session_cwd": str(tmp_path),
+            "acp_current_model_id": "claude-opus-4-1",
+            "acp_available_models": [
+                {"model_id": "claude-opus-4-1", "name": "Opus 4.1"}
+            ],
+        }
+        new_session_response = MagicMock(spec=["session_id", "config_options"])
+        new_session_response.session_id = "replacement-sess"
+        new_session_response.config_options = None
+        conn = TestACPSessionIdPersistence._make_conn(
+            load_exc=ACPRequestError(-32602, "unknown session"),
+        )
+        conn.new_session = AsyncMock(return_value=new_session_response)
+
+        with TestACPSessionIdPersistence._mocked_acp_runtime(agent, conn):
+            agent.init_state(state, on_event=lambda _: None)
+
+        assert state.agent_state["acp_session_id"] == "replacement-sess"
+        assert "acp_current_model_id" not in state.agent_state
+        assert "acp_available_models" not in state.agent_state
 
 
 class TestACPSecretsEnvInjection:
@@ -3508,33 +4207,35 @@ class TestACPSecretsEnvInjection:
 
         state = _make_state(tmp_path)
         agent._executor = AsyncExecutor()
-
-        with ExitStack() as stack:
-            stack.enter_context(
-                patch(
-                    "openhands.sdk.agent.acp_agent.asyncio.create_subprocess_exec",
-                    new=_fake_create_subprocess_exec,
+        try:
+            with ExitStack() as stack:
+                stack.enter_context(
+                    patch(
+                        "openhands.sdk.agent.acp_agent.asyncio.create_subprocess_exec",
+                        new=_fake_create_subprocess_exec,
+                    )
                 )
-            )
-            stack.enter_context(
-                patch(
-                    "openhands.sdk.agent.acp_agent.ClientSideConnection",
-                    return_value=conn,
+                stack.enter_context(
+                    patch(
+                        "openhands.sdk.agent.acp_agent.ClientSideConnection",
+                        return_value=conn,
+                    )
                 )
-            )
-            stack.enter_context(
-                patch(
-                    "openhands.sdk.agent.acp_agent._filter_jsonrpc_lines",
-                    new=_fake_filter,
+                stack.enter_context(
+                    patch(
+                        "openhands.sdk.agent.acp_agent._filter_jsonrpc_lines",
+                        new=_fake_filter,
+                    )
                 )
-            )
-            stack.enter_context(
-                patch(
-                    "openhands.sdk.agent.acp_agent.asyncio.StreamReader",
-                    return_value=MagicMock(),
+                stack.enter_context(
+                    patch(
+                        "openhands.sdk.agent.acp_agent.asyncio.StreamReader",
+                        return_value=MagicMock(),
+                    )
                 )
-            )
-            agent._start_acp_server(state)
+                agent._start_acp_server(state)
+        finally:
+            agent._executor.close(timeout=1.0)
 
         return captured
 
@@ -3652,35 +4353,39 @@ class TestACPEnvConflictSuppression:
 
         state = _make_state(tmp_path)
         agent._executor = AsyncExecutor()
-
-        with ExitStack() as stack:
-            stack.enter_context(
-                patch(
-                    "openhands.sdk.agent.acp_agent.asyncio.create_subprocess_exec",
-                    new=_fake_create_subprocess_exec,
+        try:
+            with ExitStack() as stack:
+                stack.enter_context(
+                    patch(
+                        "openhands.sdk.agent.acp_agent.asyncio.create_subprocess_exec",
+                        new=_fake_create_subprocess_exec,
+                    )
                 )
-            )
-            stack.enter_context(
-                patch(
-                    "openhands.sdk.agent.acp_agent.ClientSideConnection",
-                    return_value=conn,
+                stack.enter_context(
+                    patch(
+                        "openhands.sdk.agent.acp_agent.ClientSideConnection",
+                        return_value=conn,
+                    )
                 )
-            )
-            stack.enter_context(
-                patch(
-                    "openhands.sdk.agent.acp_agent._filter_jsonrpc_lines",
-                    new=_fake_filter,
+                stack.enter_context(
+                    patch(
+                        "openhands.sdk.agent.acp_agent._filter_jsonrpc_lines",
+                        new=_fake_filter,
+                    )
                 )
-            )
-            stack.enter_context(
-                patch(
-                    "openhands.sdk.agent.acp_agent.asyncio.StreamReader",
-                    return_value=MagicMock(),
+                stack.enter_context(
+                    patch(
+                        "openhands.sdk.agent.acp_agent.asyncio.StreamReader",
+                        return_value=MagicMock(),
+                    )
                 )
-            )
-            if extra_os_env:
-                stack.enter_context(patch.dict("os.environ", extra_os_env, clear=False))
-            agent._start_acp_server(state)
+                if extra_os_env:
+                    stack.enter_context(
+                        patch.dict("os.environ", extra_os_env, clear=False)
+                    )
+                agent._start_acp_server(state)
+        finally:
+            agent._executor.close(timeout=1.0)
 
         return captured
 
@@ -3765,14 +4470,67 @@ def _config_option(
 ) -> SessionConfigOption:
     """Build one ACP select config option sitting at *current_value*."""
     choices = values or [current_value]
-    return SessionConfigOption(
-        SessionConfigOptionSelect(
-            id=option_id,
-            name=option_id,
-            type="select",
-            current_value=current_value,
-            options=[SessionConfigSelectOption(name=v, value=v) for v in choices],
+    return SessionConfigOptionSelect(
+        id=option_id,
+        name=option_id,
+        type="select",
+        current_value=current_value,
+        options=[SessionConfigSelectOption(name=v, value=v) for v in choices],
+    )
+
+
+def _boolean_config_option(option_id: str, current_value: bool) -> SessionConfigOption:
+    """Build one ACP boolean config option sitting at *current_value*."""
+    return SessionConfigOptionBoolean(
+        id=option_id,
+        name=option_id,
+        type="boolean",
+        current_value=current_value,
+    )
+
+
+class TestConfigOptionCurrentValue:
+    def test_boolean_true_normalizes_to_lowercase_string(self):
+        option = _boolean_config_option("fast", True)
+        assert _config_option_current_value(option) == "true"
+
+    def test_boolean_false_normalizes_to_lowercase_string(self):
+        option = _boolean_config_option("fast", False)
+        assert _config_option_current_value(option) == "false"
+
+    def test_config_option_values_maps_boolean_and_select_options(self):
+        options = [
+            _boolean_config_option("fast", True),
+            _config_option("effort", "low", ["low", "medium", "high"]),
+        ]
+        assert _config_option_values(options) == {
+            "fast": "true",
+            "effort": "low",
+        }
+
+
+def _config_option_with_value(
+    option: SessionConfigOption, value: str | bool
+) -> SessionConfigOption:
+    """Return a copy of *option* with *value* as its current value."""
+    if isinstance(option, SessionConfigOptionBoolean):
+        bool_value = value if isinstance(value, bool) else value.lower() == "true"
+        return SessionConfigOptionBoolean(
+            id=option.id,
+            name=option.name,
+            type="boolean",
+            current_value=bool_value,
         )
+    str_value = str(value).lower() if isinstance(value, bool) else str(value)
+    choices = [select_option.value for select_option in option.options]
+    if str_value not in choices:
+        choices = [*choices, str_value]
+    return SessionConfigOptionSelect(
+        id=option.id,
+        name=option.name,
+        type="select",
+        current_value=str_value,
+        options=[SessionConfigSelectOption(name=v, value=v) for v in choices],
     )
 
 
@@ -3824,16 +4582,29 @@ def _make_config_conn(
 
     current = list(options or [])
 
-    async def _set_config_option(*, config_id: str, session_id: str, value: str):
+    async def _set_config_option(*, config_id: str, session_id: str, value: str | bool):
         for i, option in enumerate(current):
-            if option.root.id == config_id:
-                current[i] = _config_option(config_id, value)
+            if option.id == config_id:
+                current[i] = _config_option_with_value(option, value)
                 return SetSessionConfigOptionResponse(config_options=list(current))
         raise ACPRequestError(-32602, f"unknown config option {config_id}")
 
     conn.set_config_option = AsyncMock(side_effect=_set_config_option)
     conn.set_session_mode = AsyncMock()
-    conn.set_session_model = AsyncMock()
+
+    models_state = {"value": models}
+
+    async def _set_session_model(*, model_id: str, session_id: str, **kwargs):
+        from acp.schema import SetSessionModelResponse
+
+        if models_state["value"] is not None:
+            models_state["value"] = SessionModelState(
+                available_models=list(models_state["value"].available_models),
+                current_model_id=model_id,
+            )
+        return SetSessionModelResponse(field_meta={"current_model_id": model_id})
+
+    conn.set_session_model = AsyncMock(side_effect=_set_session_model)
     conn.authenticate = AsyncMock()
     conn.close = AsyncMock()
     return conn
@@ -3909,7 +4680,7 @@ class TestACPSessionConfigOptions:
         conn = _make_config_conn(
             options=[
                 _config_option("effort", "low", ["low", "medium", "high"]),
-                _config_option("fast", "true", ["true", "false"]),
+                _boolean_config_option("fast", True),
             ],
             models=_GROK_MODELS,
         )
@@ -3922,8 +4693,33 @@ class TestACPSessionConfigOptions:
         )
         assert [call.kwargs for call in conn.set_config_option.await_args_list] == [
             {"config_id": "effort", "session_id": "sess-new", "value": "medium"},
-            {"config_id": "fast", "session_id": "sess-new", "value": "false"},
+            {"config_id": "fast", "session_id": "sess-new", "value": False},
         ]
+
+    def test_fresh_session_applies_requested_model_without_advertised_state(
+        self, tmp_path
+    ):
+        """``acp_model`` is pushed via set_session_model even when the server
+        omits ``models`` from the session response (parameterizedModelPicker).
+        """
+        agent = _make_agent(
+            acp_model="grok-4.6",
+            acp_client_capabilities=ClientCapabilities(
+                field_meta={"parameterizedModelPicker": True}
+            ),
+        )
+        state = _make_state(tmp_path)
+        conn = _make_config_conn(
+            options=[_config_option("effort", "low", ["low", "medium", "high"])],
+            models=None,
+        )
+
+        TestACPSessionIdPersistence._patched_start_acp_server(agent, state, conn=conn)
+
+        conn.set_session_model.assert_awaited_once_with(
+            model_id="grok-4.6",
+            session_id="sess-new",
+        )
 
     def test_composer_model_and_fast_disabled(self, tmp_path):
         agent = _make_agent(
@@ -3932,7 +4728,7 @@ class TestACPSessionConfigOptions:
         )
         state = _make_state(tmp_path)
         conn = _make_config_conn(
-            options=[_config_option("fast", "true", ["true", "false"])],
+            options=[_boolean_config_option("fast", True)],
             models=SessionModelState(
                 available_models=[
                     ModelInfo(model_id="composer-2.5", name="Composer 2.5")
@@ -3950,7 +4746,7 @@ class TestACPSessionConfigOptions:
         conn.set_config_option.assert_awaited_once_with(
             config_id="fast",
             session_id="sess-new",
-            value="false",
+            value=False,
         )
 
     def test_resumed_session_applies_same_config(self, tmp_path):
@@ -3968,7 +4764,7 @@ class TestACPSessionConfigOptions:
         conn = _make_config_conn(
             options=[
                 _config_option("effort", "low", ["low", "medium", "high"]),
-                _config_option("fast", "true", ["true", "false"]),
+                _boolean_config_option("fast", True),
             ],
             models=_GROK_MODELS,
         )
@@ -3983,7 +4779,7 @@ class TestACPSessionConfigOptions:
         )
         assert [call.kwargs for call in conn.set_config_option.await_args_list] == [
             {"config_id": "effort", "session_id": "stored-sess", "value": "medium"},
-            {"config_id": "fast", "session_id": "stored-sess", "value": "false"},
+            {"config_id": "fast", "session_id": "stored-sess", "value": False},
         ]
 
     def test_composer_resumed_session_applies_same_config(self, tmp_path):
@@ -3999,7 +4795,7 @@ class TestACPSessionConfigOptions:
             "acp_session_cwd": str(tmp_path),
         }
         conn = _make_config_conn(
-            options=[_config_option("fast", "true", ["true", "false"])],
+            options=[_boolean_config_option("fast", True)],
             models=SessionModelState(
                 available_models=[
                     ModelInfo(model_id="composer-2.5", name="Composer 2.5")
@@ -4019,7 +4815,7 @@ class TestACPSessionConfigOptions:
         conn.set_config_option.assert_awaited_once_with(
             config_id="fast",
             session_id="stored-sess",
-            value="false",
+            value=False,
         )
 
     def test_no_requested_options_leaves_session_untouched(self, tmp_path):
@@ -4033,10 +4829,10 @@ class TestACPSessionConfigOptions:
         conn.set_config_option.assert_not_awaited()
         assert agent._session_id == "sess-new"
 
-    def test_claude_fresh_session_uses_meta_not_set_session_model(self, tmp_path):
-        """claude-agent-acp selects its model via new_session's ``claudeCode``
-        _meta, not the set_session_model protocol call used by other
-        providers.
+    def test_claude_fresh_session_sends_meta_and_protocol_model(self, tmp_path):
+        """claude-agent-acp still sends ``claudeCode`` session _meta and also
+        applies ``acp_model`` via ``set_session_model`` because the provider
+        registry marks it as protocol-capable.
         """
         agent = _make_agent(acp_model="claude-opus-4-6")
         state = _make_state(tmp_path)
@@ -4046,21 +4842,22 @@ class TestACPSessionConfigOptions:
 
         conn.new_session.assert_awaited_once_with(
             cwd=str(tmp_path),
+            mcp_servers=[],
             claudeCode={"options": {"model": "claude-opus-4-6"}},
         )
-        conn.set_session_model.assert_not_called()
+        conn.set_session_model.assert_awaited_once_with(
+            model_id="claude-opus-4-6",
+            session_id="sess-new",
+        )
         conn.set_config_option.assert_not_called()
 
     def test_missing_option_fails_init_state_and_cleans_up(self, tmp_path):
         """A requested option the server does not expose aborts initialization."""
-        from openhands.sdk.utils.async_executor import AsyncExecutor
-
         agent = _make_agent(acp_config_options={"effort": "medium"})
         state = _make_state(tmp_path)
         conn = _make_config_conn(options=[_config_option("fast", "true")])
 
-        agent._executor = AsyncExecutor()
-        with TestACPSessionIdPersistence._transport_patches(conn):
+        with TestACPSessionIdPersistence._mocked_acp_runtime(agent, conn):
             with pytest.raises(ACPSessionConfigError, match="effort"):
                 agent.init_state(state, on_event=lambda _: None)
 
@@ -4085,7 +4882,7 @@ class TestACPSessionConfigOptions:
                     {
                         "config_id": "fast",
                         "session_id": "replacement-sess",
-                        "value": "false",
+                        "value": False,
                     },
                 ],
             ),
@@ -4096,7 +4893,7 @@ class TestACPSessionConfigOptions:
                     {
                         "config_id": "fast",
                         "session_id": "replacement-sess",
-                        "value": "false",
+                        "value": False,
                     }
                 ],
             ),
@@ -4108,9 +4905,7 @@ class TestACPSessionConfigOptions:
         """A stale load_session id must not skip model/config setup on the
         replacement session created via new_session.
         """
-        agent = _make_agent(
-            acp_model=acp_model, acp_config_options=acp_config_options
-        )
+        agent = _make_agent(acp_model=acp_model, acp_config_options=acp_config_options)
         state = _make_state(tmp_path)
         state.agent_state = {
             **state.agent_state,
@@ -4121,7 +4916,7 @@ class TestACPSessionConfigOptions:
             session_id="replacement-sess",
             options=[
                 _config_option("effort", "low", ["low", "medium", "high"]),
-                _config_option("fast", "true", ["true", "false"]),
+                _boolean_config_option("fast", True),
             ],
             models=SessionModelState(
                 available_models=[ModelInfo(model_id=acp_model, name=acp_model)],
@@ -4265,6 +5060,64 @@ class TestApplySessionConfigOptions:
                 [_config_option("effort", "low")],
             )
 
+    async def test_invalid_boolean_request_fails_before_set(self):
+        conn = self._conn()
+        with pytest.raises(ACPSessionConfigError, match="Invalid boolean"):
+            await _apply_session_config_options(
+                conn,
+                _OpenHandsACPBridge(),
+                "cursor",
+                "sess-1",
+                {"fast": "no"},
+                [_boolean_config_option("fast", True)],
+            )
+        conn.set_config_option.assert_not_awaited()
+
+    async def test_boolean_option_sent_as_python_bool(self):
+        conn = self._conn(
+            SetSessionConfigOptionResponse(
+                config_options=[_boolean_config_option("fast", False)]
+            )
+        )
+        await _apply_session_config_options(
+            conn,
+            _OpenHandsACPBridge(),
+            "cursor",
+            "sess-1",
+            {"fast": "false"},
+            [_boolean_config_option("fast", True)],
+        )
+        assert conn.set_config_option.await_args.kwargs["value"] is False
+
+    async def test_later_write_reverting_earlier_option_fails_final_check(self):
+        """A later write must not silently undo an earlier requested option."""
+        conn = self._conn(
+            SetSessionConfigOptionResponse(
+                config_options=[
+                    _config_option("effort", "medium"),
+                    _boolean_config_option("fast", True),
+                ]
+            ),
+            SetSessionConfigOptionResponse(
+                config_options=[
+                    _config_option("effort", "low"),
+                    _boolean_config_option("fast", False),
+                ]
+            ),
+        )
+        with pytest.raises(ACPSessionConfigError, match="final configuration"):
+            await _apply_session_config_options(
+                conn,
+                _OpenHandsACPBridge(),
+                "cursor",
+                "sess-1",
+                {"effort": "medium", "fast": "false"},
+                [
+                    _config_option("effort", "low"),
+                    _boolean_config_option("fast", True),
+                ],
+            )
+
 
 class _FakeACPProcess:
     """Stand-in for the ACP subprocess handle ``_init`` spawns.
@@ -4398,3 +5251,530 @@ class TestFailedInitReapsSubprocess:
         assert agent._process is process
         assert agent._conn is conn
         assert state.agent_state["acp_session_id"] == "sess-new"
+
+
+# ---------------------------------------------------------------------------
+# Async step (astep) — RC-2b native async / interrupt lifecycle
+# ---------------------------------------------------------------------------
+
+
+class TestACPAgentAstep:
+    """Native ``ACPAgent.astep`` must not fall back to ``AgentBase.astep``."""
+
+    def _make_conversation_with_message(self, tmp_path, text="Hello"):
+        state = _make_state(tmp_path)
+        state.events.append(
+            SystemPromptEvent(
+                source="agent",
+                system_prompt=TextContent(text="ACP-managed agent"),
+                tools=[],
+            )
+        )
+        state.events.append(
+            MessageEvent(
+                source="user",
+                llm_message=Message(role="user", content=[TextContent(text=text)]),
+            )
+        )
+        conversation = MagicMock()
+        conversation.state = state
+        return conversation
+
+    def test_astep_overrides_default_agentbase_implementation(self):
+        assert ACPAgent.astep is not AgentBase.astep
+
+    def test_astep_runs_post_prompt_callbacks_on_caller_thread(self, tmp_path):
+        from openhands.sdk.utils.async_executor import AsyncExecutor
+
+        agent = _make_agent()
+        conversation = self._make_conversation_with_message(tmp_path)
+
+        caller_thread_id = threading.get_ident()
+        prompt_thread_id: list[int] = []
+        on_event_thread_ids: list[int] = []
+
+        mock_client = _OpenHandsACPBridge()
+        mock_client.get_turn_usage_update = MagicMock(return_value=object())
+        agent._client = mock_client
+        agent._conn = MagicMock()
+
+        async def _fake_prompt(prompt, session_id):  # noqa: ARG001
+            prompt_thread_id.append(threading.get_ident())
+            mock_client.accumulated_text.append("answer")
+            return None
+
+        _agent_conn(agent).prompt = _fake_prompt
+        agent._session_id = "test-session"
+
+        executor = AsyncExecutor()
+        try:
+            agent._executor = executor
+
+            def _capture_event(event):
+                on_event_thread_ids.append(threading.get_ident())
+
+            asyncio.run(agent.astep(conversation, on_event=_capture_event))
+        finally:
+            executor.close()
+
+        assert len(prompt_thread_id) == 1
+        assert prompt_thread_id[0] != caller_thread_id
+        assert len(on_event_thread_ids) >= 2
+        for tid in on_event_thread_ids:
+            assert tid == caller_thread_id
+        assert (
+            conversation.state.execution_status == ConversationExecutionStatus.FINISHED
+        )
+
+    def test_astep_consumes_selected_prompt_message(self, tmp_path):
+        from openhands.sdk.utils.async_executor import AsyncExecutor
+
+        agent = _make_agent()
+        conversation = self._make_conversation_with_message(tmp_path, text="ignored")
+        selected = MessageEvent(
+            source="user",
+            llm_message=Message(
+                role="user", content=[TextContent(text="selected prompt")]
+            ),
+        )
+
+        mock_client = _OpenHandsACPBridge()
+        mock_client.get_turn_usage_update = MagicMock(return_value=object())
+        agent._client = mock_client
+        agent._conn = MagicMock()
+
+        async def _fake_prompt(prompt, session_id):  # noqa: ARG001
+            assert prompt[0].text == "selected prompt"
+            mock_client.accumulated_text.append("answer")
+            return None
+
+        _agent_conn(agent).prompt = _fake_prompt
+        agent._session_id = "test-session"
+
+        executor = AsyncExecutor()
+        try:
+            agent._executor = executor
+            asyncio.run(
+                agent.astep(
+                    conversation,
+                    on_event=lambda _: None,
+                    prompt_message=selected,
+                )
+            )
+        finally:
+            executor.close()
+
+        assert (
+            conversation.state.execution_status == ConversationExecutionStatus.FINISHED
+        )
+
+    def test_astep_emits_failed_tool_calls_on_cancellation(self, tmp_path):
+        from openhands.sdk.utils.async_executor import AsyncExecutor
+
+        agent = _make_agent()
+        conversation = self._make_conversation_with_message(tmp_path)
+        emitted: list = []
+
+        mock_client = _OpenHandsACPBridge()
+        mock_client.get_turn_usage_update = MagicMock(return_value=object())
+        agent._client = mock_client
+        agent._conn = MagicMock()
+
+        executor = AsyncExecutor()
+
+        async def _run_with_cancel() -> None:
+            prompt_entered = asyncio.Event()
+            cancel_called = asyncio.Event()
+            prompt_released = threading.Event()
+            caller_loop = asyncio.get_running_loop()
+
+            async def _fake_prompt(prompt, session_id):  # noqa: ARG001
+                mock_client.accumulated_tool_calls.append(
+                    {
+                        "tool_call_id": "tc-cancel-1",
+                        "title": "in-flight tool",
+                        "status": "in_progress",
+                        "tool_kind": None,
+                        "raw_input": None,
+                        "raw_output": None,
+                        "content": None,
+                    }
+                )
+                caller_loop.call_soon_threadsafe(prompt_entered.set)
+                released = await asyncio.to_thread(prompt_released.wait, 10.0)
+                assert released
+                return None
+
+            async def _fake_cancel(session_id):
+                assert session_id == "test-session"
+                caller_loop.call_soon_threadsafe(cancel_called.set)
+
+            _agent_conn(agent).prompt = _fake_prompt
+            _agent_conn(agent).cancel = _fake_cancel
+            agent._session_id = "test-session"
+
+            task = asyncio.create_task(
+                agent.astep(conversation, on_event=emitted.append)
+            )
+            await asyncio.wait_for(prompt_entered.wait(), timeout=5.0)
+            task.cancel()
+            try:
+                with pytest.raises(asyncio.CancelledError):
+                    with patch(
+                        "openhands.sdk.agent.acp_agent._ACP_CANCEL_DRAIN_TIMEOUT",
+                        0.01,
+                    ):
+                        await task
+                await asyncio.wait_for(cancel_called.wait(), timeout=5.0)
+            finally:
+                prompt_released.set()
+
+        try:
+            agent._executor = executor
+            asyncio.run(_run_with_cancel())
+        finally:
+            executor.close()
+
+        failed_tool_events = [
+            e
+            for e in emitted
+            if isinstance(e, ACPToolCallEvent)
+            and e.tool_call_id == "tc-cancel-1"
+            and e.status == "failed"
+        ]
+        assert len(failed_tool_events) == 1
+        assert failed_tool_events[0].is_error is True
+
+    def test_astep_times_out_when_idle_with_inflight_tool_call(self, tmp_path):
+        agent = _make_agent(acp_prompt_timeout=0.02)
+        conversation = self._make_conversation_with_message(tmp_path)
+        emitted: list = []
+        cancel_called = threading.Event()
+
+        mock_client = _OpenHandsACPBridge()
+        mock_client.get_turn_usage_update = MagicMock(return_value=object())
+        agent._client = mock_client
+        agent._conn = MagicMock()
+        agent._session_id = "test-session"
+
+        class _FakePortal:
+            def __init__(self) -> None:
+                self.prompt_future: Future = Future()
+
+            def start_task_soon(self, fn, *args):  # noqa: ANN001, ANN202
+                if args:
+                    entry = {
+                        "tool_call_id": "git-1",
+                        "title": "git status",
+                        "tool_kind": "execute",
+                        "status": "in_progress",
+                        "raw_input": None,
+                        "raw_output": None,
+                        "content": None,
+                    }
+                    mock_client.accumulated_tool_calls.append(entry)
+                    mock_client._emit_tool_call_event(entry)
+                    return self.prompt_future
+
+                cancel_called.set()
+                cancel_future: Future = Future()
+                cancel_future.set_result(None)
+                return cancel_future
+
+        mock_executor = MagicMock()
+        mock_executor.portal = _FakePortal()
+        agent._executor = mock_executor
+
+        with patch("openhands.sdk.agent.acp_agent._ACP_CANCEL_DRAIN_TIMEOUT", 0.01):
+            asyncio.run(agent.astep(conversation, on_event=emitted.append))
+
+        assert cancel_called.is_set()
+        assert conversation.state.execution_status == ConversationExecutionStatus.ERROR
+        assert any(
+            isinstance(e, ACPToolCallEvent)
+            and e.tool_call_id == "git-1"
+            and e.status == "failed"
+            and e.is_error
+            for e in emitted
+        )
+
+    def test_cleanup_interruption_finalizes_completed_prompt(self, tmp_path):
+        agent = _make_agent()
+        conversation = self._make_conversation_with_message(tmp_path)
+        mock_client = _OpenHandsACPBridge()
+        mock_client.get_turn_usage_update = MagicMock(return_value=object())
+        agent._client = mock_client
+        agent._session_id = "test-session"
+
+        prompt_future: Future = Future()
+        prompt_future.set_result(None)
+        emitted = []
+
+        with conversation.state as state:
+            agent._handle_cancelled_cleanup_interruption(
+                prompt_future,
+                0.1,
+                state,
+                emitted.append,
+            )
+
+        assert (
+            conversation.state.execution_status == ConversationExecutionStatus.FINISHED
+        )
+        assert agent._restart_session_on_next_turn is False
+        assert any(isinstance(event, ActionEvent) for event in emitted)
+
+
+@pytest.mark.asyncio
+async def test_local_conversation_arun_interrupts_real_acp_astep(tmp_path):
+    """LocalConversation must cancel an in-flight native ACP prompt."""
+    agent = _make_agent()
+    conversation = LocalConversation(
+        agent=agent,
+        workspace=str(tmp_path),
+        max_iteration_per_run=3,
+        stuck_detection=False,
+    )
+    conversation.send_message("cancel me")
+
+    prompt_started = asyncio.Event()
+
+    async def _fake_prompt(prompt, session_id):  # noqa: ARG001
+        prompt_started.set()
+        await asyncio.Event().wait()
+
+    mock_client = _OpenHandsACPBridge()
+    mock_client.get_turn_usage_update = MagicMock(return_value=object())
+    agent._client = mock_client
+    agent._conn = MagicMock()
+    _agent_conn(agent).prompt = _fake_prompt
+    agent._session_id = "test-session"
+
+    from openhands.sdk.utils.async_executor import AsyncExecutor
+
+    executor = AsyncExecutor()
+    agent._executor = executor
+    with patch.object(ACPAgent, "init_state", autospec=True):
+        task = asyncio.create_task(conversation.arun())
+        await asyncio.wait_for(prompt_started.wait(), timeout=1.0)
+        conversation.interrupt()
+        await asyncio.wait_for(task, timeout=1.0)
+    executor.close()
+
+    assert conversation.state.execution_status == ConversationExecutionStatus.PAUSED
+
+
+# ---------------------------------------------------------------------------
+# MCP forwarding
+# ---------------------------------------------------------------------------
+
+
+class TestMcpConfigToAcpServers:
+    """Unit tests for the mcp_config -> ACP server translation + gating."""
+
+    @staticmethod
+    def _caps(http: bool, sse: bool):
+        from acp.schema import McpCapabilities
+
+        return McpCapabilities(http=http, sse=sse)
+
+    @staticmethod
+    def _config(config: Mapping[str, object]):
+        servers = config.get("mcpServers", config)
+        return coerce_mcp_config(servers)
+
+    def test_stdio_always_forwarded(self):
+        from acp.schema import McpServerStdio
+
+        cfg = {
+            "mcpServers": {
+                "fetch": {
+                    "command": "uvx",
+                    "args": ["mcp-server-fetch"],
+                    "env": {"API_KEY": "x"},
+                }
+            }
+        }
+        out = _mcp_config_to_acp_servers(
+            self._config(cfg), self._caps(http=False, sse=False)
+        )
+        assert len(out) == 1
+        srv = out[0]
+        assert isinstance(srv, McpServerStdio)
+        assert srv.name == "fetch"
+        assert srv.command == "uvx"
+        assert srv.args == ["mcp-server-fetch"]
+        assert [(e.name, e.value) for e in srv.env] == [("API_KEY", "x")]
+
+    def test_http_gated_on_capability(self):
+        from acp.schema import HttpMcpServer
+
+        cfg = {
+            "mcpServers": {
+                "remote": {
+                    "url": "https://h/mcp",
+                    "headers": {"Authorization": "Bearer y"},
+                }
+            }
+        }
+        assert (
+            _mcp_config_to_acp_servers(
+                self._config(cfg), self._caps(http=False, sse=False)
+            )
+            == []
+        )
+        out = _mcp_config_to_acp_servers(
+            self._config(cfg), self._caps(http=True, sse=False)
+        )
+        assert len(out) == 1
+        assert isinstance(out[0], HttpMcpServer)
+        assert out[0].type == "http"
+        assert out[0].url == "https://h/mcp"
+        assert [(h.name, h.value) for h in out[0].headers] == [
+            ("Authorization", "Bearer y")
+        ]
+
+    def test_http_auth_maps_to_bearer_header(self):
+        from acp.schema import HttpMcpServer
+
+        cfg = {
+            "mcpServers": {
+                "remote": {
+                    "url": "https://h/mcp",
+                    "auth": {"strategy": "bearer", "value": "token-y"},
+                }
+            }
+        }
+        out = _mcp_config_to_acp_servers(
+            self._config(cfg), self._caps(http=True, sse=False)
+        )
+        assert len(out) == 1
+        assert isinstance(out[0], HttpMcpServer)
+        assert [(h.name, h.value) for h in out[0].headers] == [
+            ("Authorization", "Bearer token-y")
+        ]
+
+    def test_http_header_auth_forwards_authorization_header(self):
+        cfg = {
+            "mcpServers": {
+                "remote": {
+                    "url": "https://h/mcp",
+                    "auth": {
+                        "strategy": "header",
+                        "headers": {"authorization": "Bearer explicit"},
+                    },
+                }
+            }
+        }
+        out = _mcp_config_to_acp_servers(
+            self._config(cfg), self._caps(http=True, sse=False)
+        )
+        assert [(h.name, h.value) for h in out[0].headers] == [
+            ("authorization", "Bearer explicit")
+        ]
+
+    def test_sse_gated_on_capability(self):
+        from acp.schema import SseMcpServer
+
+        cfg = {"mcpServers": {"s": {"url": "https://s/sse", "transport": "sse"}}}
+        assert (
+            _mcp_config_to_acp_servers(
+                self._config(cfg), self._caps(http=True, sse=False)
+            )
+            == []
+        )
+        out = _mcp_config_to_acp_servers(
+            self._config(cfg), self._caps(http=True, sse=True)
+        )
+        assert len(out) == 1
+        assert isinstance(out[0], SseMcpServer)
+        assert out[0].type == "sse"
+
+    def test_streamable_http_maps_to_http(self):
+        from acp.schema import HttpMcpServer
+
+        cfg = {
+            "mcpServers": {
+                "s": {"url": "https://h/mcp", "transport": "streamable-http"}
+            }
+        }
+        out = _mcp_config_to_acp_servers(
+            self._config(cfg), self._caps(http=True, sse=True)
+        )
+        assert len(out) == 1
+        assert isinstance(out[0], HttpMcpServer)
+
+    def test_disabled_servers_not_forwarded(self):
+        cfg = {
+            "mcpServers": {
+                "fetch": {"command": "uvx"},
+                "switched_off": {"command": "uvx", "enabled": False},
+            }
+        }
+        out = _mcp_config_to_acp_servers(
+            self._config(cfg), self._caps(http=True, sse=True)
+        )
+        assert [s.name for s in out] == ["fetch"]
+
+    def test_empty_configs(self):
+        caps = self._caps(http=True, sse=True)
+        assert _mcp_config_to_acp_servers({}, caps) == []
+        assert _mcp_config_to_acp_servers(self._config({"mcpServers": {}}), caps) == []
+
+    def test_none_capabilities_drops_remote_keeps_stdio(self):
+        from acp.schema import McpServerStdio
+
+        cfg = {
+            "mcpServers": {
+                "fetch": {"command": "echo"},
+                "remote": {"url": "https://h/mcp"},
+            }
+        }
+        out = _mcp_config_to_acp_servers(self._config(cfg), None)
+        assert [type(s).__name__ for s in out] == [McpServerStdio.__name__]
+
+
+class TestACPMcpForwarding:
+    """The translated servers reach new_session AND load_session (resume)."""
+
+    @staticmethod
+    def _conn_with_caps(*, http=True, sse=True, load_exc=None):
+        conn = TestACPSessionIdPersistence._make_conn(load_exc=load_exc)
+        conn.initialize.return_value.agent_capabilities.mcp_capabilities = (
+            TestMcpConfigToAcpServers._caps(http=http, sse=sse)
+        )
+        return conn
+
+    def test_new_session_receives_acp_mcp_servers(self, tmp_path):
+        agent = _make_agent(mcp_config={"fetch": {"command": "echo"}})
+        state = _make_state(tmp_path)
+        conn = self._conn_with_caps()
+
+        TestACPSessionIdPersistence._patched_start_acp_server(agent, state, conn=conn)
+
+        conn.new_session.assert_awaited_once()
+        servers = conn.new_session.call_args.kwargs["mcp_servers"]
+        assert [s.name for s in servers] == ["fetch"]
+
+    def test_resume_load_session_receives_acp_mcp_servers(self, tmp_path):
+        agent = _make_agent(mcp_config={"fetch": {"command": "echo"}})
+        state = _make_state(tmp_path)
+        state.agent_state = {**state.agent_state, "acp_session_id": "stored-sess"}
+        conn = self._conn_with_caps()
+
+        TestACPSessionIdPersistence._patched_start_acp_server(agent, state, conn=conn)
+
+        conn.load_session.assert_awaited_once()
+        servers = conn.load_session.call_args.kwargs["mcp_servers"]
+        assert [s.name for s in servers] == ["fetch"]
+        conn.new_session.assert_not_awaited()
+
+    def test_no_mcp_config_forwards_empty_acp_mcp_servers_list(self, tmp_path):
+        agent = _make_agent()
+        state = _make_state(tmp_path)
+        conn = self._conn_with_caps()
+
+        TestACPSessionIdPersistence._patched_start_acp_server(agent, state, conn=conn)
+
+        conn.new_session.assert_awaited_once()
+        assert conn.new_session.call_args.kwargs["mcp_servers"] == []

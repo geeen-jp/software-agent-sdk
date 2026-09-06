@@ -78,6 +78,12 @@
     "owner": "OpenHands OSS"
   },
   {
+    "pointer": "/components/schemas/AuthCapabilities/properties/_meta/anyOf/0/additionalProperties",
+    "kind": "unrestricted-additional-properties",
+    "reason": "ACP capability _meta is an intentional protocol extension channel; this entry scopes only to AuthCapabilities._meta, not arbitrary API objects.",
+    "owner": "OpenHands OSS"
+  },
+  {
     "pointer": "/components/schemas/AskOracleTool/properties/meta/anyOf/0/additionalProperties",
     "kind": "unrestricted-additional-properties",
     "reason": "Tool metadata is intentionally extensible across tool providers.",
@@ -180,6 +186,24 @@
     "owner": "OpenHands OSS"
   },
   {
+    "pointer": "/components/schemas/ClientCapabilities-Input/properties/_meta/anyOf/0/additionalProperties",
+    "kind": "unrestricted-additional-properties",
+    "reason": "ACP capability _meta is an intentional protocol extension channel; this entry scopes only to ClientCapabilities-Input._meta, not arbitrary API objects.",
+    "owner": "OpenHands OSS"
+  },
+  {
+    "pointer": "/components/schemas/ClientCapabilities-Output/properties/_meta/anyOf/0/additionalProperties",
+    "kind": "unrestricted-additional-properties",
+    "reason": "ACP capability _meta is an intentional protocol extension channel; this entry scopes only to ClientCapabilities-Output._meta, not arbitrary API objects.",
+    "owner": "OpenHands OSS"
+  },
+  {
+    "pointer": "/components/schemas/ClientNesCapabilities/properties/_meta/anyOf/0/additionalProperties",
+    "kind": "unrestricted-additional-properties",
+    "reason": "ACP capability _meta is an intentional protocol extension channel; this entry scopes only to ClientNesCapabilities._meta, not arbitrary API objects.",
+    "owner": "OpenHands OSS"
+  },
+  {
     "pointer": "/components/schemas/ClientTool/properties/input_schema/additionalProperties",
     "kind": "unrestricted-additional-properties",
     "reason": "The value is a caller or provider supplied JSON Schema or tool argument object.",
@@ -222,6 +246,24 @@
     "owner": "OpenHands OSS"
   },
   {
+    "pointer": "/components/schemas/ElicitationCapabilities/properties/_meta/anyOf/0/additionalProperties",
+    "kind": "unrestricted-additional-properties",
+    "reason": "ACP capability _meta is an intentional protocol extension channel; this entry scopes only to ElicitationCapabilities._meta, not arbitrary API objects.",
+    "owner": "OpenHands OSS"
+  },
+  {
+    "pointer": "/components/schemas/ElicitationFormCapabilities/properties/_meta/anyOf/0/additionalProperties",
+    "kind": "unrestricted-additional-properties",
+    "reason": "ACP capability _meta is an intentional protocol extension channel; this entry scopes only to ElicitationFormCapabilities._meta, not arbitrary API objects.",
+    "owner": "OpenHands OSS"
+  },
+  {
+    "pointer": "/components/schemas/ElicitationUrlCapabilities/properties/_meta/anyOf/0/additionalProperties",
+    "kind": "unrestricted-additional-properties",
+    "reason": "ACP capability _meta is an intentional protocol extension channel; this entry scopes only to ElicitationUrlCapabilities._meta, not arbitrary API objects.",
+    "owner": "OpenHands OSS"
+  },
+  {
     "pointer": "/components/schemas/EditTool/properties/meta/anyOf/0/additionalProperties",
     "kind": "unrestricted-additional-properties",
     "reason": "Tool metadata is intentionally extensible across tool providers.",
@@ -231,6 +273,12 @@
     "pointer": "/components/schemas/FileEditorTool/properties/meta/anyOf/0/additionalProperties",
     "kind": "unrestricted-additional-properties",
     "reason": "Tool metadata is intentionally extensible across tool providers.",
+    "owner": "OpenHands OSS"
+  },
+  {
+    "pointer": "/components/schemas/FileSystemCapabilities/properties/_meta/anyOf/0/additionalProperties",
+    "kind": "unrestricted-additional-properties",
+    "reason": "ACP capability _meta is an intentional protocol extension channel; this entry scopes only to FileSystemCapabilities._meta, not arbitrary API objects.",
     "owner": "OpenHands OSS"
   },
   {
@@ -285,6 +333,24 @@
     "pointer": "/components/schemas/ListDirectoryTool/properties/meta/anyOf/0/additionalProperties",
     "kind": "unrestricted-additional-properties",
     "reason": "Tool metadata is intentionally extensible across tool providers.",
+    "owner": "OpenHands OSS"
+  },
+  {
+    "pointer": "/components/schemas/NesJumpCapabilities/properties/_meta/anyOf/0/additionalProperties",
+    "kind": "unrestricted-additional-properties",
+    "reason": "ACP capability _meta is an intentional protocol extension channel; this entry scopes only to NesJumpCapabilities._meta, not arbitrary API objects.",
+    "owner": "OpenHands OSS"
+  },
+  {
+    "pointer": "/components/schemas/NesRenameCapabilities/properties/_meta/anyOf/0/additionalProperties",
+    "kind": "unrestricted-additional-properties",
+    "reason": "ACP capability _meta is an intentional protocol extension channel; this entry scopes only to NesRenameCapabilities._meta, not arbitrary API objects.",
+    "owner": "OpenHands OSS"
+  },
+  {
+    "pointer": "/components/schemas/NesSearchAndReplaceCapabilities/properties/_meta/anyOf/0/additionalProperties",
+    "kind": "unrestricted-additional-properties",
+    "reason": "ACP capability _meta is an intentional protocol extension channel; this entry scopes only to NesSearchAndReplaceCapabilities._meta, not arbitrary API objects.",
     "owner": "OpenHands OSS"
   },
   {

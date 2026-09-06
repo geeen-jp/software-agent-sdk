@@ -1,14 +1,17 @@
 import asyncio
+import inspect
 import json
 from pathlib import Path
-from unittest.mock import MagicMock
+from typing import Any
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from acp.schema import SetSessionConfigOptionResponse, SetSessionModelResponse
 from pydantic import SecretStr
 
 from openhands.sdk import LLM, LocalConversation
 from openhands.sdk.agent import Agent
-from openhands.sdk.agent.acp_agent import ACPAgent
+from openhands.sdk.agent.acp_agent import ACPAgent, _OpenHandsACPBridge
 from openhands.sdk.context.condenser import LLMSummarizingCondenser
 from openhands.sdk.context.view import View
 from openhands.sdk.conversation.persistence_const import BASE_STATE
@@ -22,6 +25,93 @@ from openhands.sdk.llm.llm_profile_store import LLMProfileStore
 from openhands.sdk.testing import TestLLM
 from openhands.sdk.utils.cipher import Cipher
 from tests.conftest import create_mock_litellm_response
+from tests.sdk.agent.test_acp_agent import (
+    _config_option,
+    _config_option_with_value,
+    _make_agent,
+)
+
+
+def _run_async_executor(
+    awaitable_or_fn: Any, *args: Any, timeout: Any = None, **kwargs: Any
+) -> Any:
+    if inspect.iscoroutine(awaitable_or_fn):
+        coro = awaitable_or_fn
+    elif inspect.iscoroutinefunction(awaitable_or_fn):
+        coro = awaitable_or_fn(*args, **kwargs)
+    else:
+        raise TypeError("run_async expects a coroutine or async function")
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(coro)
+    finally:
+        loop.close()
+
+
+def _wire_live_acp_conversation(
+    tmp_path: Path,
+    *,
+    agent_name: str = "codex-acp",
+    acp_model: str = "model-a",
+    via_config_option: bool = False,
+    initial_effective_model_id: str | None = "model-a",
+) -> tuple[LocalConversation, ACPAgent]:
+    """ACP conversation with a faked live session wired for real set_acp_model."""
+    agent = _make_agent(acp_model=acp_model)
+    conn = MagicMock()
+    model_options = [
+        _config_option("model", "old-model", ["old-model", "gpt-5.5", "gpt-5.5/high"]),
+        _config_option(
+            "reasoning_effort",
+            "medium",
+            ["low", "medium", "high", "xhigh"],
+        ),
+    ]
+
+    async def _set_config_option(
+        *, config_id: str, session_id: str, value: str | bool, **kwargs: Any
+    ) -> SetSessionConfigOptionResponse:
+        nonlocal model_options
+        updated: list[Any] = []
+        for option in model_options:
+            if option.id == config_id:
+                updated.append(_config_option_with_value(option, value))
+            else:
+                updated.append(option)
+        model_options = updated
+        return SetSessionConfigOptionResponse(config_options=list(model_options))
+
+    async def _set_session_model(
+        *, model_id: str, session_id: str, **kwargs: Any
+    ) -> SetSessionModelResponse:
+        return SetSessionModelResponse(
+            field_meta={"current_model_id": model_id},
+        )
+
+    conn.set_session_model = AsyncMock(side_effect=_set_session_model)
+    conn.set_config_option = AsyncMock(side_effect=_set_config_option)
+    agent._conn = conn
+    agent._session_id = "sess-1"
+    agent._agent_name = agent_name
+    agent._model_via_config_option = via_config_option
+    agent._client = _OpenHandsACPBridge()
+    if initial_effective_model_id is not None:
+        agent._current_model_id = initial_effective_model_id
+    executor = MagicMock()
+    executor.run_async = MagicMock(side_effect=_run_async_executor)
+    agent._executor = executor
+
+    conv = LocalConversation(
+        agent=agent,
+        workspace=tmp_path,
+        persistence_dir=str(tmp_path / "persist"),
+    )
+    return conv, agent
+
+
+def _reload_persisted_state(conv: LocalConversation) -> ConversationState:
+    base_text = conv.state._fs.read(BASE_STATE)
+    return ConversationState.model_validate(json.loads(base_text))
 
 
 def _make_llm(model: str, usage_id: str) -> LLM:
@@ -81,7 +171,13 @@ def _make_acp_conversation(tmp_path) -> tuple[LocalConversation, ACPAgent]:
     agent._session_id = "sess-1"
     agent._agent_name = "codex-acp"
     executor = MagicMock()
-    executor.run_async = MagicMock()
+
+    def _run_async(awaitable_or_fn: Any, *args: Any, **kwargs: Any) -> Any:
+        if len(args) >= 3 and isinstance(args[2], str):
+            return args[2]
+        return None
+
+    executor.run_async = MagicMock(side_effect=_run_async)
     agent._executor = executor
     conv = LocalConversation(
         agent=agent,
@@ -122,24 +218,25 @@ def test_switch_acp_model_before_session_defers_and_persists(tmp_path):
 
     conv.switch_acp_model("model-b")
 
-    # The authoritative model moved even though no live session was touched.
+    # The requested model moved even though no live session was touched.
     switched = conv.agent
     assert isinstance(switched, ACPAgent)
     assert switched.acp_model == "model-b"
     assert not switched.has_live_acp_session
     assert isinstance(conv.state.agent, ACPAgent)
     assert conv.state.agent.acp_model == "model-b"
-    # Cold-read hint updated for the chip/picker before any session exists.
-    assert conv.state.agent_state["acp_current_model_id"] == "model-b"
+    # No server/session has verified an effective model yet, so the
+    # effective-state key stays absent rather than copying the request.
+    assert "acp_current_model_id" not in conv.state.agent_state
 
     # Survives a restart before the first run: base_state.json carries the
-    # switched model, and model_post_init re-derives the sentinel LLM from it,
+    # requested model, and model_post_init re-derives the sentinel LLM from it,
     # so the first session starts on model-b (acceptance criterion #3).
-    base_text = conv.state._fs.read(BASE_STATE)
-    reloaded = ConversationState.model_validate(json.loads(base_text))
+    reloaded = _reload_persisted_state(conv)
     assert isinstance(reloaded.agent, ACPAgent)
     assert reloaded.agent.acp_model == "model-b"
     assert reloaded.agent.llm.model == "model-b"
+    assert "acp_current_model_id" not in reloaded.agent_state
 
 
 def test_switch_acp_model_persists_authoritative_model(tmp_path):
@@ -257,6 +354,83 @@ def test_switch_acp_model_disarms_discarded_agent_finalizer(tmp_path):
     live_executor.close.assert_not_called()
     switched.release_runtime()
     assert switched._atexit_callback is None
+
+
+def test_switch_llm_disarms_discarded_acp_agent_finalizer(tmp_path):
+    """switch_llm shallow-copies ACPAgent and must not leave two cleanup owners."""
+    conv, old_agent = _make_acp_conversation(tmp_path)
+    live_conn = old_agent._conn
+    live_executor = old_agent._executor
+    old_agent._register_atexit_cleanup()
+
+    conv.switch_llm(_make_llm("other-model", "other-llm"))
+
+    switched = conv.agent
+    assert isinstance(switched, ACPAgent)
+    assert switched._conn is live_conn
+    assert switched._executor is live_executor
+    assert old_agent._closed is True
+    assert old_agent._atexit_callback is None
+    assert switched._atexit_callback is not None
+
+    live_executor.run_async.reset_mock()
+    old_agent.close()
+    live_executor.run_async.assert_not_called()
+
+
+def test_switch_profile_disarms_discarded_acp_agent_finalizer(
+    tmp_path, profile_store, monkeypatch
+):
+    profile_dir = tmp_path / "profiles"
+    store = LLMProfileStore(profile_dir)
+    store.save("fast", _make_llm("fast-model", "fast"))
+    monkeypatch.setattr(llm_profile_store, "_DEFAULT_PROFILE_DIR", profile_dir)
+
+    conv, old_agent = _make_acp_conversation(tmp_path)
+    live_conn = old_agent._conn
+    live_executor = old_agent._executor
+    old_agent._register_atexit_cleanup()
+
+    conv.switch_profile("fast")
+
+    switched = conv.agent
+    assert isinstance(switched, ACPAgent)
+    assert switched._conn is live_conn
+    assert switched._executor is live_executor
+    assert old_agent._closed is True
+    assert switched._atexit_callback is not None
+
+    live_executor.run_async.reset_mock()
+    old_agent.close()
+    live_executor.run_async.assert_not_called()
+
+
+def test_switch_acp_model_new_owner_close_is_idempotent(tmp_path):
+    conv, old_agent = _make_acp_conversation(tmp_path)
+    live_executor = old_agent._executor
+    old_agent._register_atexit_cleanup()
+
+    conv.switch_acp_model("model-b")
+
+    switched = conv.agent
+    assert isinstance(switched, ACPAgent)
+    switched.close()
+    switched.close()
+    assert live_executor.run_async.call_count >= 1
+
+
+def test_switch_acp_model_old_atexit_callback_is_noop(tmp_path):
+    conv, old_agent = _make_acp_conversation(tmp_path)
+    live_executor = old_agent._executor
+    old_agent._register_atexit_cleanup()
+    old_callback = old_agent._atexit_callback
+    assert old_callback is not None
+
+    conv.switch_acp_model("model-b")
+
+    live_executor.run_async.reset_mock()
+    old_callback()
+    live_executor.run_async.assert_not_called()
 
 
 def test_switch_profile(profile_store):
@@ -756,3 +930,164 @@ def test_switch_llm_to_subscription_profile_keeps_condenser(
     assert conv.agent.llm.model == "regular-model"
     assert conv.agent.condenser is condenser
     assert conv.state.agent.condenser is condenser
+
+
+class TestSwitchACPModelEffectivePersistence:
+    """MF-2 regression: persist verified effective model, not requested."""
+
+    def test_pre_session_requested_preserves_prior_verified_effective(self, tmp_path):
+        conv, agent = _make_pre_session_acp_conversation(tmp_path)
+        conv.state.agent_state = {
+            **conv.state.agent_state,
+            "acp_current_model_id": "model-y",
+        }
+        assert not agent.has_live_acp_session
+
+        conv.switch_acp_model("model-x")
+
+        switched = conv.agent
+        assert isinstance(switched, ACPAgent)
+        assert switched.acp_model == "model-x"
+        assert conv.state.agent_state["acp_current_model_id"] == "model-y"
+
+        reloaded = _reload_persisted_state(conv)
+        assert isinstance(reloaded.agent, ACPAgent)
+        assert reloaded.agent.acp_model == "model-x"
+        assert reloaded.agent_state["acp_current_model_id"] == "model-y"
+
+    def test_pre_session_requested_does_not_create_effective_key(self, tmp_path):
+        conv, agent = _make_pre_session_acp_conversation(tmp_path)
+        assert not agent.has_live_acp_session
+        assert "acp_current_model_id" not in conv.state.agent_state
+
+        conv.switch_acp_model("model-x")
+
+        switched = conv.agent
+        assert isinstance(switched, ACPAgent)
+        assert switched.acp_model == "model-x"
+        assert "acp_current_model_id" not in conv.state.agent_state
+
+        reloaded = _reload_persisted_state(conv)
+        assert isinstance(reloaded.agent, ACPAgent)
+        assert reloaded.agent.acp_model == "model-x"
+        assert "acp_current_model_id" not in reloaded.agent_state
+
+    def test_requested_and_verified_effective_match_persists_effective(self, tmp_path):
+        conv, agent = _wire_live_acp_conversation(tmp_path)
+        conv.state.agent_state = {
+            **conv.state.agent_state,
+            "acp_current_model_id": "model-a",
+        }
+
+        conv.switch_acp_model("gpt-5.5")
+
+        switched = conv.agent
+        assert isinstance(switched, ACPAgent)
+        assert switched.acp_model == "gpt-5.5"
+        assert switched.current_model_id == "gpt-5.5"
+        assert conv.state.agent_state["acp_current_model_id"] == "gpt-5.5"
+
+    def test_requested_differs_from_verified_effective_persists_effective_only(
+        self, tmp_path
+    ):
+        conv, _agent = _wire_live_acp_conversation(
+            tmp_path, via_config_option=True, acp_model="old-model"
+        )
+        conv.state.agent_state = {
+            **conv.state.agent_state,
+            "acp_current_model_id": "old-model",
+        }
+
+        conv.switch_acp_model("gpt-5.5")
+
+        switched = conv.agent
+        assert isinstance(switched, ACPAgent)
+        assert switched.acp_model == "gpt-5.5"
+        assert switched.current_model_id == "gpt-5.5/medium"
+        assert conv.state.agent_state["acp_current_model_id"] == "gpt-5.5/medium"
+
+    def test_unverifiable_switch_fails_and_preserves_previous_effective(self, tmp_path):
+        conv, agent = _wire_live_acp_conversation(tmp_path)
+
+        async def _empty_response(*, model_id: str, session_id: str, **kwargs: Any):
+            return SetSessionModelResponse()
+
+        agent._conn.set_session_model = AsyncMock(side_effect=_empty_response)
+        conv.state.agent_state = {
+            **conv.state.agent_state,
+            "acp_current_model_id": "model-z",
+        }
+
+        with pytest.raises(ValueError, match="could not verify"):
+            conv.switch_acp_model("gpt-5.5")
+
+        switched = conv.agent
+        assert isinstance(switched, ACPAgent)
+        assert switched.acp_model == "model-a"
+        assert conv.state.agent_state["acp_current_model_id"] == "model-z"
+
+    def test_effective_mismatch_fails_and_preserves_previous_effective(self, tmp_path):
+        conv, agent = _wire_live_acp_conversation(tmp_path)
+
+        async def _wrong_model(*, model_id: str, session_id: str, **kwargs: Any):
+            return SetSessionModelResponse(
+                field_meta={"current_model_id": "other-model"}
+            )
+
+        agent._conn.set_session_model = AsyncMock(side_effect=_wrong_model)
+        conv.state.agent_state = {
+            **conv.state.agent_state,
+            "acp_current_model_id": "model-z",
+        }
+
+        with pytest.raises(ValueError, match="could not verify"):
+            conv.switch_acp_model("gpt-5.5")
+
+        switched = conv.agent
+        assert isinstance(switched, ACPAgent)
+        assert switched.acp_model == "model-a"
+        assert conv.state.agent_state["acp_current_model_id"] == "model-z"
+
+    def test_successful_switch_cold_read_reports_verified_effective(self, tmp_path):
+        conv, _agent = _wire_live_acp_conversation(
+            tmp_path, via_config_option=True, acp_model="old-model"
+        )
+
+        conv.switch_acp_model("gpt-5.5")
+
+        reloaded = _reload_persisted_state(conv)
+        assert isinstance(reloaded.agent, ACPAgent)
+        assert reloaded.agent.acp_model == "gpt-5.5"
+        assert reloaded.agent_state["acp_current_model_id"] == "gpt-5.5/medium"
+
+    def test_switch_llm_does_not_persist_requested_llm_as_effective(self, tmp_path):
+        conv, _agent = _wire_live_acp_conversation(tmp_path)
+        conv.state.agent_state = {
+            **conv.state.agent_state,
+            "acp_current_model_id": "verified-effective",
+        }
+
+        conv.switch_llm(_make_llm("fast-model", "fast-llm"))
+
+        assert conv.agent.llm.model == "fast-model"
+        assert conv.state.agent_state["acp_current_model_id"] == "verified-effective"
+
+    def test_switch_profile_does_not_persist_requested_llm_as_effective(
+        self, tmp_path, monkeypatch
+    ):
+        profile_dir = tmp_path / "profiles"
+        profile_dir.mkdir()
+        monkeypatch.setattr(llm_profile_store, "_DEFAULT_PROFILE_DIR", profile_dir)
+        store = LLMProfileStore(profile_dir)
+        store.save("fast", _make_llm("fast-model", "fast"))
+
+        conv, _agent = _wire_live_acp_conversation(tmp_path)
+        conv.state.agent_state = {
+            **conv.state.agent_state,
+            "acp_current_model_id": "verified-effective",
+        }
+
+        conv.switch_profile("fast")
+
+        assert conv.agent.llm.model == "fast-model"
+        assert conv.state.agent_state["acp_current_model_id"] == "verified-effective"
