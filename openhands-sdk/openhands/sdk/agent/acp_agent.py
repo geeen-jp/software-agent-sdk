@@ -37,16 +37,15 @@ from acp.helpers import image_block, text_block
 from acp.schema import (
     AgentMessageChunk,
     AgentThoughtChunk,
-    AllowedOutcome,
     ClientCapabilities,
     ConfigOptionUpdate,
+    CurrentModeUpdate,
     EnvVariable,
     HttpHeader,
     HttpMcpServer,
     ImageContentBlock,
     McpServerStdio,
     PromptResponse,
-    RequestPermissionResponse,
     SessionConfigOptionBoolean,
     SessionConfigOptionSelect,
     SessionModelState,
@@ -59,15 +58,38 @@ from acp.schema import (
 from acp.transports import default_environment
 from pydantic import Field, PrivateAttr, SecretStr, field_serializer, field_validator
 
+from openhands.sdk.agent.acp_claude_auth import (
+    CLAUDE_CREDENTIALS_FILENAME,
+    CLAUDE_CREDENTIALS_SECRET_NAME,
+    CLAUDE_OAUTH_ENV_NAMES,
+    CLAUDE_OAUTH_TOKEN_ENV,
+    CLAUDE_PAYG_CONFLICTING_ENV,
+    claude_subscription_auth_active,
+    create_claude_config_runtime_dir,
+    discard_claude_oauth_runtime_dir,
+    is_valid_claude_oauth_credentials,
+    seed_claude_oauth_credentials,
+    track_claude_oauth_credentials_from_file,
+    unlink_claude_oauth_credentials,
+)
 from openhands.sdk.agent.acp_file_credentials import (
     ACPFileCredentialLifecycle,
     create_file_credential_lifecycle,
     write_secret_file,
 )
 from openhands.sdk.agent.acp_models import ACPModelInfo
+from openhands.sdk.agent.acp_permission_policy import (
+    ACPPermissionPolicy,
+    assert_config_options_compatible_with_permission_policy,
+    is_permission_mode_config_option,
+    normalize_acp_permission_policy,
+    resolve_permission_response,
+    resolve_session_mode_for_policy,
+)
 from openhands.sdk.agent.acp_tracing import ACPTurnTrace
 from openhands.sdk.agent.base import AgentBase
 from openhands.sdk.context import AgentContext
+from openhands.sdk.conversation.secret_registry import SecretRegistry
 from openhands.sdk.conversation.state import ConversationExecutionStatus
 from openhands.sdk.credential import (
     CredentialBindingError,
@@ -145,19 +167,12 @@ _RETRIABLE_SERVER_ERROR_CODES: frozenset[int] = frozenset({-32603})
 # used by the terminal tool and the default max_message_chars in LLM config.
 MAX_ACP_CONTENT_CHARS: int = 30_000
 
-# Env vars that must be removed from the subprocess environment when a
-# particular "dominant" env var is present.
-#
-# Rationale: some auth mechanisms are mutually exclusive and their env vars
-# conflict.  For example, CLAUDE_CONFIG_DIR activates Claude Code's OAuth
-# credential-file flow.  If ANTHROPIC_API_KEY or ANTHROPIC_BASE_URL are
-# also present they redirect requests to a different endpoint (e.g. a proxy)
-# that doesn't support OAuth bearer tokens, breaking authentication silently.
-# When CLAUDE_CONFIG_DIR is detected we strip the conflicting vars so the
-# subprocess can reach api.anthropic.com with its own OAuth token.
-_ENV_CONFLICT_MAP: dict[str, frozenset[str]] = {
-    "CLAUDE_CONFIG_DIR": frozenset({"ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL"}),
-}
+# Env vars that conflict with Claude Code's OAuth/subscription channel.
+# Strip PAYG/proxy vars when that channel is active. Host CLAUDE_CONFIG_DIR
+# alone must not disable API/proxy auth or other providers' credentials.
+# CLAUDE_CREDENTIALS_JSON is an SDK input secret; the subprocess never
+# receives the JSON blob.
+_CLAUDE_OAUTH_CONFLICTING_ENV: frozenset[str] = CLAUDE_PAYG_CONFLICTING_ENV
 
 # Limit for asyncio.StreamReader buffers used by the ACP subprocess pipes.
 # The default (64 KiB) is too small for session_update notifications that
@@ -287,6 +302,10 @@ class ACPSessionModelError(RuntimeError):
     """
 
 
+class ACPSessionModeError(RuntimeError):
+    """A required ACP session mode could not be advertised or confirmed."""
+
+
 def _classify_acp_init_error(exc: BaseException) -> str:
     """Map a cold-start failure to a structured ``ConversationErrorEvent`` code."""
     if isinstance(exc, TimeoutError):
@@ -331,9 +350,7 @@ def _model_config_option_from_options(
     options: list[SessionConfigOption] | None,
 ) -> Any | None:
     """Return the ``model`` select option from a complete config option state."""
-    if not options:
-        return None
-    for raw in options:
+    for raw in _iter_session_config_options(options):
         opt = getattr(raw, "root", raw)
         if (
             getattr(opt, "type", None) == "select"
@@ -368,7 +385,7 @@ def _effective_model_from_config_options(
         return None
     provider = detect_acp_provider_by_agent_name(agent_name or "")
     if provider is not None and provider.key == "codex":
-        for raw in options or []:
+        for raw in _iter_session_config_options(options):
             effort_opt = getattr(raw, "root", raw)
             if getattr(effort_opt, "id", None) != "reasoning_effort":
                 continue
@@ -527,10 +544,133 @@ def _extract_session_models(
     if models is not None:
         current = getattr(models, "current_model_id", None)
         current = current if isinstance(current, str) and current else None
-        raw = getattr(models, "available_models", None) or []
+        raw = getattr(models, "available_models", None)
+        if not isinstance(raw, list):
+            raw = []
         usable = _usable_models(ACPModelInfo.from_protocol(m) for m in raw)
         return current, usable, False
     return None, None, default_via_config_option
+
+
+def _extract_session_modes(response: Any) -> tuple[str | None, set[str]]:
+    """Return (current_mode_id, available_mode_ids) from a session response."""
+    if response is None:
+        return None, set()
+    modes = getattr(response, "modes", None)
+    if modes is None:
+        return None, set()
+    available_raw = getattr(modes, "available_modes", None)
+    if not isinstance(available_raw, list):
+        return None, set()
+    available: set[str] = set()
+    for mode in available_raw:
+        mode_id = getattr(mode, "id", None)
+        if isinstance(mode_id, str) and mode_id:
+            available.add(mode_id)
+    current = getattr(modes, "current_mode_id", None)
+    current = current if isinstance(current, str) and current else None
+    return current, available
+
+
+async def _apply_acp_session_mode(
+    conn: ClientSideConnection,
+    client: _OpenHandsACPBridge,
+    *,
+    policy: str,
+    mode_id: str | None,
+    agent_name: str,
+    session_id: str,
+    session_response: Any,
+) -> None:
+    """Set the session mode; read_only also requires advertise + confirm."""
+    if mode_id is None:
+        return
+    current_mode_id, available = _extract_session_modes(session_response)
+    require_confirm = normalize_acp_permission_policy(policy) == "read_only"
+    if require_confirm and mode_id not in available:
+        raise ACPSessionModeError(
+            f"ACP server {agent_name!r} session {session_id} did not advertise "
+            f"required read_only session mode {mode_id!r}; "
+            f"available modes: {sorted(available)}."
+        )
+    logger.info("Setting ACP session mode: %s", mode_id)
+    try:
+        await conn.set_session_mode(mode_id=mode_id, session_id=session_id)
+    except ACPSessionModeError:
+        raise
+    except Exception as exc:
+        if require_confirm:
+            raise ACPSessionModeError(
+                f"ACP server {agent_name!r} session {session_id} failed to set "
+                f"read_only session mode {mode_id!r}: {exc}"
+            ) from exc
+        raise
+    if not require_confirm:
+        return
+    observed = client.get_current_mode_id(session_id)
+    if observed == mode_id or (observed is None and current_mode_id == mode_id):
+        return
+    raise ACPSessionModeError(
+        f"ACP server {agent_name!r} session {session_id} did not confirm "
+        f"read_only session mode {mode_id!r} "
+        f"(advertised current={current_mode_id!r}, observed={observed!r})."
+    )
+
+
+def _iter_session_config_options(
+    options: list[SessionConfigOption] | None,
+) -> Iterable[SessionConfigOption]:
+    if not isinstance(options, list):
+        return []
+    return options
+
+
+def _verify_read_only_mode_after_config(
+    client: _OpenHandsACPBridge,
+    *,
+    policy: str,
+    required_mode_id: str | None,
+    agent_name: str,
+    session_id: str,
+    config_options: list[SessionConfigOption] | None,
+    mode_generation_before: int = 0,
+    require_fresh_mode: bool = False,
+) -> None:
+    """Fail closed if session configuration replaced the verified read_only mode."""
+    if (
+        normalize_acp_permission_policy(policy) != "read_only"
+        or required_mode_id is None
+    ):
+        return
+    observed = client.get_current_mode_id(session_id)
+    generation = client.get_current_mode_generation(session_id)
+    if require_fresh_mode:
+        if generation <= mode_generation_before or observed != required_mode_id:
+            raise ACPSessionModeError(
+                f"ACP server {agent_name!r} session {session_id} did not prove "
+                f"read_only session mode {required_mode_id!r} after applying "
+                f"session configuration (observed={observed!r})."
+            )
+    elif observed is not None and observed != required_mode_id:
+        raise ACPSessionModeError(
+            f"ACP server {agent_name!r} session {session_id} replaced "
+            f"read_only session mode {required_mode_id!r} with {observed!r} "
+            "after applying session configuration."
+        )
+    for option in (
+        *_iter_session_config_options(config_options),
+        *_iter_session_config_options(client.get_config_options(session_id)),
+    ):
+        option_id = getattr(option, "id", None)
+        if not is_permission_mode_config_option(option_id):
+            continue
+        current = _config_option_current_value(option)
+        if current != required_mode_id:
+            raise ACPSessionModeError(
+                f"ACP server {agent_name!r} session {session_id} configuration "
+                f"option {option_id!r}={current!r} replaced read_only session "
+                f"mode {required_mode_id!r}."
+            )
 
 
 async def _maybe_set_session_model(
@@ -700,9 +840,10 @@ def _config_option_values(
     options: list[SessionConfigOption] | None,
 ) -> dict[str, str]:
     """Map ``option id -> current value`` for a complete config option state."""
-    if not options:
-        return {}
-    return {option.id: _config_option_current_value(option) for option in options}
+    return {
+        option.id: _config_option_current_value(option)
+        for option in _iter_session_config_options(options)
+    }
 
 
 _CANONICAL_BOOLEAN_REQUESTS = frozenset({"true", "false"})
@@ -711,9 +852,7 @@ _CANONICAL_BOOLEAN_REQUESTS = frozenset({"true", "false"})
 def _config_options_index(
     options: list[SessionConfigOption] | None,
 ) -> dict[str, SessionConfigOption]:
-    if not options:
-        return {}
-    return {option.id: option for option in options}
+    return {option.id: option for option in _iter_session_config_options(options)}
 
 
 def _parse_boolean_request(value: str) -> bool:
@@ -786,6 +925,8 @@ async def _apply_session_config_options(
     session_id: str,
     requested: dict[str, str],
     initial_options: list[SessionConfigOption] | None,
+    *,
+    required_session_mode: str | None = None,
 ) -> None:
     """Apply *requested* session config options and verify the observed state.
 
@@ -800,7 +941,9 @@ async def _apply_session_config_options(
     response does not describe the option (some servers publish the new state
     asynchronously, and selecting one option can reveal another).  After all
     writes complete, every requested option is checked again against the final
-    complete state for that same session.
+    complete state for that same session.  Under ``read_only``, permission or
+    session-mode option ids are refused up front, and the effective session
+    mode is checked again after the writes.
 
     Raises:
         ACPSessionConfigError: if the server exposes no config options, a
@@ -808,9 +951,31 @@ async def _apply_session_config_options(
             complete state comes back, or the reported value differs from the
             requested one.  Never returns while a requested option is
             unverified.
+        ACPSessionModeError: if applying configuration replaced a verified
+            ``read_only`` session mode.
+        ValueError: if a requested option would select a permission/session
+            mode under ``read_only``.
     """
+    assert_config_options_compatible_with_permission_policy(
+        client.permission_policy,
+        requested,
+    )
     if not requested:
+        _verify_read_only_mode_after_config(
+            client,
+            policy=client.permission_policy,
+            required_mode_id=required_session_mode,
+            agent_name=agent_name,
+            session_id=session_id,
+            config_options=initial_options,
+        )
         return
+
+    mode_generation_before = client.get_current_mode_generation(session_id)
+    require_fresh_mode = (
+        normalize_acp_permission_policy(client.permission_policy) == "read_only"
+        and required_session_mode is not None
+    )
 
     state_by_id = _config_options_index(initial_options)
     observed_by_id = _config_options_index(client.get_config_options(session_id))
@@ -897,6 +1062,16 @@ async def _apply_session_config_options(
         session_id,
         requested,
         final_state,
+    )
+    _verify_read_only_mode_after_config(
+        client,
+        policy=client.permission_policy,
+        required_mode_id=required_session_mode,
+        agent_name=agent_name,
+        session_id=session_id,
+        config_options=list(final_state.values()),
+        mode_generation_before=mode_generation_before,
+        require_fresh_mode=require_fresh_mode,
     )
 
 
@@ -1225,7 +1400,10 @@ class _OpenHandsACPBridge:
       treat the post-message event as authoritative.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, permission_policy: ACPPermissionPolicy = "writable") -> None:
+        self.permission_policy: ACPPermissionPolicy = normalize_acp_permission_policy(
+            permission_policy
+        )
         self.accumulated_text: list[str] = []
         self.accumulated_thoughts: list[str] = []
         self.accumulated_tool_calls: list[dict[str, Any]] = []
@@ -1267,6 +1445,8 @@ class _OpenHandsACPBridge:
         # Keyed by session so an update for a different session can never
         # satisfy the verification of this one.
         self._config_options_by_session: dict[str, list[SessionConfigOption]] = {}
+        self._current_mode_by_session: dict[str, str] = {}
+        self._current_mode_generation_by_session: dict[str, int] = {}
         # Fork session state for ask_agent() — guarded by _fork_lock to
         # prevent concurrent ask_agent() calls from colliding.
         self._fork_lock = threading.Lock()
@@ -1314,6 +1494,14 @@ class _OpenHandsACPBridge:
     def get_config_options(self, session_id: str) -> list[SessionConfigOption] | None:
         """Return the last complete config option state seen for *session_id*."""
         return self._config_options_by_session.get(session_id)
+
+    def get_current_mode_id(self, session_id: str) -> str | None:
+        """Return the last confirmed session mode id for *session_id*."""
+        return self._current_mode_by_session.get(session_id)
+
+    def get_current_mode_generation(self, session_id: str) -> int:
+        """Return how many CurrentModeUpdate notifications this session has seen."""
+        return self._current_mode_generation_by_session.get(session_id, 0)
 
     def _mask_value(self, value: Any) -> Any:
         if self.mask is None:
@@ -1385,6 +1573,13 @@ class _OpenHandsACPBridge:
             # it per session so initialization can verify requested options
             # even when the server answers set_config_option asynchronously.
             self._config_options_by_session[session_id] = list(update.config_options)
+        elif isinstance(update, CurrentModeUpdate):
+            current_mode_id = update.current_mode_id
+            if isinstance(current_mode_id, str) and current_mode_id:
+                self._current_mode_by_session[session_id] = current_mode_id
+                self._current_mode_generation_by_session[session_id] = (
+                    self._current_mode_generation_by_session.get(session_id, 0) + 1
+                )
         elif isinstance(update, ToolCallStart):
             entry = {
                 "tool_call_id": update.tool_call_id,
@@ -1498,16 +1693,11 @@ class _OpenHandsACPBridge:
         tool_call: Any,
         **kwargs: Any,  # noqa: ARG002
     ) -> Any:
-        """Auto-approve all permission requests from the ACP server."""
-        # Pick the first option (usually "allow once")
-        option_id = options[0].option_id if options else "allow_once"
-        logger.info(
-            "ACP auto-approving permission: %s (option: %s)",
+        """Apply the conversation-local ACP permission policy."""
+        return resolve_permission_response(
+            self.permission_policy,
+            options,
             tool_call,
-            option_id,
-        )
-        return RequestPermissionResponse(
-            outcome=AllowedOutcome(outcome="selected", option_id=option_id),
         )
 
     # fs/terminal methods — raise NotImplementedError; ACP server handles its own
@@ -1687,6 +1877,22 @@ class ACPAgent(AgentBase):
             "instead of the shared user HOME."
         ),
     )
+    acp_permission_policy: ACPPermissionPolicy = Field(
+        default="writable",
+        description=(
+            "Conversation-local permission policy for ACP sessions. "
+            "``writable`` preserves the default auto-approve behavior. "
+            "``read_only`` refuses unverified provider write paths and, for "
+            "Claude Code, uses a permission-requesting session mode plus "
+            "denied request_permission callbacks. Unsupported providers and "
+            "unknown policy values fail closed."
+        ),
+    )
+
+    @field_validator("acp_permission_policy")
+    @classmethod
+    def _validate_acp_permission_policy(cls, value: str) -> ACPPermissionPolicy:
+        return normalize_acp_permission_policy(value)
 
     @field_validator("agent_context")
     @classmethod
@@ -1744,6 +1950,9 @@ class ACPAgent(AgentBase):
     _replace_file_credentials_on_next_materialisation: set[str] = PrivateAttr(
         default_factory=set
     )
+    _claude_config_runtime_dir: Path | None = PrivateAttr(default=None)
+    _claude_oauth_source_digest: str | None = PrivateAttr(default=None)
+    _secret_registry_for_masking: SecretRegistry | None = PrivateAttr(default=None)
     _atexit_callback: Callable[[], None] | None = PrivateAttr(default=None)
     # Suffix rendered once at session start from agent_context + secret_registry.
     _suffix_install_state: str = PrivateAttr(default="unused")
@@ -1912,6 +2121,7 @@ class ACPAgent(AgentBase):
 
     def restart_for_updated_credentials(self, secret_names: Collection[str]) -> None:
         configured = {spec.secret_name for spec in self.acp_file_secrets}
+        configured.add(CLAUDE_CREDENTIALS_SECRET_NAME)
         with self._file_credential_lock:
             self._replace_file_credentials_on_next_materialisation.update(
                 configured.intersection(secret_names)
@@ -1925,6 +2135,7 @@ class ACPAgent(AgentBase):
             or self._process is not None
             or self._conn is not None
             or bool(self._file_credential_lifecycles)
+            or self._claude_config_runtime_dir is not None
         )
 
     def _register_atexit_cleanup(self, *, replace: bool = False) -> None:
@@ -1961,16 +2172,89 @@ class ACPAgent(AgentBase):
             root = Path(state.workspace.working_dir) / ".openhands" / "acp" / subdir
         return Path(os.path.abspath(root))
 
+    def _ensure_claude_config_runtime_dir(self) -> Path:
+        existing = self._claude_config_runtime_dir
+        if existing is not None and existing.is_dir():
+            return existing
+        runtime_dir = create_claude_config_runtime_dir()
+        self._claude_config_runtime_dir = runtime_dir
+        return runtime_dir
+
+    def _remove_durable_claude_oauth_credentials(
+        self, state: ConversationState
+    ) -> None:
+        durable_dir = self._acp_file_secret_dir(state, "claude-code")
+        unlink_claude_oauth_credentials(durable_dir)
+
+    def _cleanup_claude_config_runtime(self, *, discard: bool) -> None:
+        runtime_dir = self._claude_config_runtime_dir
+        if runtime_dir is None:
+            return
+        if not discard:
+            return
+        discard_claude_oauth_runtime_dir(runtime_dir)
+        self._claude_config_runtime_dir = None
+        self._claude_oauth_source_digest = None
+
+    def _explicit_claude_oauth_credentials(
+        self, state: ConversationState
+    ) -> str | None:
+        registry_value = state.secret_registry.get_secret_value(
+            CLAUDE_CREDENTIALS_SECRET_NAME
+        )
+        if is_valid_claude_oauth_credentials(registry_value):
+            return str(registry_value)
+        if self.agent_context and self.agent_context.secrets:
+            secret = self.agent_context.secrets.get(CLAUDE_CREDENTIALS_SECRET_NAME)
+            if secret is None:
+                return None
+            value = (
+                secret.get_value() if isinstance(secret, SecretSource) else str(secret)
+            )
+            if is_valid_claude_oauth_credentials(value):
+                return value
+        return None
+
     def _isolate_acp_data_dir(
         self, state: ConversationState, env: dict[str, str]
-    ) -> None:
+    ) -> bool:
         provider = detect_acp_provider_by_command(self.acp_command)
         if provider is None or provider.data_dir_env_var is None:
-            return
+            return False
         env_var = provider.data_dir_env_var
-        data_dir = self._acp_file_secret_dir(state, provider.key)
-        data_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        oauth_file_channel = False
+        if provider.key == "claude-code":
+            data_dir = self._ensure_claude_config_runtime_dir()
+            with self._file_credential_lock:
+                replace_existing = (
+                    CLAUDE_CREDENTIALS_SECRET_NAME
+                    in self._replace_file_credentials_on_next_materialisation
+                )
+            try:
+                result = seed_claude_oauth_credentials(
+                    data_dir,
+                    state.secret_registry,
+                    replace_existing=replace_existing,
+                    required=self.acp_permission_policy == "read_only",
+                    last_source_digest=self._claude_oauth_source_digest,
+                    explicit_credentials=self._explicit_claude_oauth_credentials(state),
+                )
+            except BaseException:
+                self._cleanup_claude_config_runtime(discard=True)
+                raise
+            self._claude_oauth_source_digest = result.source_digest
+            if replace_existing:
+                with self._file_credential_lock:
+                    self._replace_file_credentials_on_next_materialisation.discard(
+                        CLAUDE_CREDENTIALS_SECRET_NAME
+                    )
+            oauth_file_channel = result.seeded
+            self._remove_durable_claude_oauth_credentials(state)
+        else:
+            data_dir = self._acp_file_secret_dir(state, provider.key)
+            data_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         env[env_var] = str(data_dir)
+        return oauth_file_channel
 
     def _materialise_file_secrets(
         self, state: ConversationState, env: dict[str, str]
@@ -2133,6 +2417,13 @@ class ACPAgent(AgentBase):
                 raise CredentialSyncError(
                     f"ACP file credential {_name!r} could not be synchronized."
                 ) from error
+        registry = self._secret_registry_for_masking
+        runtime_dir = self._claude_config_runtime_dir
+        if registry is None or runtime_dir is None:
+            return
+        track_claude_oauth_credentials_from_file(
+            registry, runtime_dir / CLAUDE_CREDENTIALS_FILENAME
+        )
 
     def _bind_file_credential_masking(self) -> None:
         client = self._client
@@ -2296,7 +2587,9 @@ class ACPAgent(AgentBase):
 
     def _render_suffix(self, state: ConversationState) -> str | None:
         """Render the system suffix once, including secrets from the registry."""
-        file_secret_names = self._present_file_secret_names(state)
+        file_secret_names = self._present_file_secret_names(state) | set(
+            CLAUDE_OAUTH_ENV_NAMES
+        )
         secret_infos = [
             info
             for info in state.secret_registry.get_secret_infos()
@@ -2321,8 +2614,22 @@ class ACPAgent(AgentBase):
 
     def _start_acp_server(self, state: ConversationState) -> None:
         """Start the ACP subprocess and initialize the session."""
-        client = _OpenHandsACPBridge()
+        command_provider = detect_acp_provider_by_command(self.acp_command)
+        resolve_session_mode_for_policy(
+            self.acp_permission_policy,
+            provider_key=command_provider.key if command_provider else None,
+            explicit_mode=self.acp_session_mode,
+            default_session_mode=(
+                command_provider.default_session_mode if command_provider else None
+            ),
+        )
+        assert_config_options_compatible_with_permission_policy(
+            self.acp_permission_policy,
+            self.acp_config_options,
+        )
+        client = _OpenHandsACPBridge(permission_policy=self.acp_permission_policy)
         self._client = client
+        self._secret_registry_for_masking = state.secret_registry
         client.mask = state.secret_registry.mask_secrets_in_output
         self._bind_file_credential_masking()
 
@@ -2330,16 +2637,30 @@ class ACPAgent(AgentBase):
         env = default_environment()
         env.update(os.environ)
         env.update(self.acp_env)
-        file_secret_names = self._present_file_secret_names(state)
-        env.update(
-            state.secret_registry.get_all_secrets_as_env_vars(exclude=file_secret_names)
+        command_is_claude = (
+            command_provider is not None and command_provider.key == "claude-code"
         )
+        excluded_secret_names = self._present_file_secret_names(state) | {
+            CLAUDE_CREDENTIALS_SECRET_NAME
+        }
+        if not command_is_claude:
+            excluded_secret_names = {*excluded_secret_names, CLAUDE_OAUTH_TOKEN_ENV}
+        env.update(
+            state.secret_registry.get_all_secrets_as_env_vars(
+                exclude=excluded_secret_names
+            )
+        )
+        claude_oauth_file_channel = False
         if self.acp_isolate_data_dir:
-            self._isolate_acp_data_dir(state, env)
+            claude_oauth_file_channel = self._isolate_acp_data_dir(state, env)
         self._materialise_file_secrets(state, env)
         # Inject secrets from agent_context for keys not already present.
         if self.agent_context and self.agent_context.secrets:
             for name, secret in self.agent_context.secrets.items():
+                if name in CLAUDE_OAUTH_ENV_NAMES and (
+                    name == CLAUDE_CREDENTIALS_SECRET_NAME or not command_is_claude
+                ):
+                    continue
                 if name not in env:
                     value = (
                         secret.get_value()
@@ -2350,12 +2671,22 @@ class ACPAgent(AgentBase):
                         env[name] = value
         # Strip CLAUDECODE so nested Claude Code instances don't refuse to start
         env.pop("CLAUDECODE", None)
+        env.pop(CLAUDE_CREDENTIALS_SECRET_NAME, None)
+        if not command_is_claude:
+            for oauth_name in CLAUDE_OAUTH_ENV_NAMES:
+                env.pop(oauth_name, None)
 
-        # Strip env vars that conflict with an active auth mechanism.
-        for dominant, conflicts in _ENV_CONFLICT_MAP.items():
-            if dominant in env:
-                for conflict in conflicts:
-                    env.pop(conflict, None)
+        # Strip PAYG/proxy vars when Claude subscription/OAuth is active so
+        # they cannot silently win. Writable API/proxy stays intact when
+        # OAuth is truly absent. File-channel sessions also drop the token
+        # env var so the isolated credential file is the only channel.
+        if command_is_claude and claude_subscription_auth_active(
+            env, oauth_file_channel=claude_oauth_file_channel
+        ):
+            for conflict in _CLAUDE_OAUTH_CONFLICTING_ENV:
+                env.pop(conflict, None)
+            if claude_oauth_file_channel:
+                env.pop(CLAUDE_OAUTH_TOKEN_ENV, None)
 
         command = self.acp_command[0]
         args = list(self.acp_command[1:]) + list(self.acp_args)
@@ -2516,6 +2847,7 @@ class ACPAgent(AgentBase):
                 reported_model_id: str | None = None
                 available_models: list[ACPModelInfo] | None = None
                 config_options: list[SessionConfigOption] | None = None
+                load_response: Any = None
                 if prior_session_id is not None:
                     try:
                         load_response = await conn.load_session(
@@ -2549,7 +2881,7 @@ class ACPAgent(AgentBase):
                             e,
                         )
 
-                effective_model_id: str | None = None
+                session_response: Any
                 if session_id is None:
                     session_meta = build_session_model_meta(agent_name, self.acp_model)
                     response = await conn.new_session(
@@ -2559,6 +2891,7 @@ class ACPAgent(AgentBase):
                     )
                     session_id = response.session_id
                     config_options = response.config_options
+                    session_response = response
                     (
                         reported_model_id,
                         available_models,
@@ -2575,6 +2908,7 @@ class ACPAgent(AgentBase):
                         client=client,
                     )
                 else:
+                    session_response = load_response
                     effective_model_id = await _reapply_session_model_on_resume(
                         conn,
                         agent_name,
@@ -2596,13 +2930,46 @@ class ACPAgent(AgentBase):
                 # own mode ID (bypassPermissions, full-access, yolo …).
                 # Unknown/custom servers get None — skip the call rather than
                 # sending a provider-specific string they won't recognise.
+                # Writable keeps the historical runtime-agent_name lookup and
+                # does not fall back to the launch-command provider.
+                # read_only may use the command provider because it already
+                # failed closed before spawn when that provider is unverified.
                 provider = detect_acp_provider_by_agent_name(agent_name)
-                mode_id = self.acp_session_mode or (
-                    provider.default_session_mode if provider else None
+                if self.acp_permission_policy == "read_only":
+                    runtime_key = (
+                        provider.key
+                        if provider is not None
+                        else (command_provider.key if command_provider else None)
+                    )
+                    runtime_default_mode = (
+                        provider.default_session_mode
+                        if provider is not None
+                        else (
+                            command_provider.default_session_mode
+                            if command_provider
+                            else None
+                        )
+                    )
+                else:
+                    runtime_key = provider.key if provider is not None else None
+                    runtime_default_mode = (
+                        provider.default_session_mode if provider is not None else None
+                    )
+                mode_id = resolve_session_mode_for_policy(
+                    self.acp_permission_policy,
+                    provider_key=runtime_key,
+                    explicit_mode=self.acp_session_mode,
+                    default_session_mode=runtime_default_mode,
                 )
-                if mode_id is not None:
-                    logger.info("Setting ACP session mode: %s", mode_id)
-                    await conn.set_session_mode(mode_id=mode_id, session_id=session_id)
+                await _apply_acp_session_mode(
+                    conn,
+                    client,
+                    policy=self.acp_permission_policy,
+                    mode_id=mode_id,
+                    agent_name=agent_name,
+                    session_id=session_id,
+                    session_response=session_response,
+                )
 
                 # Requested session configuration is applied and verified here —
                 # part of initialization, so step() never prompts a session whose
@@ -2616,6 +2983,7 @@ class ACPAgent(AgentBase):
                     session_id,
                     self.acp_config_options,
                     config_options,
+                    required_session_mode=mode_id,
                 )
 
                 return (
@@ -3742,10 +4110,12 @@ class ACPAgent(AgentBase):
 
         credential_failures = self._release_file_credentials_collect()
         failures.update(credential_failures)
+        self._cleanup_claude_config_runtime(discard=discard_bindings)
         if discard_bindings:
             with self._file_credential_lock:
                 if not credential_failures:
                     self._file_credential_bindings = {}
+            self._secret_registry_for_masking = None
 
         if self._executor is not None and not credential_failures:
             try:
@@ -3757,7 +4127,9 @@ class ACPAgent(AgentBase):
 
     @staticmethod
     async def _wait_for_process(process: asyncio.subprocess.Process) -> None:
-        await process.wait()
+        wait = process.wait()
+        if inspect.isawaitable(wait):
+            await wait
 
     @staticmethod
     async def _await_cancelled_task(task: asyncio.Task[Any]) -> None:
@@ -3773,6 +4145,9 @@ class ACPAgent(AgentBase):
             with self._file_credential_lock:
                 self._file_credential_lifecycles = {}
                 self._file_credential_bindings = {}
+                self._claude_config_runtime_dir = None
+                self._claude_oauth_source_digest = None
+                self._secret_registry_for_masking = None
                 self._closed = True
 
     def __del__(self) -> None:

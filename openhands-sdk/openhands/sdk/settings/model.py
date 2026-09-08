@@ -1677,6 +1677,18 @@ class ACPAgentSettings(AgentSettingsBase):
             "conversations share one sandbox (see #1019)."
         ),
     )
+    acp_permission_policy: Literal["writable", "read_only"] = Field(
+        default="writable",
+        description=(
+            "Conversation-local permission policy for ACP sessions. "
+            "Forwarded to :attr:`~openhands.sdk.agent.ACPAgent.acp_permission_policy`. "
+            "``writable`` preserves the default auto-approve behavior. "
+            "``read_only`` is fail-closed: unverified providers and bypass "
+            "session modes are refused; Claude Code uses a "
+            "permission-requesting mode plus denied request_permission "
+            "callbacks."
+        ),
+    )
     # Programmatic / downstream-facing knob, deliberately NOT surfaced in the
     # settings-form UI (no SETTINGS_METADATA_KEY): it's a list of structured
     # specs a downstream application supplies in code to support other ACP CLIs,
@@ -1885,6 +1897,7 @@ class ACPAgentSettings(AgentSettingsBase):
             acp_prompt_timeout=self.acp_prompt_timeout,
             acp_startup_timeout=self.acp_startup_timeout,
             acp_isolate_data_dir=self.acp_isolate_data_dir,
+            acp_permission_policy=self.acp_permission_policy,
             acp_file_secrets=list(self.acp_file_secrets),
             agent_context=self.agent_context,
             mcp_config=self.mcp_config,
