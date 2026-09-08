@@ -4301,15 +4301,12 @@ class TestACPSecretsEnvInjection:
 
 
 class TestACPEnvConflictSuppression:
-    """CLAUDE_CONFIG_DIR OAuth auth must not coexist with API-key env vars.
+    """OAuth conflict stripping applies only to an active Claude file channel.
 
-    When CLAUDE_CONFIG_DIR is present in the subprocess environment the agent
-    uses a credential file for OAuth.  If ANTHROPIC_API_KEY or
-    ANTHROPIC_BASE_URL are also present they redirect requests to a proxy that
-    does not support OAuth bearer tokens, breaking auth silently.
-
-    _start_acp_server must strip the conflicting vars regardless of where they
-    came from: acp_env, os.environ, or agent_context.secrets.
+    Host-exported CLAUDE_CONFIG_DIR must not strip API/proxy or other
+    providers' credentials. Writable Claude sessions that use ANTHROPIC_API_KEY
+    / ANTHROPIC_BASE_URL keep those vars. Isolated claude-code that actually
+    seeds OAuth still strips the conflicting PAYG/provider vars.
     """
 
     @staticmethod
@@ -4386,69 +4383,143 @@ class TestACPEnvConflictSuppression:
                 agent._start_acp_server(state)
         finally:
             agent._executor.close(timeout=1.0)
+            agent._cleanup_claude_config_runtime(discard=True)
 
         return captured
 
-    def test_claude_config_dir_suppresses_api_key_from_acp_env(self, tmp_path):
-        """ANTHROPIC_API_KEY from acp_env is stripped when CLAUDE_CONFIG_DIR present."""
-        agent = _make_agent(
+    @pytest.mark.parametrize(
+        "command",
+        [
+            ["npx", "-y", "@agentclientprotocol/codex-acp"],
+            ["npx", "-y", "@google/gemini-cli", "--acp"],
+        ],
+    )
+    def test_host_claude_config_dir_does_not_strip_non_claude_provider(
+        self, tmp_path, command
+    ):
+        agent = ACPAgent(
+            acp_command=command,
             acp_env={
-                "CLAUDE_CONFIG_DIR": "/tmp/claude-creds",
-                "ANTHROPIC_API_KEY": "sk-conflict",
+                "ANTHROPIC_API_KEY": "sk-keep",
                 "ANTHROPIC_BASE_URL": "https://proxy.example.com",
-            }
-        )
-        env = self._run_start_capturing_env(agent, tmp_path)
-
-        assert env["CLAUDE_CONFIG_DIR"] == "/tmp/claude-creds"
-        assert "ANTHROPIC_API_KEY" not in env
-        assert "ANTHROPIC_BASE_URL" not in env
-
-    def test_claude_config_dir_suppresses_api_key_from_os_environ(self, tmp_path):
-        """ANTHROPIC_API_KEY leaking in from os.environ is stripped too."""
-        agent = _make_agent(
-            acp_env={"CLAUDE_CONFIG_DIR": "/tmp/claude-creds"},
+                "AWS_BEARER_TOKEN_BEDROCK": "bedrock-token",
+                "GOOGLE_APPLICATION_CREDENTIALS": "/tmp/sa.json",
+            },
         )
         env = self._run_start_capturing_env(
             agent,
             tmp_path,
-            extra_os_env={
-                "ANTHROPIC_API_KEY": "sk-leaked",
+            extra_os_env={"CLAUDE_CONFIG_DIR": "/tmp/host-claude"},
+        )
+
+        assert env["CLAUDE_CONFIG_DIR"] == "/tmp/host-claude"
+        assert env["ANTHROPIC_API_KEY"] == "sk-keep"
+        assert env["ANTHROPIC_BASE_URL"] == "https://proxy.example.com"
+        assert env["AWS_BEARER_TOKEN_BEDROCK"] == "bedrock-token"
+        assert env["GOOGLE_APPLICATION_CREDENTIALS"] == "/tmp/sa.json"
+
+    def test_writable_claude_api_key_and_proxy_kept_with_host_config_dir(
+        self, tmp_path
+    ):
+        agent = ACPAgent(
+            acp_command=["npx", "-y", "@agentclientprotocol/claude-agent-acp"],
+            acp_env={
+                "ANTHROPIC_API_KEY": "sk-valid",
                 "ANTHROPIC_BASE_URL": "https://proxy.example.com",
             },
         )
+        env = self._run_start_capturing_env(
+            agent,
+            tmp_path,
+            extra_os_env={"CLAUDE_CONFIG_DIR": "/tmp/host-claude"},
+        )
 
+        assert env["CLAUDE_CONFIG_DIR"] == "/tmp/host-claude"
+        assert env["ANTHROPIC_API_KEY"] == "sk-valid"
+        assert env["ANTHROPIC_BASE_URL"] == "https://proxy.example.com"
+
+    def test_writable_isolated_claude_without_oauth_keeps_api_key(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+        monkeypatch.setattr(
+            "openhands.sdk.agent.acp_claude_auth.Path.home",
+            classmethod(lambda cls: tmp_path / "missing-home"),
+        )
+        agent = ACPAgent(
+            acp_command=["npx", "-y", "@agentclientprotocol/claude-agent-acp"],
+            acp_isolate_data_dir=True,
+            acp_env={
+                "ANTHROPIC_API_KEY": "sk-isolated",
+                "ANTHROPIC_BASE_URL": "https://proxy.example.com",
+            },
+        )
+        env = self._run_start_capturing_env(agent, tmp_path)
+
+        assert env["ANTHROPIC_API_KEY"] == "sk-isolated"
+        assert env["ANTHROPIC_BASE_URL"] == "https://proxy.example.com"
         assert "CLAUDE_CONFIG_DIR" in env
-        assert "ANTHROPIC_API_KEY" not in env
-        assert "ANTHROPIC_BASE_URL" not in env
+        assert env["CLAUDE_CONFIG_DIR"] != "/tmp/host-claude"
 
-    def test_claude_config_dir_suppresses_api_key_from_secrets(self, tmp_path):
-        """ANTHROPIC_API_KEY injected via agent_context.secrets is stripped too."""
+    def test_isolated_claude_oauth_strips_payg_provider_and_credentials_json(
+        self, tmp_path, monkeypatch
+    ):
         from pydantic import SecretStr
 
         from openhands.sdk.secret import StaticSecret
 
-        agent = _make_agent(
-            acp_env={"CLAUDE_CONFIG_DIR": "/tmp/claude-creds"},
+        payload = json.dumps(
+            {
+                "claudeAiOauth": {
+                    "accessToken": "file-channel-access",
+                    "refreshToken": "file-channel-refresh",
+                    "expiresAt": 9_999_999_999_000,
+                }
+            }
+        )
+        source_root = tmp_path / "home" / ".claude"
+        source_root.mkdir(parents=True)
+        (source_root / ".credentials.json").write_text(payload, encoding="utf-8")
+        monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+        monkeypatch.setattr(
+            "openhands.sdk.agent.acp_claude_auth.Path.home",
+            classmethod(lambda cls: tmp_path / "home"),
+        )
+        agent = ACPAgent(
+            acp_command=["npx", "-y", "@agentclientprotocol/claude-agent-acp"],
+            acp_isolate_data_dir=True,
+            acp_env={
+                "ANTHROPIC_AUTH_TOKEN": "sk-auth-token",
+                "ANTHROPIC_API_KEY": "sk-conflict",
+                "ANTHROPIC_BASE_URL": "https://proxy.example.com",
+                "CLAUDE_CODE_USE_BEDROCK": "1",
+                "CLAUDE_CODE_USE_VERTEX": "true",
+                "CLAUDE_CODE_USE_FOUNDRY": "1",
+                "AWS_BEARER_TOKEN_BEDROCK": "bedrock-token",
+                "GOOGLE_APPLICATION_CREDENTIALS": "/tmp/sa.json",
+            },
             agent_context=AgentContext(
                 secrets={
-                    "ANTHROPIC_API_KEY": StaticSecret(
-                        value=SecretStr("sk-from-secret")
-                    ),
-                    "ANTHROPIC_BASE_URL": StaticSecret(
-                        value=SecretStr("https://proxy.example.com")
-                    ),
+                    "CLAUDE_CREDENTIALS_JSON": StaticSecret(value=SecretStr(payload)),
+                    "UNRELATED_TOKEN": StaticSecret(value=SecretStr("keep-me")),
                 }
             ),
         )
         env = self._run_start_capturing_env(agent, tmp_path)
 
         assert "CLAUDE_CONFIG_DIR" in env
+        assert "ANTHROPIC_AUTH_TOKEN" not in env
         assert "ANTHROPIC_API_KEY" not in env
         assert "ANTHROPIC_BASE_URL" not in env
+        assert "CLAUDE_CODE_USE_BEDROCK" not in env
+        assert "CLAUDE_CODE_USE_VERTEX" not in env
+        assert "CLAUDE_CODE_USE_FOUNDRY" not in env
+        assert "AWS_BEARER_TOKEN_BEDROCK" not in env
+        assert "GOOGLE_APPLICATION_CREDENTIALS" not in env
+        assert "CLAUDE_CREDENTIALS_JSON" not in env
+        assert env.get("UNRELATED_TOKEN") == "keep-me"
 
-    def test_no_suppression_without_claude_config_dir(self, tmp_path):
-        """Without CLAUDE_CONFIG_DIR, ANTHROPIC_API_KEY passes through unchanged."""
+    def test_no_suppression_without_claude_oauth_file_channel(self, tmp_path):
         agent = _make_agent(
             acp_env={"ANTHROPIC_API_KEY": "sk-valid"},
         )
