@@ -12,11 +12,13 @@ jobs:
     publish:
         # Skip PyPI publishing for pre-releases (e.g., release candidates).
         # Pre-releases can still be created on GitHub for testing without
-        # pushing packages to PyPI.  Manual workflow_dispatch always runs.
+        # pushing packages to PyPI.  Manual workflow_dispatch still runs on
+        # OpenHands/software-agent-sdk only (forks are excluded).
         if: >
-            github.event_name == 'workflow_dispatch' ||
-            (!github.event.release.prerelease &&
-             startsWith(github.event.release.tag_name, 'v'))
+            github.repository == 'OpenHands/software-agent-sdk' &&
+            (github.event_name == 'workflow_dispatch' ||
+             (!github.event.release.prerelease &&
+              startsWith(github.event.release.tag_name, 'v')))
         runs-on: ubuntu-24.04
         permissions:
             actions: write

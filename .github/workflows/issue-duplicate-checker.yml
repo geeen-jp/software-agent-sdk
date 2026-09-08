@@ -33,7 +33,9 @@ permissions:
 
 jobs:
     smoke-clone:
-        if: github.event_name == 'workflow_dispatch' && inputs.mode == 'smoke-clone'
+        if: >
+            github.repository == 'OpenHands/software-agent-sdk' &&
+            github.event_name == 'workflow_dispatch' && inputs.mode == 'smoke-clone'
         runs-on: ubuntu-latest
         steps:
             - name: Checkout repository
@@ -54,8 +56,9 @@ jobs:
 
     issue-duplicate-check:
         if: |
-            github.event_name == 'issues' ||
-            (github.event_name == 'workflow_dispatch' && inputs.mode == 'issue-check' && inputs.issue_number != '')
+            github.repository == 'OpenHands/software-agent-sdk' &&
+            (github.event_name == 'issues' ||
+             (github.event_name == 'workflow_dispatch' && inputs.mode == 'issue-check' && inputs.issue_number != ''))
         runs-on: ubuntu-latest
         timeout-minutes: 35
         concurrency:
@@ -74,8 +77,9 @@ jobs:
 
     auto-close-duplicates:
         if: |
-            github.event_name == 'schedule' ||
-            (github.event_name == 'workflow_dispatch' && inputs.mode == 'auto-close')
+            github.repository == 'OpenHands/software-agent-sdk' &&
+            (github.event_name == 'schedule' ||
+             (github.event_name == 'workflow_dispatch' && inputs.mode == 'auto-close'))
         runs-on: ubuntu-latest
         timeout-minutes: 20
         concurrency:
