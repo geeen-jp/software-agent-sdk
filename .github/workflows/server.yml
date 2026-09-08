@@ -745,7 +745,7 @@ jobs:
                   BUILD_SUMMARY=$(jq -n \
                       --arg image "$IMAGE" \
                       --arg short_sha "$SHORT_SHA" \
-                      --arg ghcr_url "https://github.com/OpenHands/agent-sdk/pkgs/container/agent-server" \
+                      --arg ghcr_url "https://github.com/${GITHUB_REPOSITORY}/pkgs/container/agent-server" \
                       --arg all_tags "$ALL_TAGS" \
                       --argjson variants "$VARIANTS_JSON" \
                       '{
