@@ -350,9 +350,7 @@ def _model_config_option_from_options(
     options: list[SessionConfigOption] | None,
 ) -> Any | None:
     """Return the ``model`` select option from a complete config option state."""
-    if not options:
-        return None
-    for raw in options:
+    for raw in _iter_session_config_options(options):
         opt = getattr(raw, "root", raw)
         if (
             getattr(opt, "type", None) == "select"
@@ -387,7 +385,7 @@ def _effective_model_from_config_options(
         return None
     provider = detect_acp_provider_by_agent_name(agent_name or "")
     if provider is not None and provider.key == "codex":
-        for raw in options or []:
+        for raw in _iter_session_config_options(options):
             effort_opt = getattr(raw, "root", raw)
             if getattr(effort_opt, "id", None) != "reasoning_effort":
                 continue
@@ -546,7 +544,9 @@ def _extract_session_models(
     if models is not None:
         current = getattr(models, "current_model_id", None)
         current = current if isinstance(current, str) and current else None
-        raw = getattr(models, "available_models", None) or []
+        raw = getattr(models, "available_models", None)
+        if not isinstance(raw, list):
+            raw = []
         usable = _usable_models(ACPModelInfo.from_protocol(m) for m in raw)
         return current, usable, False
     return None, None, default_via_config_option
@@ -840,9 +840,10 @@ def _config_option_values(
     options: list[SessionConfigOption] | None,
 ) -> dict[str, str]:
     """Map ``option id -> current value`` for a complete config option state."""
-    if not options:
-        return {}
-    return {option.id: _config_option_current_value(option) for option in options}
+    return {
+        option.id: _config_option_current_value(option)
+        for option in _iter_session_config_options(options)
+    }
 
 
 _CANONICAL_BOOLEAN_REQUESTS = frozenset({"true", "false"})
@@ -851,9 +852,7 @@ _CANONICAL_BOOLEAN_REQUESTS = frozenset({"true", "false"})
 def _config_options_index(
     options: list[SessionConfigOption] | None,
 ) -> dict[str, SessionConfigOption]:
-    if not options:
-        return {}
-    return {option.id: option for option in options}
+    return {option.id: option for option in _iter_session_config_options(options)}
 
 
 def _parse_boolean_request(value: str) -> bool:
@@ -4128,7 +4127,9 @@ class ACPAgent(AgentBase):
 
     @staticmethod
     async def _wait_for_process(process: asyncio.subprocess.Process) -> None:
-        await process.wait()
+        wait = process.wait()
+        if inspect.isawaitable(wait):
+            await wait
 
     @staticmethod
     async def _await_cancelled_task(task: asyncio.Task[Any]) -> None:

@@ -3656,6 +3656,8 @@ class TestACPSessionIdPersistence:
             process = MagicMock()
             process.stdin = MagicMock()
             process.stdout = MagicMock()
+            process.stdout.readline = AsyncMock(return_value=b"")
+            process.wait = AsyncMock(return_value=0)
 
         async def _fake_create_subprocess_exec(*_args, **_kwargs):
             return process
@@ -3727,15 +3729,23 @@ class TestACPSessionIdPersistence:
 
         new_response = MagicMock()
         new_response.session_id = new_session_id
+        new_response.config_options = None
+        new_response.models = None
+        new_response.modes = None
         conn.new_session = AsyncMock(return_value=new_response)
 
         if load_exc is not None:
             conn.load_session = AsyncMock(side_effect=load_exc)
         else:
-            conn.load_session = AsyncMock(return_value=MagicMock())
+            load_response = MagicMock()
+            load_response.config_options = None
+            load_response.models = None
+            load_response.modes = None
+            conn.load_session = AsyncMock(return_value=load_response)
 
         conn.set_session_mode = AsyncMock()
         conn.set_session_model = AsyncMock(side_effect=_verified_set_session_model)
+        conn.set_config_option = AsyncMock()
         conn.authenticate = AsyncMock()
         conn.close = AsyncMock()
         return conn
