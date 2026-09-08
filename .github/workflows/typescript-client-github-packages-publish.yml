@@ -22,9 +22,10 @@ defaults:
 jobs:
     publish:
         if: >-
-            github.event_name == 'workflow_dispatch' ||
-            (!github.event.release.prerelease &&
-             startsWith(github.event.release.tag_name, 'v'))
+            github.repository == 'OpenHands/software-agent-sdk' &&
+            (github.event_name == 'workflow_dispatch' ||
+             (!github.event.release.prerelease &&
+              startsWith(github.event.release.tag_name, 'v')))
         runs-on: ubuntu-latest
         steps:
             - name: Check out repository

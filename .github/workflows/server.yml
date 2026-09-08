@@ -15,9 +15,9 @@ on:
                 type: string
                 default: nikolaik/python-nodejs:python3.13-nodejs22-slim
             image:
-                description: GHCR image name
+                description: GHCR image name (empty uses ghcr.io/<owner>/agent-server)
                 type: string
-                default: ghcr.io/openhands/agent-server
+                default: ''
             platforms:
                 description: Target platforms
                 type: string
@@ -323,7 +323,9 @@ jobs:
         runs-on: ${{ matrix.runner }}
 
         env:
-            IMAGE: ${{ inputs.image != '' && inputs.image || 'ghcr.io/openhands/agent-server' }}
+            # Push to this repo's GHCR namespace. Hardcoding openhands/ fails on
+            # forks (permission_denied: The requested installation does not exist).
+            IMAGE: ${{ inputs.image != '' && inputs.image || format('ghcr.io/{0}/agent-server', github.repository_owner) }}
             BASE_IMAGE: ${{ inputs.base_image != '' && inputs.base_image || matrix.base_image }}
             # The maybe-empty value (inputs.install_acp_providers) must be the
             # LAST operand: GitHub Actions' `A && B || C` collapses to C
@@ -347,6 +349,9 @@ jobs:
             CI: 'true'
 
         steps:
+            - name: Lowercase GHCR image
+              run: echo "IMAGE=${IMAGE,,}" >> "$GITHUB_ENV"
+
             - name: Checkout
               uses: actions/checkout@v7
 
@@ -493,9 +498,12 @@ jobs:
             matrix:
                 variant: [python, java, golang]
         env:
-            IMAGE: ${{ inputs.image != '' && inputs.image || 'ghcr.io/openhands/agent-server' }}
+            IMAGE: ${{ inputs.image != '' && inputs.image || format('ghcr.io/{0}/agent-server', github.repository_owner) }}
 
         steps:
+            - name: Lowercase GHCR image
+              run: echo "IMAGE=${IMAGE,,}" >> "$GITHUB_ENV"
+
             - name: Download build info to extract SHORT_SHA
               uses: actions/download-artifact@v8
               with:
@@ -737,7 +745,7 @@ jobs:
                   BUILD_SUMMARY=$(jq -n \
                       --arg image "$IMAGE" \
                       --arg short_sha "$SHORT_SHA" \
-                      --arg ghcr_url "https://github.com/OpenHands/agent-sdk/pkgs/container/agent-server" \
+                      --arg ghcr_url "https://github.com/${GITHUB_REPOSITORY}/pkgs/container/agent-server" \
                       --arg all_tags "$ALL_TAGS" \
                       --argjson variants "$VARIANTS_JSON" \
                       '{

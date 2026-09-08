@@ -24,6 +24,8 @@ permissions:
 
 jobs:
     cancel-eval:
+        # Only run in the main repository, not in forks
+        if: github.repository == 'OpenHands/software-agent-sdk'
         runs-on: ubuntu-latest
         steps:
             - name: Cancel evaluation job

@@ -15,6 +15,7 @@ concurrency:
 jobs:
     remove-duplicate-candidate:
         if: |
+            github.repository == 'OpenHands/software-agent-sdk' &&
             github.event.issue.state == 'open' &&
             github.event.issue.pull_request == null &&
             contains(github.event.issue.labels.*.name, 'duplicate-candidate') &&

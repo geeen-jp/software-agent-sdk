@@ -11,6 +11,8 @@ on:
 
 jobs:
     prepare-release:
+        # Only run in the main repository, not in forks
+        if: github.repository == 'OpenHands/software-agent-sdk'
         runs-on: ubuntu-24.04
         steps:
             - name: Validate version format

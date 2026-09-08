@@ -16,6 +16,7 @@ jobs:
             group: cleanup-pr-artifacts-${{ github.event.pull_request.number }}
             cancel-in-progress: false
         if: >-
+            github.repository == 'OpenHands/software-agent-sdk' &&
             github.event_name == 'pull_request_review' &&
             github.event.review.state == 'approved' &&
             github.event.pull_request.head.repo.full_name == github.repository
@@ -178,6 +179,7 @@ jobs:
             group: cleanup-pr-artifacts-${{ github.event.pull_request.base.ref }}
             cancel-in-progress: false
         if: >-
+            github.repository == 'OpenHands/software-agent-sdk' &&
             github.event_name == 'pull_request_target' &&
             github.event.action == 'closed' &&
             github.event.pull_request.merged == true
