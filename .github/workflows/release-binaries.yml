@@ -313,11 +313,14 @@ jobs:
                       arch: arm64
                       runner: ubuntu-24.04-arm
         env:
-            IMAGE: ghcr.io/openhands/agent-server
+            IMAGE: ${{ format('ghcr.io/{0}/agent-server', github.repository_owner) }}
             IMAGE_TAG: ${{ needs.resolve-tag.outputs.image_tag }}
             VARIANT: ${{ matrix.variant }}
             ARCH: ${{ matrix.arch }}
         steps:
+            - name: Lowercase GHCR image
+              run: echo "IMAGE=${IMAGE,,}" >> "$GITHUB_ENV"
+
             - name: Set up Docker Buildx
               uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
 
