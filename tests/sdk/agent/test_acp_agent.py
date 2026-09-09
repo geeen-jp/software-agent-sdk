@@ -39,6 +39,7 @@ from openhands.sdk.agent.acp_agent import (
     _config_option_current_value,
     _config_option_values,
     _estimate_cost_from_tokens,
+    _extract_session_models,
     _extract_token_usage,
     _image_url_to_acp_block,
     _maybe_set_session_model,
@@ -4031,6 +4032,16 @@ class TestSerializeToolContent:
         assert result == [{"type": "diff", "path": "b.py"}, d]
 
 
+@pytest.mark.timeout(2)
+def test_magicmock_session_payloads_do_not_hang_extractors():
+    """MagicMock session/auth payloads must not be walked as lists."""
+    current, models, via_config = _extract_session_models(MagicMock())
+    assert current is None
+    assert models == []
+    assert via_config is False
+    assert _select_auth_method(MagicMock(), {}) is None
+
+
 # ---------------------------------------------------------------------------
 # ACP session resume via ConversationState.agent_state (issue #2867)
 # ---------------------------------------------------------------------------
@@ -4058,6 +4069,7 @@ class TestACPSessionIdPersistence:
             process.stdout = MagicMock()
             process.stdout.readline = AsyncMock(return_value=b"")
             process.wait = AsyncMock(return_value=0)
+            process.returncode = 0
 
         async def _fake_create_subprocess_exec(*_args, **_kwargs):
             return process
@@ -4576,76 +4588,29 @@ class TestACPSecretsEnvInjection:
     """
 
     @staticmethod
-    def _make_conn():
-        conn = MagicMock()
-        init_response = MagicMock()
-        init_response.agent_info = MagicMock()
-        init_response.agent_info.name = "claude-agent-acp"
-        init_response.agent_info.version = "1.0"
-        init_response.auth_methods = []
-        conn.initialize = AsyncMock(return_value=init_response)
-        new_response = MagicMock()
-        new_response.session_id = "sess-1"
-        conn.new_session = AsyncMock(return_value=new_response)
-        conn.load_session = AsyncMock(return_value=MagicMock())
-        conn.set_session_mode = AsyncMock()
-        conn.set_session_model = AsyncMock()
-        conn.authenticate = AsyncMock()
-        conn.close = AsyncMock()
-        return conn
-
-    @staticmethod
     def _run_start_capturing_env(agent, tmp_path) -> dict:
         """Run _start_acp_server and return the env dict passed to the subprocess."""
-        from contextlib import ExitStack
-
-        from openhands.sdk.utils.async_executor import AsyncExecutor
-
         captured: dict = {}
-        conn = TestACPSecretsEnvInjection._make_conn()
-
-        mock_process = MagicMock()
-        mock_process.stdin = MagicMock()
-        mock_process.stdout = MagicMock()
+        conn = TestACPSessionIdPersistence._make_conn()
+        process = MagicMock()
+        process.stdin = MagicMock()
+        process.stdout = MagicMock()
+        process.stdout.readline = AsyncMock(return_value=b"")
+        process.wait = AsyncMock(return_value=0)
+        process.returncode = 0
 
         async def _fake_create_subprocess_exec(*_args, env=None, **_kwargs):
             captured.update(env or {})
-            return mock_process
+            return process
 
-        async def _fake_filter(_src, _dst):
-            return None
-
-        state = _make_state(tmp_path)
-        agent._executor = AsyncExecutor()
-        try:
-            with ExitStack() as stack:
-                stack.enter_context(
-                    patch(
-                        "openhands.sdk.agent.acp_agent.asyncio.create_subprocess_exec",
-                        new=_fake_create_subprocess_exec,
-                    )
-                )
-                stack.enter_context(
-                    patch(
-                        "openhands.sdk.agent.acp_agent.ClientSideConnection",
-                        return_value=conn,
-                    )
-                )
-                stack.enter_context(
-                    patch(
-                        "openhands.sdk.agent.acp_agent._filter_jsonrpc_lines",
-                        new=_fake_filter,
-                    )
-                )
-                stack.enter_context(
-                    patch(
-                        "openhands.sdk.agent.acp_agent.asyncio.StreamReader",
-                        return_value=MagicMock(),
-                    )
-                )
-                agent._start_acp_server(state)
-        finally:
-            agent._executor.close(timeout=1.0)
+        with TestACPSessionIdPersistence._mocked_acp_runtime(
+            agent, conn, process=process
+        ):
+            with patch(
+                "openhands.sdk.agent.acp_agent.asyncio.create_subprocess_exec",
+                new=_fake_create_subprocess_exec,
+            ):
+                agent._start_acp_server(_make_state(tmp_path))
 
         return captured
 
@@ -4720,81 +4685,35 @@ class TestACPEnvConflictSuppression:
     """
 
     @staticmethod
-    def _make_conn():
-        conn = MagicMock()
-        init_response = MagicMock()
-        init_response.agent_info = MagicMock()
-        init_response.agent_info.name = "claude-agent-acp"
-        init_response.agent_info.version = "1.0"
-        init_response.auth_methods = []
-        conn.initialize = AsyncMock(return_value=init_response)
-        new_response = MagicMock()
-        new_response.session_id = "sess-conflict"
-        conn.new_session = AsyncMock(return_value=new_response)
-        conn.load_session = AsyncMock(return_value=MagicMock())
-        conn.set_session_mode = AsyncMock()
-        conn.set_session_model = AsyncMock()
-        conn.authenticate = AsyncMock()
-        conn.close = AsyncMock()
-        return conn
-
-    @staticmethod
     def _run_start_capturing_env(agent, tmp_path, *, extra_os_env=None) -> dict:
-        from contextlib import ExitStack
-
-        from openhands.sdk.utils.async_executor import AsyncExecutor
-
         captured: dict = {}
-        conn = TestACPEnvConflictSuppression._make_conn()
-
-        mock_process = MagicMock()
-        mock_process.stdin = MagicMock()
-        mock_process.stdout = MagicMock()
+        conn = TestACPSessionIdPersistence._make_conn(
+            new_session_id="sess-conflict",
+        )
+        process = MagicMock()
+        process.stdin = MagicMock()
+        process.stdout = MagicMock()
+        process.stdout.readline = AsyncMock(return_value=b"")
+        process.wait = AsyncMock(return_value=0)
+        process.returncode = 0
 
         async def _fake_create_subprocess_exec(*_args, env=None, **_kwargs):
             captured.update(env or {})
-            return mock_process
+            return process
 
-        async def _fake_filter(_src, _dst):
-            return None
-
-        state = _make_state(tmp_path)
-        agent._executor = AsyncExecutor()
-        try:
-            with ExitStack() as stack:
-                stack.enter_context(
-                    patch(
-                        "openhands.sdk.agent.acp_agent.asyncio.create_subprocess_exec",
-                        new=_fake_create_subprocess_exec,
-                    )
-                )
-                stack.enter_context(
-                    patch(
-                        "openhands.sdk.agent.acp_agent.ClientSideConnection",
-                        return_value=conn,
-                    )
-                )
-                stack.enter_context(
-                    patch(
-                        "openhands.sdk.agent.acp_agent._filter_jsonrpc_lines",
-                        new=_fake_filter,
-                    )
-                )
-                stack.enter_context(
-                    patch(
-                        "openhands.sdk.agent.acp_agent.asyncio.StreamReader",
-                        return_value=MagicMock(),
-                    )
-                )
+        with TestACPSessionIdPersistence._mocked_acp_runtime(
+            agent, conn, process=process
+        ):
+            with patch(
+                "openhands.sdk.agent.acp_agent.asyncio.create_subprocess_exec",
+                new=_fake_create_subprocess_exec,
+            ):
                 if extra_os_env:
-                    stack.enter_context(
-                        patch.dict("os.environ", extra_os_env, clear=False)
-                    )
-                agent._start_acp_server(state)
-        finally:
-            agent._executor.close(timeout=1.0)
-            agent._cleanup_claude_config_runtime(discard=True)
-
+                    with patch.dict("os.environ", extra_os_env, clear=False):
+                        agent._start_acp_server(_make_state(tmp_path))
+                else:
+                    agent._start_acp_server(_make_state(tmp_path))
+        agent._cleanup_claude_config_runtime(discard=True)
         return captured
 
     @pytest.mark.parametrize(

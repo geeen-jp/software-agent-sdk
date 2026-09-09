@@ -384,6 +384,8 @@ def _select_auth_method(
     ``CODEX_HOME`` is isolated, the effective file is conversation-scoped and
     the host user's ``~/.codex/auth.json`` is never consulted.
     """
+    if not isinstance(auth_methods, list):
+        return None
     method_ids = {m.id for m in auth_methods}
     if "chat-gpt" in method_ids and codex_auth_file_is_chatgpt(env):
         return "chat-gpt"
@@ -672,7 +674,9 @@ def _extract_session_models(
     if opt is not None:
         current = getattr(opt, "current_value", None)
         current = current if isinstance(current, str) and current else None
-        options = getattr(opt, "options", None) or []
+        options = getattr(opt, "options", None)
+        if not isinstance(options, list):
+            options = []
         usable = _usable_models(
             ACPModelInfo.from_protocol(o, id_attr="value") for o in options
         )
@@ -4545,11 +4549,13 @@ class ACPAgent(AgentBase):
             return
         if inspect.iscoroutinefunction(wait):
             awaitable: Any = wait()
-        elif inspect.isawaitable(wait):
+        elif inspect.iscoroutine(wait) or asyncio.isfuture(wait):
             awaitable = wait
         else:
-            # Sync wait() would block the portal loop so fail_after cannot fire.
-            awaitable = asyncio.get_running_loop().run_in_executor(None, wait)
+            # asyncio.subprocess.Process.wait is a coroutine function. Anything
+            # else (including MagicMock.wait) is not a process wait — do not
+            # drive it on the portal or a worker thread.
+            return
         if not await _await_deadline(awaitable, _ACP_RUNTIME_SHUTDOWN_TIMEOUT):
             raise TimeoutError("ACP process did not exit")
 
