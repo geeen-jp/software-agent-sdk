@@ -2,19 +2,37 @@
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from types import MappingProxyType
 
 import pytest
 
 from openhands.sdk.settings.acp_providers import (
     ACP_PROVIDERS,
+    CLAUDE_AGENT_ACP_VERSION,
+    CODEX_ACP_VERSION,
+    CODEX_RUNTIME_PACKAGE,
+    CODEX_RUNTIME_VERSION,
+    GEMINI_CLI_VERSION,
     ACPModelOption,
     ACPProviderInfo,
     build_session_model_meta,
     detect_acp_provider_by_agent_name,
     detect_acp_provider_by_command,
+    extract_acp_package_version,
     get_acp_provider,
+    resolve_acp_package_version,
+    resolve_acp_runtime_version,
+    resolve_effective_acp_provider_key,
 )
+
+
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+_DOCKERFILE = (
+    _REPO_ROOT / "openhands-agent-server/openhands/agent_server/docker/Dockerfile"
+)
+_TS_ACP_PROVIDERS = _REPO_ROOT / "clients/typescript/src/models/acp-providers.json"
 
 
 class TestACPProviderInfo:
@@ -49,6 +67,8 @@ class TestACPProviderInfo:
         assert models["haiku"] == "Claude Haiku"
         # Pinned binary exposed by the agent-server image wrappers.
         assert info.binary_name == "claude-agent-acp"
+        assert info.runtime_package is None
+        assert info.runtime_version is None
         assert info.data_dir_env_var == "CLAUDE_CONFIG_DIR"
 
     def test_codex_metadata(self):
@@ -71,6 +91,8 @@ class TestACPProviderInfo:
         assert any(m.id == "gpt-5.5" for m in info.available_models)
         assert info.binary_name == "codex-acp"
         assert info.data_dir_env_var == "CODEX_HOME"
+        assert info.runtime_package == CODEX_RUNTIME_PACKAGE
+        assert info.runtime_version == CODEX_RUNTIME_VERSION
 
     def test_gemini_cli_metadata(self):
         info = ACP_PROVIDERS["gemini-cli"]
@@ -91,6 +113,8 @@ class TestACPProviderInfo:
         assert info.binary_name == "gemini"
         # Gemini CLI has no dedicated config-dir var, so only HOME relocates it.
         assert info.data_dir_env_var == "HOME"
+        assert info.runtime_package is None
+        assert info.runtime_version is None
 
     def test_provider_info_is_frozen(self):
         info = ACP_PROVIDERS["claude-code"]
@@ -190,6 +214,62 @@ class TestDetectACPProviderByCommand:
         assert info is not None and info.key == "codex"
 
 
+class TestStartupProviderResolution:
+    def test_extract_acp_package_version_from_pinned_command(self):
+        command = ("npx", "-y", "@agentclientprotocol/codex-acp@1.1.7")
+        assert extract_acp_package_version(command) == "1.1.7"
+
+    def test_extract_acp_package_version_absent_for_unpinned_binary(self):
+        assert extract_acp_package_version(("codex-acp",)) is None
+
+    def test_resolve_package_version_uses_registry_pin_for_codex_binary(self):
+        assert (
+            resolve_acp_package_version(("codex-acp",), provider_key="codex")
+            == CODEX_ACP_VERSION
+        )
+
+    def test_resolve_package_version_does_not_invent_pin_for_other_providers(self):
+        assert (
+            resolve_acp_package_version(
+                ("claude-agent-acp",), provider_key="claude-code"
+            )
+            is None
+        )
+
+    def test_resolve_runtime_version_is_codex_runtime_not_adapter(self):
+        assert resolve_acp_runtime_version("codex") == CODEX_RUNTIME_VERSION
+        assert resolve_acp_runtime_version("claude-code") is None
+        assert CODEX_RUNTIME_VERSION != CODEX_ACP_VERSION
+
+    def test_resolve_effective_provider_prefers_runtime_agent_name(self):
+        assert (
+            resolve_effective_acp_provider_key(
+                acp_server="claude-code",
+                command=("codex-acp",),
+                agent_name="codex-acp",
+            )
+            == "codex"
+        )
+
+    def test_resolve_effective_provider_uses_configured_server(self):
+        assert (
+            resolve_effective_acp_provider_key(
+                acp_server="gemini-cli",
+                command=("gemini", "--acp"),
+            )
+            == "gemini-cli"
+        )
+
+    def test_resolve_effective_provider_falls_back_to_command(self):
+        assert (
+            resolve_effective_acp_provider_key(
+                acp_server=None,
+                command=("npx", "-y", "@agentclientprotocol/claude-agent-acp"),
+            )
+            == "claude-code"
+        )
+
+
 class TestProviderRegistryConsistency:
     """Verify the registry is internally consistent."""
 
@@ -224,6 +304,27 @@ class TestProviderRegistryConsistency:
                 assert detected.key == key, (
                     f"pattern {pattern!r} matched {detected.key!r}, expected {key!r}"
                 )
+
+    def test_pinned_acp_versions_match_dockerfile_and_typescript_client(self):
+        """Registry pins must stay aligned with the image build and TS client."""
+        dockerfile = _DOCKERFILE.read_text(encoding="utf-8")
+        assert (
+            f"@agentclientprotocol/claude-agent-acp@{CLAUDE_AGENT_ACP_VERSION}"
+            in dockerfile
+        )
+        assert f"@agentclientprotocol/codex-acp@{CODEX_ACP_VERSION}" in dockerfile
+        assert f"{CODEX_RUNTIME_PACKAGE}@{CODEX_RUNTIME_VERSION}" in dockerfile
+        assert 'export CODEX_PATH="%s/bin/codex"' in dockerfile
+        assert f"@google/gemini-cli@{GEMINI_CLI_VERSION}" in dockerfile
+
+        ts_providers = json.loads(_TS_ACP_PROVIDERS.read_text(encoding="utf-8"))
+        assert ts_providers["codex"]["default_command"][-1].endswith(
+            f"@agentclientprotocol/codex-acp@{CODEX_ACP_VERSION}"
+        )
+        assert ts_providers["codex"]["runtime_package"] == CODEX_RUNTIME_PACKAGE
+        assert ts_providers["codex"]["runtime_version"] == CODEX_RUNTIME_VERSION
+        assert CODEX_ACP_VERSION == "1.1.7"
+        assert CODEX_RUNTIME_VERSION == "0.145.0"
 
 
 class TestProviderModelLists:

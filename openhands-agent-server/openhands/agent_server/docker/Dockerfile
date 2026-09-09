@@ -121,7 +121,7 @@ RUN set -eux; \
       case "$provider" in \
         claude-code) PACKAGES="$PACKAGES @agentclientprotocol/claude-agent-acp@0.63.0"; \
           WRAPPER_BINS="$WRAPPER_BINS claude-agent-acp";; \
-        codex) PACKAGES="$PACKAGES @agentclientprotocol/codex-acp@1.1.7"; \
+        codex) PACKAGES="$PACKAGES @agentclientprotocol/codex-acp@1.1.7 @openai/codex@0.145.0"; \
           WRAPPER_BINS="$WRAPPER_BINS codex-acp";; \
         gemini-cli) PACKAGES="$PACKAGES @google/gemini-cli@0.46.0"; \
           WRAPPER_BINS="$WRAPPER_BINS gemini";; \
@@ -152,9 +152,15 @@ RUN set -eux; \
     "$ACP_NODE_DIR/bin/node" --version; \
     PATH="$ACP_NODE_DIR/bin:$PATH" "$ACP_NODE_DIR/bin/npm" install -g $PACKAGES; \
     for bin in $WRAPPER_BINS; do \
-      printf '#!/bin/sh\nPATH="%s/bin:$PATH" exec "%s/bin/%s" "$@"\n' \
-        "$ACP_NODE_DIR" "$ACP_NODE_DIR" "$bin" \
-        > "$ACP_WRAPPER_DIR/$bin"; \
+      if [ "$bin" = "codex-acp" ]; then \
+        printf '#!/bin/sh\nPATH="%s/bin:$PATH"\nexport CODEX_PATH="%s/bin/codex"\nexec "%s/bin/%s" "$@"\n' \
+          "$ACP_NODE_DIR" "$ACP_NODE_DIR" "$ACP_NODE_DIR" "$bin" \
+          > "$ACP_WRAPPER_DIR/$bin"; \
+      else \
+        printf '#!/bin/sh\nPATH="%s/bin:$PATH" exec "%s/bin/%s" "$@"\n' \
+          "$ACP_NODE_DIR" "$ACP_NODE_DIR" "$bin" \
+          > "$ACP_WRAPPER_DIR/$bin"; \
+      fi; \
       chmod +x "$ACP_WRAPPER_DIR/$bin"; \
     done
 

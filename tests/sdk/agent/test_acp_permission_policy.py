@@ -30,6 +30,8 @@ from openhands.sdk.agent.acp_agent import (
 )
 from openhands.sdk.agent.acp_permission_policy import (
     assert_config_options_compatible_with_permission_policy,
+    initial_agent_mode_env_for_policy,
+    is_codex_mode_config_option,
     is_permission_mode_config_option,
     normalize_acp_permission_policy,
     resolve_permission_response,
@@ -45,6 +47,11 @@ _CLAUDE_COMMAND = [
     "-y",
     "@agentclientprotocol/claude-agent-acp",
 ]
+_CODEX_COMMAND = [
+    "npx",
+    "-y",
+    "@agentclientprotocol/codex-acp",
+]
 
 
 def _claude_session_modes(current: str = "default") -> SessionModeState:
@@ -52,6 +59,17 @@ def _claude_session_modes(current: str = "default") -> SessionModeState:
         available_modes=[
             SessionMode(id="default", name="Default"),
             SessionMode(id="bypassPermissions", name="Bypass permissions"),
+        ],
+        current_mode_id=current,
+    )
+
+
+def _codex_session_modes(current: str = "read-only") -> SessionModeState:
+    return SessionModeState(
+        available_modes=[
+            SessionMode(id="read-only", name="Read-only"),
+            SessionMode(id="agent", name="Agent"),
+            SessionMode(id="agent-full-access", name="Agent (full access)"),
         ],
         current_mode_id=current,
     )
@@ -132,9 +150,9 @@ def test_read_only_session_mode_fails_closed_for_unverified_providers() -> None:
     with pytest.raises(ValueError, match="write paths are unverified"):
         resolve_session_mode_for_policy(
             "read_only",
-            provider_key="codex",
+            provider_key="gemini-cli",
             explicit_mode=None,
-            default_session_mode="agent-full-access",
+            default_session_mode="default",
         )
     with pytest.raises(ValueError, match="write paths are unverified"):
         resolve_session_mode_for_policy(
@@ -153,6 +171,70 @@ def test_read_only_refuses_bypass_session_mode() -> None:
             explicit_mode="bypassPermissions",
             default_session_mode="bypassPermissions",
         )
+    with pytest.raises(ValueError, match="bypasses permission prompts"):
+        resolve_session_mode_for_policy(
+            "read_only",
+            provider_key="codex",
+            explicit_mode="agent-full-access",
+            default_session_mode="agent-full-access",
+        )
+    with pytest.raises(ValueError, match="bypasses permission prompts"):
+        resolve_session_mode_for_policy(
+            "read_only",
+            provider_key="codex",
+            explicit_mode="yolo",
+            default_session_mode="agent-full-access",
+        )
+    with pytest.raises(ValueError, match="bypasses permission prompts"):
+        resolve_session_mode_for_policy(
+            "read_only",
+            provider_key="codex",
+            explicit_mode="dontAsk",
+            default_session_mode="agent-full-access",
+        )
+
+
+def test_read_only_codex_refuses_writable_agent_mode() -> None:
+    with pytest.raises(ValueError, match="not a verified read_only"):
+        resolve_session_mode_for_policy(
+            "read_only",
+            provider_key="codex",
+            explicit_mode="agent",
+            default_session_mode="agent-full-access",
+        )
+
+
+def test_read_only_codex_uses_sandbox_read_only_mode() -> None:
+    assert (
+        resolve_session_mode_for_policy(
+            "read_only",
+            provider_key="codex",
+            explicit_mode=None,
+            default_session_mode="agent-full-access",
+        )
+        == "read-only"
+    )
+    assert initial_agent_mode_env_for_policy(
+        "read_only",
+        provider_key="codex",
+        mode_id="read-only",
+    ) == {"INITIAL_AGENT_MODE": "read-only"}
+    assert (
+        initial_agent_mode_env_for_policy(
+            "writable",
+            provider_key="codex",
+            mode_id="agent-full-access",
+        )
+        == {}
+    )
+    assert (
+        initial_agent_mode_env_for_policy(
+            "read_only",
+            provider_key="claude-code",
+            mode_id="default",
+        )
+        == {}
+    )
 
 
 def test_read_only_claude_uses_permission_requesting_mode() -> None:
@@ -202,6 +284,7 @@ def _start_acp_server_with_mocked_transport(
     tmp_path,
     *,
     agent_name: str = "claude-agent-acp",
+    modes: SessionModeState | None = None,
     capture_env: dict[str, str] | None = None,
 ) -> MagicMock:
     conn = MagicMock()
@@ -213,7 +296,7 @@ def _start_acp_server_with_mocked_transport(
     conn.initialize = AsyncMock(return_value=init_response)
     new_response = MagicMock()
     new_response.session_id = "sess-1"
-    new_response.modes = _claude_session_modes()
+    new_response.modes = modes if modes is not None else _claude_session_modes()
     conn.new_session = AsyncMock(return_value=new_response)
     conn.load_session = AsyncMock(return_value=MagicMock())
     conn.set_session_mode = AsyncMock()
@@ -289,14 +372,52 @@ def test_read_only_unknown_command_fails_closed_before_subprocess(tmp_path) -> N
     assert agent._client is None
 
 
-def test_read_only_codex_fails_closed_before_subprocess(tmp_path) -> None:
+def test_read_only_codex_startup_sets_sandbox_read_only_mode(tmp_path) -> None:
+    capture_env: dict[str, str] = {}
     agent = ACPAgent(
-        acp_command=["npx", "-y", "@agentclientprotocol/codex-acp"],
+        acp_command=_CODEX_COMMAND,
+        acp_permission_policy="read_only",
+        acp_env={"INITIAL_AGENT_MODE": "agent-full-access"},
+    )
+    conn = _start_acp_server_with_mocked_transport(
+        agent,
+        tmp_path,
+        agent_name="codex-acp",
+        modes=_codex_session_modes(),
+        capture_env=capture_env,
+    )
+    assert agent._client is not None
+    assert agent._client.permission_policy == "read_only"
+    conn.set_session_mode.assert_awaited_once_with(
+        mode_id="read-only",
+        session_id="sess-1",
+    )
+    assert capture_env.get("INITIAL_AGENT_MODE") == "read-only"
+
+
+def test_read_only_codex_fails_closed_when_current_mode_is_writable(tmp_path) -> None:
+    agent = ACPAgent(
+        acp_command=_CODEX_COMMAND,
+        acp_permission_policy="read_only",
+    )
+    with pytest.raises(ACPSessionModeError, match="did not confirm"):
+        _start_acp_server_with_mocked_transport(
+            agent,
+            tmp_path,
+            agent_name="codex-acp",
+            modes=_codex_session_modes("agent"),
+        )
+
+
+def test_read_only_gemini_fails_closed_before_subprocess(tmp_path) -> None:
+    agent = ACPAgent(
+        acp_command=["npx", "-y", "@google/gemini-cli", "--acp"],
         acp_permission_policy="read_only",
     )
     state = _make_state(tmp_path, agent)
     with pytest.raises(ValueError, match="write paths are unverified"):
         agent._start_acp_server(state)
+    assert agent._client is None
 
 
 @pytest.mark.asyncio
@@ -500,6 +621,17 @@ def _select_config_option(
     )
 
 
+_CODEX_MODE_CHOICES = ["read-only", "agent", "agent-full-access"]
+
+
+def _codex_mode_config_option(current: str = "read-only") -> SessionConfigOptionSelect:
+    return _select_config_option("mode", current, list(_CODEX_MODE_CHOICES))
+
+
+def _codex_effort_option(current: str = "low") -> SessionConfigOptionSelect:
+    return _select_config_option("reasoning_effort", current, ["low", "medium", "high"])
+
+
 def _start_acp_server_with_session_config(
     agent: ACPAgent,
     tmp_path,
@@ -631,6 +763,12 @@ def test_unrelated_config_ids_are_not_permission_mode_options() -> None:
     assert not is_permission_mode_config_option("effort")
     assert not is_permission_mode_config_option("model")
     assert not is_permission_mode_config_option("fast")
+
+
+def test_codex_mode_config_option_id_is_exact() -> None:
+    assert is_codex_mode_config_option("mode")
+    assert not is_codex_mode_config_option("permissionMode")
+    assert not is_codex_mode_config_option("MODE")
 
 
 def test_read_only_rejects_permission_mode_config_option_ids() -> None:
@@ -890,6 +1028,94 @@ async def test_read_only_config_accepts_fresh_mode_after_writes() -> None:
         required_session_mode="default",
     )
     conn.set_config_option.assert_awaited_once()
+
+
+def test_read_only_codex_startup_accepts_mode_config_without_current_mode_update(
+    tmp_path,
+) -> None:
+    agent = ACPAgent(
+        acp_command=_CODEX_COMMAND,
+        acp_permission_policy="read_only",
+        acp_config_options={"reasoning_effort": "medium"},
+    )
+    conn = _start_acp_server_with_session_config(
+        agent,
+        tmp_path,
+        agent_name="codex-acp",
+        modes=_codex_session_modes("read-only"),
+        config_options=[
+            _codex_effort_option(),
+            _codex_mode_config_option("read-only"),
+        ],
+    )
+    conn.set_session_mode.assert_awaited_once_with(
+        mode_id="read-only",
+        session_id="sess-1",
+    )
+    conn.set_config_option.assert_awaited_once_with(
+        config_id="reasoning_effort",
+        session_id="sess-1",
+        value="medium",
+    )
+
+
+def test_read_only_codex_startup_fails_if_mode_config_is_writable(
+    tmp_path,
+) -> None:
+    agent = ACPAgent(
+        acp_command=_CODEX_COMMAND,
+        acp_permission_policy="read_only",
+        acp_config_options={"reasoning_effort": "medium"},
+    )
+    with pytest.raises(ACPSessionModeError, match="configuration option"):
+        _start_acp_server_with_session_config(
+            agent,
+            tmp_path,
+            agent_name="codex-acp",
+            modes=_codex_session_modes("read-only"),
+            config_options=[
+                _codex_effort_option(),
+                _codex_mode_config_option("agent"),
+            ],
+        )
+
+
+def test_read_only_codex_startup_fails_if_mode_config_is_absent(tmp_path) -> None:
+    agent = ACPAgent(
+        acp_command=_CODEX_COMMAND,
+        acp_permission_policy="read_only",
+        acp_config_options={"reasoning_effort": "medium"},
+    )
+    with pytest.raises(ACPSessionModeError, match="did not prove"):
+        _start_acp_server_with_session_config(
+            agent,
+            tmp_path,
+            agent_name="codex-acp",
+            modes=_codex_session_modes("read-only"),
+            config_options=[_codex_effort_option()],
+        )
+
+
+def test_read_only_codex_startup_fails_if_observed_mode_is_writable(
+    tmp_path,
+) -> None:
+    agent = ACPAgent(
+        acp_command=_CODEX_COMMAND,
+        acp_permission_policy="read_only",
+        acp_config_options={"reasoning_effort": "medium"},
+    )
+    with pytest.raises(ACPSessionModeError, match="did not prove"):
+        _start_acp_server_with_session_config(
+            agent,
+            tmp_path,
+            agent_name="codex-acp",
+            modes=_codex_session_modes("read-only"),
+            config_options=[
+                _codex_effort_option(),
+                _codex_mode_config_option("read-only"),
+            ],
+            emit_mode_after_config="agent",
+        )
 
 
 def test_permission_logs_omit_tool_call_payload(

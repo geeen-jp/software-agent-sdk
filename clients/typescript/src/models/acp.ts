@@ -101,6 +101,14 @@ export interface ACPProviderInfo {
   readonly binary_name: string | null;
   /** Env var that relocates the provider's data/config directory, or `null`. */
   readonly data_dir_env_var: string | null;
+  /**
+   * Exact npm package of the bundled CLI runtime, or `null` when the
+   * adapter package is the runtime. Codex adapter `codex-acp` launches
+   * `@openai/codex`; `agentInfo.version` is the adapter, not this pin.
+   */
+  readonly runtime_package: string | null;
+  /** Exact version pin for `runtime_package`, or `null`. */
+  readonly runtime_version: string | null;
 }
 
 export const ACP_PROVIDERS: Readonly<Record<ACPProviderKey, ACPProviderInfo>> =

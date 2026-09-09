@@ -22,6 +22,7 @@ import contextlib
 import inspect
 import json
 import os
+import re
 import threading
 import time
 import uuid
@@ -74,6 +75,7 @@ from openhands.sdk.agent.acp_claude_auth import (
 )
 from openhands.sdk.agent.acp_file_credentials import (
     ACPFileCredentialLifecycle,
+    codex_auth_file_is_chatgpt,
     create_file_credential_lifecycle,
     write_secret_file,
 )
@@ -81,6 +83,8 @@ from openhands.sdk.agent.acp_models import ACPModelInfo
 from openhands.sdk.agent.acp_permission_policy import (
     ACPPermissionPolicy,
     assert_config_options_compatible_with_permission_policy,
+    initial_agent_mode_env_for_policy,
+    is_codex_mode_config_option,
     is_permission_mode_config_option,
     normalize_acp_permission_policy,
     resolve_permission_response,
@@ -115,6 +119,9 @@ from openhands.sdk.settings.acp_providers import (
     default_acp_file_secrets,
     detect_acp_provider_by_agent_name,
     detect_acp_provider_by_command,
+    resolve_acp_package_version,
+    resolve_acp_runtime_version,
+    resolve_effective_acp_provider_key,
 )
 from openhands.sdk.tool import Tool  # noqa: TC002
 from openhands.sdk.tool.builtins.finish import FinishAction, FinishObservation
@@ -192,6 +199,14 @@ _STREAM_READER_LIMIT: int = 100 * 1024 * 1024  # 100 MiB
 # call on a subprocess that is already wedged or gone.
 _ACP_INIT_ABORT_TIMEOUT: float = float(os.environ.get("ACP_INIT_ABORT_TIMEOUT", "5.0"))
 
+# Bound on each ACP runtime teardown await (process wait, cancelled reader
+# tasks, connection close).  ``AsyncExecutor.run_async(..., timeout=)`` uses
+# ``anyio.fail_after``, which cannot return until the cancelled await actually
+# exits — so the await itself must also yield at this deadline.
+_ACP_RUNTIME_SHUTDOWN_TIMEOUT: float = float(
+    os.environ.get("ACP_RUNTIME_SHUTDOWN_TIMEOUT", "5.0")
+)
+
 # Minimum interval between on_activity heartbeat signals (seconds).
 # Throttled to avoid excessive calls while still keeping the idle timer
 # well below the ~20 min runtime-api kill threshold.
@@ -248,17 +263,111 @@ def _make_dummy_llm() -> LLM:
 # ---------------------------------------------------------------------------
 
 
-# ACP auth method ID → environment variable that supplies the credential.
-# When the server reports auth_methods, we pick the first method whose
-# required credential source is present.
-# Note: claude-login is intentionally NOT included because Claude Code ACP
-# uses bypassPermissions mode instead of API key authentication.
-_AUTH_METHOD_ENV_MAP: dict[str, str] = {
-    "codex-api-key": "CODEX_API_KEY",
-    "openai-api-key": "OPENAI_API_KEY",
-    "gemini-api-key": "GEMINI_API_KEY",
+# ACP auth method ID → environment variables that supply the credential.
+# These IDs are the contract advertised by the pinned Codex ACP adapter. Keep
+# this table exact: accepting arbitrary/legacy-looking IDs can select a billing
+# path the adapter did not actually offer.
+_AUTH_METHOD_ENV_MAP: dict[str, tuple[str, ...]] = {
+    "api-key": ("CODEX_API_KEY", "OPENAI_API_KEY"),
+    "gemini-api-key": ("GEMINI_API_KEY",),
 }
-_CHATGPT_AUTH_PATH = Path(".codex") / "auth.json"
+
+
+class ACPAuthSelectionError(RuntimeError):
+    """The ACP server's advertised authentication contract cannot be met."""
+
+
+_ACP_DIAGNOSTIC_TAIL_CHARS = 4_000
+_ACP_OFFERED_AUTH_MAX_IDS = 16
+_ACP_OFFERED_AUTH_ID_CHARS = 64
+_ACP_SECRET_PATTERNS = (
+    re.compile(r"(?i)(bearer\s+)[^\s,;]+"),
+    re.compile(
+        r"(?i)(['\"]?(?:access[_-]?token|refresh[_-]?token|id[_-]?token|api[_-]?key|password)['\"]?\s*[:=]\s*['\"]?)[^\s,'\"}]+"
+    ),
+)
+
+
+def _has_usable_env_value(env: dict[str, str], name: str) -> bool:
+    value = env.get(name)
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _sanitize_acp_diagnostic(
+    value: object, mask: Callable[[str], str] | None = None
+) -> str:
+    """Return a bounded diagnostic string without credential-shaped values."""
+    text = str(value)
+    if mask is not None:
+        text = mask(text)
+    for pattern in _ACP_SECRET_PATTERNS:
+        text = pattern.sub(r"\1<redacted>", text)
+    if len(text) > _ACP_DIAGNOSTIC_TAIL_CHARS:
+        text = text[-_ACP_DIAGNOSTIC_TAIL_CHARS:]
+    return text
+
+
+async def _capture_acp_stderr(stream: Any, tail: list[str]) -> None:
+    """Keep only a bounded in-memory stderr tail for startup diagnostics."""
+    try:
+        while True:
+            line = await stream.readline()
+            if not line:
+                return
+            if isinstance(line, bytes):
+                line = line.decode(errors="replace")
+            tail[0] = (tail[0] + str(line))[-_ACP_DIAGNOSTIC_TAIL_CHARS:]
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.debug("ACP stderr capture stopped", exc_info=True)
+
+
+def _acp_startup_log_extra(
+    *,
+    phase: str,
+    launcher: str,
+    provider_key: str | None,
+    package_version: str | None,
+    adapter_name: str | None,
+    adapter_version: str | None,
+    runtime_version: str | None,
+    rpc: str | None,
+    stage: str | None,
+    exit_code: int | None,
+    stderr_tail: str,
+    detail: str,
+) -> dict[str, object]:
+    """Structured, bounded startup diagnostics for logging."""
+    return {
+        "phase": phase,
+        "launcher": launcher,
+        "provider_key": provider_key,
+        "package_version": package_version,
+        "adapter_name": adapter_name,
+        "adapter_version": adapter_version,
+        "runtime_version": runtime_version,
+        "rpc": rpc,
+        "stage": stage,
+        "exit_code": exit_code,
+        "stderr_tail": stderr_tail,
+        "detail": detail,
+    }
+
+
+def _bound_offered_auth_ids(auth_methods: list[Any]) -> list[str]:
+    """Return a bounded, sanitized list of advertised ACP auth method IDs."""
+    ids: list[str] = []
+    for method in auth_methods:
+        raw = getattr(method, "id", None)
+        if not raw:
+            continue
+        text = _sanitize_acp_diagnostic(str(raw))[:_ACP_OFFERED_AUTH_ID_CHARS]
+        if text and text not in ids:
+            ids.append(text)
+        if len(ids) >= _ACP_OFFERED_AUTH_MAX_IDS:
+            break
+    return ids
 
 
 def _select_auth_method(
@@ -270,20 +379,46 @@ def _select_auth_method(
     Returns the ``id`` of the first matching method, or ``None`` if no
     supported credential source is available (the server may not require auth).
 
-    ChatGPT subscription login (device-code flow stored in
-    ``~/.codex/auth.json``) is checked first so it takes precedence over
-    explicit API keys, which serve as the fallback.
+    ChatGPT subscription credentials in the effective ``CODEX_HOME`` are
+    checked first so they take precedence over explicit API keys. When
+    ``CODEX_HOME`` is isolated, the effective file is conversation-scoped and
+    the host user's ``~/.codex/auth.json`` is never consulted.
     """
     method_ids = {m.id for m in auth_methods}
-    # Prefer ChatGPT subscription login when the auth file is present.
-    if "chatgpt" in method_ids:
-        if (Path.home() / _CHATGPT_AUTH_PATH).is_file():
-            return "chatgpt"
-    # Fall back to explicit API key env vars.
-    for method_id, env_var in _AUTH_METHOD_ENV_MAP.items():
-        if method_id in method_ids and env_var in env:
+    if "chat-gpt" in method_ids and codex_auth_file_is_chatgpt(env):
+        return "chat-gpt"
+    for method_id, env_vars in _AUTH_METHOD_ENV_MAP.items():
+        if method_id not in method_ids:
+            continue
+        if isinstance(env_vars, str):
+            env_vars = (env_vars,)
+        if any(_has_usable_env_value(env, env_var) for env_var in env_vars):
             return method_id
     return None
+
+
+def _should_defer_codex_chatgpt_auth(
+    *,
+    is_codex: bool,
+    method_id: str,
+    env: dict[str, str],
+    has_codex_api_key: bool,
+) -> bool:
+    """Let codex-acp validate file-backed ChatGPT auth during session creation.
+
+    codex-acp's explicit ``authenticate(chat-gpt)`` path asks the app-server to
+    refresh the account and falls back to browser login when that refresh does
+    not return an account. A file-backed ChatGPT credential is already the
+    isolated runtime's auth source, so session creation must perform the
+    non-refreshing auth check instead. API-key and all non-Codex paths retain
+    the normal explicit-auth behavior.
+    """
+    return (
+        is_codex
+        and method_id == "chat-gpt"
+        and not has_codex_api_key
+        and codex_auth_file_is_chatgpt(env)
+    )
 
 
 class ACPSessionConfigError(RuntimeError):
@@ -308,6 +443,8 @@ class ACPSessionModeError(RuntimeError):
 
 def _classify_acp_init_error(exc: BaseException) -> str:
     """Map a cold-start failure to a structured ``ConversationErrorEvent`` code."""
+    if isinstance(exc, ACPAuthSelectionError):
+        return "ACPAuthError"
     if isinstance(exc, TimeoutError):
         return "ACPStartupTimeout"
     if isinstance(exc, (FileNotFoundError, PermissionError)):
@@ -636,7 +773,14 @@ def _verify_read_only_mode_after_config(
     mode_generation_before: int = 0,
     require_fresh_mode: bool = False,
 ) -> None:
-    """Fail closed if session configuration replaced the verified read_only mode."""
+    """Fail closed if session configuration replaced the verified read_only mode.
+
+    Codex ACP 1.1.7 updates ``agentMode`` in memory and exposes it as config
+    option ``mode``; it does not emit ``current_mode_update``. That provider
+    may prove ``read_only`` with ``mode``/``currentValue=read-only`` instead
+    of a fresh mode notification. Other providers still require a fresh
+    ``CurrentModeUpdate`` after config writes.
+    """
     if (
         normalize_acp_permission_policy(policy) != "read_only"
         or required_mode_id is None
@@ -644,24 +788,28 @@ def _verify_read_only_mode_after_config(
         return
     observed = client.get_current_mode_id(session_id)
     generation = client.get_current_mode_generation(session_id)
-    if require_fresh_mode:
-        if generation <= mode_generation_before or observed != required_mode_id:
+    if observed is not None and observed != required_mode_id:
+        if require_fresh_mode:
             raise ACPSessionModeError(
                 f"ACP server {agent_name!r} session {session_id} did not prove "
                 f"read_only session mode {required_mode_id!r} after applying "
                 f"session configuration (observed={observed!r})."
             )
-    elif observed is not None and observed != required_mode_id:
         raise ACPSessionModeError(
             f"ACP server {agent_name!r} session {session_id} replaced "
             f"read_only session mode {required_mode_id!r} with {observed!r} "
             "after applying session configuration."
         )
+    codex_mode_value: str | None = None
+    saw_codex_mode = False
     for option in (
         *_iter_session_config_options(config_options),
         *_iter_session_config_options(client.get_config_options(session_id)),
     ):
         option_id = getattr(option, "id", None)
+        if is_codex_mode_config_option(option_id):
+            saw_codex_mode = True
+            codex_mode_value = _config_option_current_value(option)
         if not is_permission_mode_config_option(option_id):
             continue
         current = _config_option_current_value(option)
@@ -670,6 +818,23 @@ def _verify_read_only_mode_after_config(
                 f"ACP server {agent_name!r} session {session_id} configuration "
                 f"option {option_id!r}={current!r} replaced read_only session "
                 f"mode {required_mode_id!r}."
+            )
+    if require_fresh_mode:
+        provider = detect_acp_provider_by_agent_name(agent_name)
+        if provider is not None and provider.key == "codex":
+            if not saw_codex_mode or codex_mode_value != required_mode_id:
+                raise ACPSessionModeError(
+                    f"ACP server {agent_name!r} session {session_id} did not "
+                    f"prove read_only session mode {required_mode_id!r} after "
+                    "applying session configuration "
+                    f"(mode={codex_mode_value!r}, observed={observed!r})."
+                )
+            return
+        if generation <= mode_generation_before or observed != required_mode_id:
+            raise ACPSessionModeError(
+                f"ACP server {agent_name!r} session {session_id} did not prove "
+                f"read_only session mode {required_mode_id!r} after applying "
+                f"session configuration (observed={observed!r})."
             )
 
 
@@ -1281,10 +1446,9 @@ async def _filter_jsonrpc_lines(source: Any, dest: Any) -> None:
             if stripped.startswith(b"{") and b'"jsonrpc"' in line:
                 dest.feed_data(line)
             else:
-                logger.debug(
-                    "ACP stdout (non-JSON): %s",
-                    line.decode(errors="replace").rstrip(),
-                )
+                # Non-protocol stdout is intentionally not logged: providers
+                # may echo prompts, environment values, or credentials there.
+                logger.debug("ACP stdout contained non-protocol output")
     except Exception:
         logger.debug("_filter_jsonrpc_lines stopped", exc_info=True)
         dest.feed_eof()
@@ -1315,6 +1479,34 @@ async def _close_acp_connection(connection: Any) -> None:
         await close_result
 
 
+async def _await_deadline(awaitable: Any, timeout: float) -> bool:
+    """Wait up to *timeout* seconds; return whether *awaitable* completed.
+
+    Unlike ``asyncio.wait_for`` / ``anyio.fail_after``, this does not keep
+    waiting for an awaitable that ignores cancellation.  The deadline always
+    returns control to the caller; a still-pending waiter is cancelled and
+    abandoned.
+    """
+    if not inspect.isawaitable(awaitable):
+        return True
+    task = asyncio.ensure_future(awaitable)
+    try:
+        done, _pending = await asyncio.wait({task}, timeout=timeout)
+    except asyncio.CancelledError:
+        if not task.done():
+            task.cancel()
+        raise
+    if task not in done:
+        task.cancel()
+        return False
+    if task.cancelled():
+        raise asyncio.CancelledError
+    exc = task.exception()
+    if exc is not None:
+        raise exc
+    return True
+
+
 async def _await_bounded(awaitable: Any, what: str) -> bool:
     """Await *awaitable* under ``_ACP_INIT_ABORT_TIMEOUT``; report completion.
 
@@ -1324,8 +1516,12 @@ async def _await_bounded(awaitable: Any, what: str) -> bool:
     raised.  Cancellation still propagates so the caller can escalate.
     """
     try:
-        await asyncio.wait_for(awaitable, timeout=_ACP_INIT_ABORT_TIMEOUT)
-        return True
+        if await _await_deadline(awaitable, _ACP_INIT_ABORT_TIMEOUT):
+            return True
+        logger.debug("ACP init teardown: %s did not complete (timeout)", what)
+        return False
+    except asyncio.CancelledError:
+        raise
     except Exception as e:
         logger.debug("ACP init teardown: %s did not complete (%s)", what, e)
         return False
@@ -1883,9 +2079,9 @@ class ACPAgent(AgentBase):
             "Conversation-local permission policy for ACP sessions. "
             "``writable`` preserves the default auto-approve behavior. "
             "``read_only`` refuses unverified provider write paths and, for "
-            "Claude Code, uses a permission-requesting session mode plus "
-            "denied request_permission callbacks. Unsupported providers and "
-            "unknown policy values fail closed."
+            "Claude Code and Codex, uses a permission-requesting session mode "
+            "plus denied request_permission callbacks. Unsupported providers "
+            "and unknown policy values fail closed."
         ),
     )
 
@@ -1923,6 +2119,7 @@ class ACPAgent(AgentBase):
     _client: Any = PrivateAttr(default=None)  # _OpenHandsACPBridge
     _filtered_reader: Any = PrivateAttr(default=None)  # StreamReader
     _stdout_filter_task: Any = PrivateAttr(default=None)  # asyncio.Task
+    _stderr_capture_task: Any = PrivateAttr(default=None)  # asyncio.Task
     _closed: bool = PrivateAttr(default=False)
     _working_dir: str = PrivateAttr(default="")
     _agent_name: str = PrivateAttr(
@@ -1953,6 +2150,16 @@ class ACPAgent(AgentBase):
     _claude_config_runtime_dir: Path | None = PrivateAttr(default=None)
     _claude_oauth_source_digest: str | None = PrivateAttr(default=None)
     _secret_registry_for_masking: SecretRegistry | None = PrivateAttr(default=None)
+    _startup_phase: str = PrivateAttr(default="not-started")
+    _startup_rpc: str | None = PrivateAttr(default=None)
+    _startup_stage: str = PrivateAttr(default="not-started")
+    _startup_stderr_tail: str = PrivateAttr(default="")
+    _startup_exit_code: int | None = PrivateAttr(default=None)
+    _startup_provider_key: str | None = PrivateAttr(default=None)
+    _startup_package_version: str | None = PrivateAttr(default=None)
+    _startup_adapter_name: str | None = PrivateAttr(default=None)
+    _startup_adapter_version: str | None = PrivateAttr(default=None)
+    _startup_runtime_version: str | None = PrivateAttr(default=None)
     _atexit_callback: Callable[[], None] | None = PrivateAttr(default=None)
     # Suffix rendered once at session start from agent_context + secret_registry.
     _suffix_install_state: str = PrivateAttr(default="unused")
@@ -2499,7 +2706,55 @@ class ACPAgent(AgentBase):
         try:
             self._start_acp_server(state)
         except Exception as e:
-            logger.error("Failed to start ACP server: %s", e)
+            detail = _sanitize_acp_diagnostic(
+                str(e),
+                state.secret_registry.mask_secrets_in_output,
+            )
+            stderr_tail = _sanitize_acp_diagnostic(
+                self._startup_stderr_tail,
+                state.secret_registry.mask_secrets_in_output,
+            )
+            adapter_name = _sanitize_acp_diagnostic(
+                self._startup_adapter_name or "",
+                state.secret_registry.mask_secrets_in_output,
+            )
+            adapter_version = _sanitize_acp_diagnostic(
+                self._startup_adapter_version or "",
+                state.secret_registry.mask_secrets_in_output,
+            )
+            runtime_version = _sanitize_acp_diagnostic(
+                self._startup_runtime_version or "",
+                state.secret_registry.mask_secrets_in_output,
+            )
+            package_version = _sanitize_acp_diagnostic(
+                self._startup_package_version or "",
+                state.secret_registry.mask_secrets_in_output,
+            )
+            rpc = _sanitize_acp_diagnostic(
+                self._startup_rpc or "",
+                state.secret_registry.mask_secrets_in_output,
+            )
+            stage = _sanitize_acp_diagnostic(
+                self._startup_stage or "",
+                state.secret_registry.mask_secrets_in_output,
+            )
+            logger.error(
+                "ACP startup failed",
+                extra=_acp_startup_log_extra(
+                    phase=self._startup_phase,
+                    launcher=Path(self.acp_command[0]).name,
+                    provider_key=self._startup_provider_key,
+                    package_version=package_version or None,
+                    adapter_name=adapter_name or None,
+                    adapter_version=adapter_version or None,
+                    runtime_version=runtime_version or None,
+                    rpc=rpc or None,
+                    stage=stage or None,
+                    exit_code=self._startup_exit_code,
+                    stderr_tail=stderr_tail,
+                    detail=detail,
+                ),
+            )
             try:
                 self._cleanup()
             except Exception:
@@ -2512,7 +2767,18 @@ class ACPAgent(AgentBase):
                     ConversationErrorEvent(
                         source="agent",
                         code=_classify_acp_init_error(e),
-                        detail=str(e)[:500],
+                        detail=(
+                            f"{detail[:500]} (phase={self._startup_phase}, "
+                            f"provider_key={self._startup_provider_key or 'unknown'}, "
+                            f"package_version={package_version or '<unavailable>'}, "
+                            f"adapter_name={adapter_name or '<unavailable>'}, "
+                            f"adapter_version={adapter_version or '<unavailable>'}, "
+                            f"runtime_version={runtime_version or '<unavailable>'}, "
+                            f"rpc={rpc or '<unavailable>'}, "
+                            f"stage={stage or '<unavailable>'}, "
+                            f"exit_code={self._startup_exit_code}, "
+                            f"stderr={stderr_tail[:500] or '<empty>'})"
+                        ),
                     )
                 )
             except Exception:
@@ -2612,10 +2878,37 @@ class ACPAgent(AgentBase):
                 "acp_suffix_installed": True,
             }
 
+    def _mark_startup(
+        self,
+        phase: str,
+        *,
+        rpc: str | None = None,
+        stage: str | None = None,
+    ) -> None:
+        self._startup_phase = phase
+        self._startup_rpc = rpc
+        self._startup_stage = stage if stage is not None else phase
+
     def _start_acp_server(self, state: ConversationState) -> None:
         """Start the ACP subprocess and initialize the session."""
+        self._mark_startup("preflight", rpc=None, stage="preflight")
+        self._startup_stderr_tail = ""
+        self._startup_exit_code = None
+        self._startup_provider_key = resolve_effective_acp_provider_key(
+            acp_server=self.acp_server,
+            command=self.acp_command,
+        )
+        self._startup_package_version = resolve_acp_package_version(
+            self.acp_command,
+            provider_key=self._startup_provider_key,
+        )
+        self._startup_adapter_name = None
+        self._startup_adapter_version = None
+        self._startup_runtime_version = resolve_acp_runtime_version(
+            self._startup_provider_key
+        )
         command_provider = detect_acp_provider_by_command(self.acp_command)
-        resolve_session_mode_for_policy(
+        preflight_mode = resolve_session_mode_for_policy(
             self.acp_permission_policy,
             provider_key=command_provider.key if command_provider else None,
             explicit_mode=self.acp_session_mode,
@@ -2688,6 +2981,14 @@ class ACPAgent(AgentBase):
             if claude_oauth_file_channel:
                 env.pop(CLAUDE_OAUTH_TOKEN_ENV, None)
 
+        env.update(
+            initial_agent_mode_env_for_policy(
+                self.acp_permission_policy,
+                provider_key=command_provider.key if command_provider else None,
+                mode_id=preflight_mode,
+            )
+        )
+
         command = self.acp_command[0]
         args = list(self.acp_command[1:]) + list(self.acp_args)
 
@@ -2716,6 +3017,11 @@ class ACPAgent(AgentBase):
             )
             prior_session_id = None
 
+        has_codex_api_key = any(
+            _has_usable_env_value(env, name)
+            for name in ("CODEX_API_KEY", "OPENAI_API_KEY")
+        )
+
         async def _init() -> tuple[
             Any,
             Any,
@@ -2731,6 +3037,7 @@ class ACPAgent(AgentBase):
             # filtering reader that skips non-JSON-RPC lines some
             # ACP servers (e.g. claude-code-acp v0.1.x) write to
             # stdout.
+            self._mark_startup("spawn", rpc=None, stage="spawn")
             process = await asyncio.create_subprocess_exec(
                 command,
                 *args,
@@ -2747,7 +3054,15 @@ class ACPAgent(AgentBase):
             # teardown below only touches what was actually created.
             conn: ClientSideConnection | None = None
             filter_task: asyncio.Task | None = None
+            stderr_tail = [""]
+            stderr_task: asyncio.Task | None = None
             try:
+                stderr_reader = getattr(process, "stderr", None)
+                stderr_readline = getattr(stderr_reader, "readline", None)
+                if inspect.iscoroutinefunction(stderr_readline):
+                    stderr_task = asyncio.get_event_loop().create_task(
+                        _capture_acp_stderr(stderr_reader, stderr_tail)
+                    )
                 # Wrap the subprocess stdout in a filtering reader that
                 # only passes lines starting with '{' (JSON-RPC messages).
                 filtered_reader = asyncio.StreamReader(limit=_STREAM_READER_LIMIT)
@@ -2767,10 +3082,12 @@ class ACPAgent(AgentBase):
                 self._conn = conn
                 self._filtered_reader = filtered_reader
                 self._stdout_filter_task = filter_task
+                self._stderr_capture_task = stderr_task
 
                 # Initialize the protocol and discover server identity.  The
                 # capabilities argument is only sent when the caller supplied one,
                 # so servers keep seeing the library defaults otherwise.
+                self._mark_startup("initialize", rpc="initialize", stage="handshake")
                 if self.acp_client_capabilities is not None:
                     init_response = await conn.initialize(
                         protocol_version=1,
@@ -2783,6 +3100,20 @@ class ACPAgent(AgentBase):
                 if init_response.agent_info is not None:
                     agent_name = init_response.agent_info.name or ""
                     agent_version = init_response.agent_info.version or ""
+                self._startup_adapter_name = agent_name or None
+                self._startup_adapter_version = agent_version or None
+                self._startup_provider_key = resolve_effective_acp_provider_key(
+                    acp_server=self.acp_server,
+                    command=self.acp_command,
+                    agent_name=agent_name or None,
+                )
+                self._startup_package_version = resolve_acp_package_version(
+                    self.acp_command,
+                    provider_key=self._startup_provider_key,
+                )
+                self._startup_runtime_version = resolve_acp_runtime_version(
+                    self._startup_provider_key
+                )
                 logger.info(
                     "ACP server initialized: agent_name=%r, agent_version=%r",
                     agent_name,
@@ -2806,33 +3137,79 @@ class ACPAgent(AgentBase):
                 # (e.g. codex-acp) require an explicit authenticate call
                 # before session creation.  We auto-detect the method from
                 # the env vars that are available to the process.
+                self._mark_startup("authenticate", rpc="authenticate", stage="select")
                 auth_methods = init_response.auth_methods or []
-                if auth_methods:
-                    method_id = _select_auth_method(auth_methods, env)
-                    if method_id is not None:
-                        logger.info("Authenticating with ACP method: %s", method_id)
-                        auth_kwargs: dict[str, Any] = {}
-                        # gemini-cli: pass gateway baseUrl to route API calls
-                        # through LiteLLM proxy. claude-agent-acp and codex-acp
-                        # read their provider base URL from env vars directly.
-                        if method_id == "gemini-api-key":
-                            provider = detect_acp_provider_by_agent_name(agent_name)
-                            base_url_var = (
-                                provider.base_url_env_var
-                                if provider is not None
-                                else None
-                            )
-                            if base_url_var:
-                                base_url = env.get(base_url_var)
-                                if base_url:
-                                    auth_kwargs["gateway"] = {"baseUrl": base_url}
-                        await conn.authenticate(method_id=method_id, **auth_kwargs)
-                    else:
+                method_id = _select_auth_method(auth_methods, env)
+                is_codex = (
+                    self._startup_provider_key == "codex"
+                    or (
+                        command_provider is not None and command_provider.key == "codex"
+                    )
+                    or self.acp_server == "codex"
+                )
+                isolated_codex_without_api = bool(
+                    is_codex and self.acp_isolate_data_dir and not has_codex_api_key
+                )
+                defer_codex_chatgpt_auth = bool(
+                    method_id is not None
+                    and _should_defer_codex_chatgpt_auth(
+                        is_codex=is_codex,
+                        method_id=method_id,
+                        env=env,
+                        has_codex_api_key=has_codex_api_key,
+                    )
+                )
+                if method_id is None:
+                    offered = _bound_offered_auth_ids(auth_methods)
+                    if is_codex and auth_methods:
+                        raise ACPAuthSelectionError(
+                            "Codex advertised auth methods have no exact "
+                            "supported credential match "
+                            f"(offered={offered})."
+                        )
+                    if isolated_codex_without_api and not codex_auth_file_is_chatgpt(
+                        env
+                    ):
+                        raise ACPAuthSelectionError(
+                            "Codex ChatGPT subscription authentication is "
+                            "required for isolated startup, but no usable "
+                            "chat-gpt credential was materialized "
+                            f"(offered={offered})."
+                        )
+                    if auth_methods:
                         logger.warning(
                             "ACP server offers auth methods %s but no matching "
                             "env var is set — session creation may fail",
-                            [m.id for m in auth_methods],
+                            offered,
                         )
+                elif defer_codex_chatgpt_auth:
+                    self._mark_startup(
+                        "authenticate", rpc=None, stage="deferred_to_session"
+                    )
+                    logger.info(
+                        "Deferring ACP authenticate RPC for Codex ChatGPT "
+                        "file-backed auth; app-server will validate it during "
+                        "session creation"
+                    )
+                else:
+                    logger.info("Authenticating with ACP method: %s", method_id)
+                    self._mark_startup(
+                        "authenticate", rpc="authenticate", stage="authenticate"
+                    )
+                    auth_kwargs: dict[str, Any] = {}
+                    # gemini-cli: pass gateway baseUrl to route API calls
+                    # through LiteLLM proxy. claude-agent-acp and codex-acp
+                    # read their provider base URL from env vars directly.
+                    if method_id == "gemini-api-key":
+                        provider = detect_acp_provider_by_agent_name(agent_name)
+                        base_url_var = (
+                            provider.base_url_env_var if provider is not None else None
+                        )
+                        if base_url_var:
+                            base_url = env.get(base_url_var)
+                            if base_url:
+                                auth_kwargs["gateway"] = {"baseUrl": base_url}
+                    await conn.authenticate(method_id=method_id, **auth_kwargs)
 
                 # Resume the prior ACP session if we have its id.  If the server
                 # has forgotten it (state wiped, new host, etc.) fall through to
@@ -2850,6 +3227,9 @@ class ACPAgent(AgentBase):
                 load_response: Any = None
                 if prior_session_id is not None:
                     try:
+                        self._mark_startup(
+                            "load_session", rpc="session/load", stage="load_session"
+                        )
                         load_response = await conn.load_session(
                             cwd=working_dir,
                             session_id=prior_session_id,
@@ -2883,6 +3263,9 @@ class ACPAgent(AgentBase):
 
                 session_response: Any
                 if session_id is None:
+                    self._mark_startup(
+                        "new_session", rpc="session/new", stage="new_session"
+                    )
                     session_meta = build_session_model_meta(agent_name, self.acp_model)
                     response = await conn.new_session(
                         cwd=working_dir,
@@ -2897,6 +3280,12 @@ class ACPAgent(AgentBase):
                         available_models,
                         self._model_via_config_option,
                     ) = _extract_session_models(response)
+                    model_rpc = (
+                        "session/set_config_option"
+                        if self._model_via_config_option
+                        else "session/set_model"
+                    )
+                    self._mark_startup("model", rpc=model_rpc, stage="apply_model")
                     effective_model_id = await _maybe_set_session_model(
                         conn,
                         agent_name,
@@ -2908,6 +3297,12 @@ class ACPAgent(AgentBase):
                         client=client,
                     )
                 else:
+                    model_rpc = (
+                        "session/set_config_option"
+                        if self._model_via_config_option
+                        else "session/set_model"
+                    )
+                    self._mark_startup("model", rpc=model_rpc, stage="apply_model")
                     session_response = load_response
                     effective_model_id = await _reapply_session_model_on_resume(
                         conn,
@@ -2961,6 +3356,7 @@ class ACPAgent(AgentBase):
                     explicit_mode=self.acp_session_mode,
                     default_session_mode=runtime_default_mode,
                 )
+                self._mark_startup("mode", rpc="session/set_mode", stage="set_mode")
                 await _apply_acp_session_mode(
                     conn,
                     client,
@@ -2976,6 +3372,9 @@ class ACPAgent(AgentBase):
                 # configuration the server did not confirm.  Runs last so options
                 # that depend on the selected model are resolved against the
                 # server's post-model state.
+                self._mark_startup(
+                    "config", rpc="session/set_config_option", stage="set_config"
+                )
                 await _apply_session_config_options(
                     conn,
                     client,
@@ -2986,6 +3385,7 @@ class ACPAgent(AgentBase):
                     required_session_mode=mode_id,
                 )
 
+                self._mark_startup("ready", rpc=None, stage="ready")
                 return (
                     conn,
                     process,
@@ -2998,6 +3398,8 @@ class ACPAgent(AgentBase):
                     override_applied,
                 )
             except BaseException:
+                self._startup_stderr_tail = stderr_tail[0]
+                self._startup_exit_code = getattr(process, "returncode", None)
                 # The subprocess is already running, but its handles have not
                 # been published to the ACPAgent attributes yet — ``init_state``
                 # cleanup cannot see them, so nothing else would ever reap the
@@ -3012,12 +3414,17 @@ class ACPAgent(AgentBase):
                     # running, but the event loop may disappear with us, so
                     # kill the subprocess without awaiting anything.
                     _signal_acp_process(process, "kill")
+                if stderr_task is not None:
+                    await _await_bounded(stderr_task, "reading ACP stderr")
+                    self._startup_stderr_tail = stderr_tail[0]
+                self._startup_exit_code = getattr(process, "returncode", None)
                 # Clear early-published handles so init_state's _cleanup does
                 # not close/terminate resources _abort_partial_acp_init reaped.
                 self._conn = None
                 self._process = None
                 self._filtered_reader = None
                 self._stdout_filter_task = None
+                self._stderr_capture_task = None
                 # Re-raises the original failure, not anything from teardown.
                 raise
 
@@ -4063,7 +4470,11 @@ class ACPAgent(AgentBase):
         if self._conn is not None and self._executor is not None:
             conn = self._conn
             try:
-                self._executor.run_async(_close_acp_connection, conn, timeout=5.0)
+                self._executor.run_async(
+                    _close_acp_connection,
+                    conn,
+                    timeout=_ACP_RUNTIME_SHUTDOWN_TIMEOUT,
+                )
             except Exception as e:
                 logger.debug("Error closing ACP connection: %s", e)
             self._conn = None
@@ -4079,7 +4490,7 @@ class ACPAgent(AgentBase):
                     self._executor.run_async(
                         self._wait_for_process,
                         process,
-                        timeout=5.0,
+                        timeout=_ACP_RUNTIME_SHUTDOWN_TIMEOUT,
                     )
             except Exception as e:
                 logger.debug("Error terminating ACP process: %s", e)
@@ -4089,20 +4500,22 @@ class ACPAgent(AgentBase):
                         self._executor.run_async(
                             self._wait_for_process,
                             process,
-                            timeout=5.0,
+                            timeout=_ACP_RUNTIME_SHUTDOWN_TIMEOUT,
                         )
                 except Exception as kill_error:
                     logger.debug("Error killing ACP process: %s", kill_error)
             self._process = None
 
-        for task_attr in ("_stdout_filter_task",):
+        for task_attr in ("_stdout_filter_task", "_stderr_capture_task"):
             task = getattr(self, task_attr)
             if task is not None:
                 task.cancel()
                 if self._executor is not None:
                     try:
                         self._executor.run_async(
-                            self._await_cancelled_task, task, timeout=5.0
+                            self._await_cancelled_task,
+                            task,
+                            timeout=_ACP_RUNTIME_SHUTDOWN_TIMEOUT,
                         )
                     except Exception as e:
                         logger.debug("Error stopping %s: %s", task_attr, e)
@@ -4119,7 +4532,7 @@ class ACPAgent(AgentBase):
 
         if self._executor is not None and not credential_failures:
             try:
-                self._executor.close()
+                self._executor.close(timeout=_ACP_RUNTIME_SHUTDOWN_TIMEOUT)
             except Exception as e:
                 failures["ACP executor"] = e
             self._executor = None
@@ -4127,14 +4540,23 @@ class ACPAgent(AgentBase):
 
     @staticmethod
     async def _wait_for_process(process: asyncio.subprocess.Process) -> None:
-        wait = process.wait()
-        if inspect.isawaitable(wait):
-            await wait
+        wait = getattr(process, "wait", None)
+        if wait is None:
+            return
+        if inspect.iscoroutinefunction(wait):
+            awaitable: Any = wait()
+        elif inspect.isawaitable(wait):
+            awaitable = wait
+        else:
+            # Sync wait() would block the portal loop so fail_after cannot fire.
+            awaitable = asyncio.get_running_loop().run_in_executor(None, wait)
+        if not await _await_deadline(awaitable, _ACP_RUNTIME_SHUTDOWN_TIMEOUT):
+            raise TimeoutError("ACP process did not exit")
 
     @staticmethod
     async def _await_cancelled_task(task: asyncio.Task[Any]) -> None:
         with contextlib.suppress(asyncio.CancelledError):
-            await task
+            await _await_deadline(task, _ACP_RUNTIME_SHUTDOWN_TIMEOUT)
 
     def release_runtime(self) -> None:
         """Disarm this agent's finalizer after handing its live ACP runtime to a

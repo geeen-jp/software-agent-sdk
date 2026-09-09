@@ -35,7 +35,9 @@
     "supports_runtime_model_switch": true,
     "file_secrets": [],
     "binary_name": "claude-agent-acp",
-    "data_dir_env_var": "CLAUDE_CONFIG_DIR"
+    "data_dir_env_var": "CLAUDE_CONFIG_DIR",
+    "runtime_package": null,
+    "runtime_version": null
   },
   "codex": {
     "key": "codex",
@@ -90,7 +92,9 @@
       }
     ],
     "binary_name": "codex-acp",
-    "data_dir_env_var": "CODEX_HOME"
+    "data_dir_env_var": "CODEX_HOME",
+    "runtime_package": "@openai/codex",
+    "runtime_version": "0.145.0"
   },
   "gemini-cli": {
     "key": "gemini-cli",
@@ -145,6 +149,8 @@
       }
     ],
     "binary_name": "gemini",
-    "data_dir_env_var": "HOME"
+    "data_dir_env_var": "HOME",
+    "runtime_package": null,
+    "runtime_version": null
   }
 }
