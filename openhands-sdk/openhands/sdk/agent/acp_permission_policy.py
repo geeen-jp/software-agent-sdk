@@ -25,8 +25,13 @@ _BYPASS_SESSION_MODES: frozenset[str] = frozenset(
     {"bypassPermissions", "agent-full-access", "yolo", "dontAsk"}
 )
 _READ_ONLY_SESSION_MODES: Mapping[str, str] = MappingProxyType(
-    {"claude-code": "default"}
+    {
+        "claude-code": "default",
+        "codex": "read-only",
+    }
 )
+_CODEX_INITIAL_AGENT_MODE_ENV = "INITIAL_AGENT_MODE"
+_CODEX_MODE_CONFIG_OPTION_ID = "mode"
 _PERMISSION_MODE_CONFIG_IDS: frozenset[str] = frozenset(
     {
         "mode",
@@ -76,6 +81,33 @@ def resolve_session_mode_for_policy(
         f"acp_session_mode={explicit_mode!r} is not a verified read_only "
         f"enforcement mode for {provider_key!r}."
     )
+
+
+def initial_agent_mode_env_for_policy(
+    policy: str,
+    *,
+    provider_key: str | None,
+    mode_id: str | None,
+) -> dict[str, str]:
+    """Env that makes Codex advertise the verified read_only mode at session/new.
+
+    pinned codex-acp 1.1.7 applies ``set_session_mode`` in-memory and does not
+    emit ``current_mode_update``. ``INITIAL_AGENT_MODE`` is the adapter's
+    documented initial-mode contract, so session/new can advertise
+    ``current_mode_id=read-only`` for the existing advertise+confirm check.
+    """
+    if (
+        normalize_acp_permission_policy(policy) != "read_only"
+        or provider_key != "codex"
+        or not mode_id
+    ):
+        return {}
+    return {_CODEX_INITIAL_AGENT_MODE_ENV: mode_id}
+
+
+def is_codex_mode_config_option(config_id: object) -> bool:
+    """Return True for Codex ``MODE_CONFIG_ID`` (``mode``), not other mode ids."""
+    return isinstance(config_id, str) and config_id == _CODEX_MODE_CONFIG_OPTION_ID
 
 
 def _normalize_permission_mode_config_id(config_id: object) -> str | None:

@@ -283,6 +283,21 @@ class ACPProviderInfo:
     :attr:`~openhands.sdk.agent.ACPAgent.acp_isolate_data_dir`.
     """
 
+    runtime_package: str | None = None
+    """Exact npm package of the provider's bundled CLI runtime, or ``None``.
+
+    Distinct from the ACP adapter package in :attr:`default_command`. Codex
+    adapter ``codex-acp`` launches ``@openai/codex``; ``agentInfo.version``
+    from ``initialize`` is the adapter, not this runtime.
+    """
+
+    runtime_version: str | None = None
+    """Exact version pin for :attr:`runtime_package`, or ``None``.
+
+    Docker installs this version alongside the adapter so a caret range
+    cannot float. ``None`` when the adapter *is* the runtime (Claude, Gemini).
+    """
+
 
 # ---------------------------------------------------------------------------
 # Curated ``acp_model`` candidate lists for the built-in providers.
@@ -390,8 +405,15 @@ _GEMINI_FILE_SECRETS: tuple[ACPFileSecretSpec, ...] = (
 # claude-agent-acp 0.44+ / codex-acp select the model via a ``model``
 # ``configOptions`` entry (and retain the legacy ``session/set_model``
 # extension); the SDK detects which mechanism each session advertises.
+#
+# Codex adapter 1.1.7 depends on ``@openai/codex ^0.145.0``. The adapter pin
+# is not a Codex runtime pin; Docker installs the exact runtime package and
+# points ``CODEX_PATH`` at that binary. Do not treat ``agentInfo.version`` as
+# ``CODEX_RUNTIME_VERSION``.
 CLAUDE_AGENT_ACP_VERSION = "0.63.0"
 CODEX_ACP_VERSION = "1.1.7"
+CODEX_RUNTIME_PACKAGE = "@openai/codex"
+CODEX_RUNTIME_VERSION = "0.145.0"
 GEMINI_CLI_VERSION = "0.46.0"
 
 
@@ -446,6 +468,8 @@ ACP_PROVIDERS: Mapping[str, ACPProviderInfo] = MappingProxyType(
             file_secrets=_CODEX_FILE_SECRETS,
             binary_name="codex-acp",
             data_dir_env_var="CODEX_HOME",
+            runtime_package=CODEX_RUNTIME_PACKAGE,
+            runtime_version=CODEX_RUNTIME_VERSION,
         ),
         "gemini-cli": ACPProviderInfo(
             key="gemini-cli",
@@ -500,6 +524,86 @@ def default_acp_file_secrets() -> tuple[ACPFileSecretSpec, ...]:
 def get_acp_provider(key: str) -> ACPProviderInfo | None:
     """Return the :class:`ACPProviderInfo` for ``key``, or ``None`` if unknown."""
     return ACP_PROVIDERS.get(key)
+
+
+def extract_acp_package_version(command: Sequence[str]) -> str | None:
+    """Return a trailing ``@version`` pin from a launch command, when present."""
+    for token in command:
+        base = token.rsplit("/", 1)[-1]
+        at = base.rfind("@")
+        if at > 0:
+            version = base[at + 1 :]
+            if version:
+                return version
+    return None
+
+
+def _command_basename(token: str) -> str:
+    base = token.rsplit("/", 1)[-1].lower()
+    at = base.rfind("@")
+    if at > 0:
+        return base[:at]
+    return base
+
+
+def resolve_acp_package_version(
+    command: Sequence[str],
+    *,
+    provider_key: str | None = None,
+) -> str | None:
+    """Adapter package version from a launch ``@version`` token or known binary.
+
+    ``npx .../codex-acp@1.1.7`` carries the pin in the command. The production
+    Docker wrapper is the bare ``codex-acp`` binary, which has no ``@version``
+    token; that path reports the registry adapter pin, not ``agentInfo.version``.
+    """
+    extracted = extract_acp_package_version(command)
+    if extracted:
+        return extracted
+    if provider_key != "codex":
+        return None
+    info = get_acp_provider("codex")
+    if info is None or info.binary_name is None:
+        return None
+    expected = info.binary_name.lower()
+    if any(_command_basename(token) == expected for token in command):
+        return CODEX_ACP_VERSION
+    return None
+
+
+def resolve_acp_runtime_version(provider_key: str | None) -> str | None:
+    """Return the pinned CLI runtime version for ``provider_key``, if any."""
+    if not provider_key:
+        return None
+    info = get_acp_provider(provider_key)
+    if info is None:
+        return None
+    return info.runtime_version
+
+
+def resolve_effective_acp_provider_key(
+    *,
+    acp_server: str | None,
+    command: Sequence[str],
+    agent_name: str | None = None,
+) -> str | None:
+    """Resolve the provider registry key for startup diagnostics.
+
+    Prefers the runtime ``agent_name`` reported by ``initialize`` when it maps to
+    a built-in provider, then the configured ``acp_server`` value, then command
+    detection. Returns ``None`` when no provider can be identified.
+    """
+    if agent_name:
+        by_agent = detect_acp_provider_by_agent_name(agent_name)
+        if by_agent is not None:
+            return by_agent.key
+    if acp_server is not None:
+        if acp_server == "custom" or get_acp_provider(acp_server) is not None:
+            return acp_server
+    by_command = detect_acp_provider_by_command(command)
+    if by_command is not None:
+        return by_command.key
+    return None
 
 
 def detect_acp_provider_by_agent_name(agent_name: str) -> ACPProviderInfo | None:

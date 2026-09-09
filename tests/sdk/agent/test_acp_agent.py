@@ -29,10 +29,13 @@ from acp.schema import (
 
 from openhands.sdk.agent.acp_agent import (
     ACPAgent,
+    ACPAuthSelectionError,
     ACPSessionConfigError,
     ACPSessionModelError,
     SessionConfigOption,
     _apply_session_config_options,
+    _bound_offered_auth_ids,
+    _classify_acp_init_error,
     _config_option_current_value,
     _config_option_values,
     _estimate_cost_from_tokens,
@@ -41,8 +44,10 @@ from openhands.sdk.agent.acp_agent import (
     _maybe_set_session_model,
     _mcp_config_to_acp_servers,
     _OpenHandsACPBridge,
+    _sanitize_acp_diagnostic,
     _select_auth_method,
     _serialize_tool_content,
+    _should_defer_codex_chatgpt_auth,
 )
 from openhands.sdk.agent.base import AgentBase
 from openhands.sdk.context import AgentContext
@@ -1320,6 +1325,60 @@ class TestACPAgentCleanup:
             agent.close()
 
         conn.close.assert_awaited_once()
+
+    def test_close_returns_when_process_wait_ignores_cancellation(self):
+        """close() must return even if process.wait() swallows CancelledError.
+
+        ``run_async(..., timeout=)`` uses ``anyio.fail_after``, which cannot
+        return until the cancelled await actually exits.  A wait() that
+        ignores cancellation previously stalled LocalConversation.close().
+        """
+        from openhands.sdk.utils.async_executor import AsyncExecutor
+
+        class _UncancellableWaitProcess:
+            def __init__(self) -> None:
+                self.returncode: int | None = None
+                self.terminated = False
+                self.killed = False
+
+            def terminate(self) -> None:
+                self.terminated = True
+
+            def kill(self) -> None:
+                self.killed = True
+                self.returncode = -9
+
+            async def wait(self) -> int | None:
+                while True:
+                    try:
+                        await asyncio.sleep(3600)
+                    except asyncio.CancelledError:
+                        continue
+
+        agent = _make_agent()
+        agent._conn = None
+        process = _UncancellableWaitProcess()
+        agent._process = process
+        agent._executor = AsyncExecutor()
+        done = threading.Event()
+
+        def _close() -> None:
+            try:
+                with patch(
+                    "openhands.sdk.agent.acp_agent._ACP_RUNTIME_SHUTDOWN_TIMEOUT",
+                    0.1,
+                ):
+                    agent.close()
+            finally:
+                done.set()
+
+        threading.Thread(target=_close, daemon=True).start()
+        assert done.wait(timeout=2.0), (
+            "close() hung on a process.wait() that ignores cancellation"
+        )
+        assert agent._process is None
+        assert process.terminated is True
+        assert process.killed is True
 
     def test_has_live_acp_session_false_before_init(self):
         agent = _make_agent()
@@ -2839,74 +2898,415 @@ class TestSelectAuthMethod:
         m.id = method_id
         return m
 
+    @staticmethod
+    def _write_codex_auth(path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(
+                {
+                    "auth_mode": "chatgpt",
+                    "tokens": {"refresh_token": "refresh-token"},
+                }
+            ),
+            encoding="utf-8",
+        )
+
     def test_openai_api_key(self):
         methods = [
-            self._make_auth_method("codex-api-key"),
-            self._make_auth_method("openai-api-key"),
+            self._make_auth_method("api-key"),
         ]
         env = {"OPENAI_API_KEY": "sk-test"}
-        assert _select_auth_method(methods, env) == "openai-api-key"
+        assert _select_auth_method(methods, env) == "api-key"
 
-    def test_codex_api_key_preferred_over_openai(self):
-        """CODEX_API_KEY is checked first (appears first in the map)."""
-        methods = [
-            self._make_auth_method("codex-api-key"),
-            self._make_auth_method("openai-api-key"),
-        ]
+    def test_codex_api_key_is_accepted_by_actual_adapter_id(self):
+        methods = [self._make_auth_method("api-key")]
         env = {"CODEX_API_KEY": "key1", "OPENAI_API_KEY": "key2"}
-        assert _select_auth_method(methods, env) == "codex-api-key"
+        assert _select_auth_method(methods, env) == "api-key"
 
-    def test_chatgpt_preferred_over_api_key(self, tmp_path):
+    def test_chat_gpt_preferred_over_api_key(self, tmp_path):
         """ChatGPT subscription login takes precedence over API keys."""
         methods = [
-            self._make_auth_method("chatgpt"),
-            self._make_auth_method("openai-api-key"),
+            self._make_auth_method("chat-gpt"),
+            self._make_auth_method("api-key"),
         ]
         auth_dir = tmp_path / ".codex"
-        auth_dir.mkdir()
-        (auth_dir / "auth.json").write_text("{}", encoding="utf-8")
+        self._write_codex_auth(auth_dir / "auth.json")
 
         env = {"OPENAI_API_KEY": "sk-test"}
         with patch("openhands.sdk.agent.acp_agent.Path.home", return_value=tmp_path):
-            assert _select_auth_method(methods, env) == "chatgpt"
+            assert _select_auth_method(methods, env) == "chat-gpt"
 
-    def test_api_key_fallback_when_no_chatgpt_file(self, tmp_path):
-        """Falls back to API key when chatgpt is offered but auth file absent."""
+    def test_api_key_is_used_when_subscription_file_is_absent(self, tmp_path):
+        """An explicitly supplied API key remains a separate auth choice."""
         methods = [
-            self._make_auth_method("chatgpt"),
-            self._make_auth_method("openai-api-key"),
+            self._make_auth_method("chat-gpt"),
+            self._make_auth_method("api-key"),
         ]
         env = {"OPENAI_API_KEY": "sk-test"}
         with patch("openhands.sdk.agent.acp_agent.Path.home", return_value=tmp_path):
-            assert _select_auth_method(methods, env) == "openai-api-key"
+            assert _select_auth_method(methods, env) == "api-key"
 
     def test_no_matching_credentials(self, tmp_path):
         methods = [
-            self._make_auth_method("chatgpt"),
-            self._make_auth_method("openai-api-key"),
+            self._make_auth_method("chat-gpt"),
+            self._make_auth_method("api-key"),
         ]
         env = {"UNRELATED": "value"}
         with patch("openhands.sdk.agent.acp_agent.Path.home", return_value=tmp_path):
             assert _select_auth_method(methods, env) is None
 
     def test_chatgpt_auth_file(self, tmp_path):
-        methods = [self._make_auth_method("chatgpt")]
+        methods = [self._make_auth_method("chat-gpt")]
         auth_dir = tmp_path / ".codex"
-        auth_dir.mkdir()
-        (auth_dir / "auth.json").write_text("{}", encoding="utf-8")
+        self._write_codex_auth(auth_dir / "auth.json")
 
         with patch("openhands.sdk.agent.acp_agent.Path.home", return_value=tmp_path):
-            assert _select_auth_method(methods, {}) == "chatgpt"
+            assert _select_auth_method(methods, {}) == "chat-gpt"
+
+    def test_isolated_codex_home_is_the_only_subscription_source(self, tmp_path):
+        methods = [self._make_auth_method("chat-gpt")]
+        self._write_codex_auth(tmp_path / ".codex" / "auth.json")
+        isolated_home = tmp_path / "isolated-codex"
+        isolated_home.mkdir()
+        env = {"CODEX_HOME": str(isolated_home)}
+
+        with patch("openhands.sdk.agent.acp_agent.Path.home", return_value=tmp_path):
+            assert _select_auth_method(methods, env) is None
+
+        self._write_codex_auth(isolated_home / "auth.json")
+        assert _select_auth_method(methods, env) == "chat-gpt"
+
+    @pytest.mark.parametrize("value", ["", "   ", "\t\n"])
+    def test_empty_api_key_is_absent(self, value):
+        methods = [self._make_auth_method("api-key")]
+        assert _select_auth_method(methods, {"OPENAI_API_KEY": value}) is None
 
     def test_empty_auth_methods(self):
         assert _select_auth_method([], {}) is None
 
     def test_method_not_in_server_list(self, tmp_path):
         """Even if env var is set, method must be offered by server."""
-        methods = [self._make_auth_method("chatgpt")]
+        methods = [self._make_auth_method("chat-gpt")]
         env = {"OPENAI_API_KEY": "sk-test"}
         with patch("openhands.sdk.agent.acp_agent.Path.home", return_value=tmp_path):
             assert _select_auth_method(methods, env) is None
+
+    def test_unknown_adapter_auth_id_is_not_guessed(self):
+        methods = [self._make_auth_method("legacy-chatgpt")]
+        assert _select_auth_method(methods, {"OPENAI_API_KEY": "sk-test"}) is None
+
+    @pytest.mark.parametrize(
+        ("is_codex", "method_id", "has_api_key", "auth_file", "expected"),
+        [
+            (True, "chat-gpt", False, True, True),
+            (True, "chat-gpt", True, True, False),
+            (False, "chat-gpt", False, True, False),
+            (True, "api-key", False, True, False),
+            (True, "chat-gpt", False, False, False),
+        ],
+    )
+    def test_codex_chatgpt_auth_defer_condition(
+        self,
+        tmp_path,
+        is_codex,
+        method_id,
+        has_api_key,
+        auth_file,
+        expected,
+    ):
+        auth_path = tmp_path / ".codex" / "auth.json"
+        if auth_file:
+            self._write_codex_auth(auth_path)
+        with patch("openhands.sdk.agent.acp_agent.Path.home", return_value=tmp_path):
+            assert (
+                _should_defer_codex_chatgpt_auth(
+                    is_codex=is_codex,
+                    method_id=method_id,
+                    env={"OPENAI_API_KEY": "sk-test"} if has_api_key else {},
+                    has_codex_api_key=has_api_key,
+                )
+                is expected
+            )
+
+    @pytest.mark.parametrize(
+        "contents",
+        [
+            "not-json",
+            json.dumps({"auth_mode": "chatgpt", "tokens": {}}),
+        ],
+    )
+    def test_invalid_codex_chatgpt_auth_does_not_defer(self, tmp_path, contents):
+        auth_path = tmp_path / ".codex" / "auth.json"
+        auth_path.parent.mkdir(parents=True)
+        auth_path.write_text(contents, encoding="utf-8")
+
+        with patch("openhands.sdk.agent.acp_agent.Path.home", return_value=tmp_path):
+            assert not _should_defer_codex_chatgpt_auth(
+                is_codex=True,
+                method_id="chat-gpt",
+                env={},
+                has_codex_api_key=False,
+            )
+
+    def test_diagnostic_redacts_credentials_and_is_bounded(self):
+        value = 'Bearer bearer-secret access_token="access-secret" ' + "x" * 5_000
+        sanitized = _sanitize_acp_diagnostic(value)
+        assert "bearer-secret" not in sanitized
+        assert "access-secret" not in sanitized
+        assert len(sanitized) <= 4_000
+
+    def test_missing_isolated_codex_subscription_fails_before_session(self, tmp_path):
+        agent = ACPAgent(
+            acp_command=["codex-acp"],
+            acp_server="codex",
+            acp_isolate_data_dir=True,
+        )
+        state = _make_state(tmp_path)
+        conn = TestACPSessionIdPersistence._make_conn()
+
+        with (
+            TestACPSessionIdPersistence._mocked_acp_runtime(agent, conn),
+            pytest.raises(ACPAuthSelectionError, match="ChatGPT subscription"),
+        ):
+            agent._start_acp_server(state)
+        conn.new_session.assert_not_awaited()
+
+    def test_codex_chatgpt_file_auth_defers_explicit_auth(self, tmp_path, caplog):
+        agent = ACPAgent(
+            acp_command=["codex-acp"],
+            acp_server="codex",
+            acp_isolate_data_dir=False,
+        )
+        self._write_codex_auth(tmp_path / ".codex" / "auth.json")
+        state = _make_state(tmp_path)
+        conn = TestACPSessionIdPersistence._make_conn()
+        conn.initialize.return_value.agent_info.name = "codex-acp"
+        conn.initialize.return_value.auth_methods = [self._make_auth_method("chat-gpt")]
+
+        with (
+            caplog.at_level("INFO", logger="openhands.sdk.agent.acp_agent"),
+            patch("openhands.sdk.agent.acp_agent.Path.home", return_value=tmp_path),
+            TestACPSessionIdPersistence._mocked_acp_runtime(agent, conn),
+        ):
+            agent._start_acp_server(state)
+
+        conn.authenticate.assert_not_awaited()
+        conn.new_session.assert_awaited_once()
+        assert any(
+            "Deferring ACP authenticate RPC" in record.getMessage()
+            for record in caplog.records
+        )
+
+    def test_unmatched_non_codex_auth_method_still_reaches_new_session(
+        self, tmp_path, caplog
+    ):
+        """Claude out-of-band login is not in the Codex auth map; warn and continue."""
+        agent = ACPAgent(
+            acp_command=["claude-agent-acp"],
+            acp_server="claude-code",
+        )
+        state = _make_state(tmp_path)
+        conn = TestACPSessionIdPersistence._make_conn()
+        conn.initialize.return_value.auth_methods = [
+            self._make_auth_method("claude-login")
+        ]
+
+        with (
+            caplog.at_level("WARNING", logger="openhands.sdk.agent.acp_agent"),
+            TestACPSessionIdPersistence._mocked_acp_runtime(agent, conn),
+        ):
+            agent._start_acp_server(state)
+
+        conn.authenticate.assert_not_awaited()
+        conn.new_session.assert_awaited_once()
+        assert any(
+            "no matching env var is set" in record.getMessage()
+            for record in caplog.records
+        )
+
+    def test_codex_unknown_advertised_auth_ids_fail_closed_with_api_key(self, tmp_path):
+        agent = ACPAgent(
+            acp_command=["codex-acp"],
+            acp_server="codex",
+            acp_env={"OPENAI_API_KEY": "sk-test"},
+        )
+        state = _make_state(tmp_path)
+        conn = TestACPSessionIdPersistence._make_conn()
+        conn.initialize.return_value.agent_info.name = "codex-acp"
+        conn.initialize.return_value.auth_methods = [
+            self._make_auth_method("legacy-chatgpt")
+        ]
+
+        with (
+            TestACPSessionIdPersistence._mocked_acp_runtime(agent, conn),
+            pytest.raises(
+                ACPAuthSelectionError, match="no exact supported credential match"
+            ),
+        ):
+            agent._start_acp_server(state)
+        conn.authenticate.assert_not_awaited()
+        conn.new_session.assert_not_awaited()
+
+    def test_codex_empty_auth_methods_with_api_key_reaches_new_session(self, tmp_path):
+        agent = ACPAgent(
+            acp_command=["codex-acp"],
+            acp_server="codex",
+            acp_env={"OPENAI_API_KEY": "sk-test"},
+            acp_isolate_data_dir=False,
+        )
+        state = _make_state(tmp_path)
+        conn = TestACPSessionIdPersistence._make_conn()
+        conn.initialize.return_value.agent_info.name = "codex-acp"
+        conn.initialize.return_value.auth_methods = []
+
+        with TestACPSessionIdPersistence._mocked_acp_runtime(agent, conn):
+            agent._start_acp_server(state)
+
+        conn.authenticate.assert_not_awaited()
+        conn.new_session.assert_awaited_once()
+
+    def test_unmatched_gemini_oauth_auth_method_still_reaches_new_session(
+        self, tmp_path, caplog
+    ):
+        agent = ACPAgent(
+            acp_command=["gemini", "--acp"],
+            acp_server="gemini-cli",
+        )
+        state = _make_state(tmp_path)
+        conn = TestACPSessionIdPersistence._make_conn()
+        conn.initialize.return_value.agent_info.name = "gemini-cli"
+        conn.initialize.return_value.auth_methods = [
+            self._make_auth_method("oauth-personal")
+        ]
+
+        with (
+            caplog.at_level("WARNING", logger="openhands.sdk.agent.acp_agent"),
+            TestACPSessionIdPersistence._mocked_acp_runtime(agent, conn),
+        ):
+            agent._start_acp_server(state)
+
+        conn.authenticate.assert_not_awaited()
+        conn.new_session.assert_awaited_once()
+        assert any(
+            "no matching env var is set" in record.getMessage()
+            for record in caplog.records
+        )
+
+    def test_offered_auth_ids_are_bounded(self):
+        methods = [
+            self._make_auth_method("id-" + str(i) + ("x" * 80)) for i in range(40)
+        ]
+        bounded = _bound_offered_auth_ids(methods)
+        assert len(bounded) == 16
+        assert all(len(item) <= 64 for item in bounded)
+
+
+def test_classify_acp_init_error_maps_auth_selection_failure():
+    assert _classify_acp_init_error(ACPAuthSelectionError("missing")) == "ACPAuthError"
+
+
+def test_startup_failure_logs_provider_and_runtime_identity(tmp_path, caplog):
+    agent = ACPAgent(
+        acp_command=["npx", "-y", "@agentclientprotocol/codex-acp@1.1.7"],
+        acp_server="codex",
+        acp_isolate_data_dir=True,
+    )
+    state = _make_state(tmp_path)
+    conn = TestACPSessionIdPersistence._make_conn()
+    conn.initialize.return_value.agent_info.name = "codex-acp"
+    conn.initialize.return_value.agent_info.version = "1.1.7-adapter"
+    conn.initialize.return_value.auth_methods = [
+        TestSelectAuthMethod._make_auth_method("chat-gpt")
+    ]
+
+    with (
+        caplog.at_level("ERROR", logger="openhands.sdk.agent.acp_agent"),
+        TestACPSessionIdPersistence._mocked_acp_runtime(agent, conn),
+        pytest.raises(ACPAuthSelectionError),
+    ):
+        agent.init_state(state, on_event=lambda _: None)
+
+    record = next(r for r in caplog.records if r.getMessage() == "ACP startup failed")
+    assert record.provider_key == "codex"
+    assert record.package_version == "1.1.7"
+    assert record.adapter_name == "codex-acp"
+    assert record.adapter_version == "1.1.7-adapter"
+    assert record.runtime_version == "0.145.0"
+    assert record.runtime_version != record.adapter_version
+    assert record.rpc == "authenticate"
+    assert record.stage == "select"
+    assert record.phase == "authenticate"
+
+
+def test_startup_failure_before_initialize_reports_command_provider(tmp_path, caplog):
+    agent = ACPAgent(
+        acp_command=["npx", "-y", "@agentclientprotocol/codex-acp@9.9.9"],
+        acp_server="codex",
+    )
+    state = _make_state(tmp_path)
+
+    with (
+        caplog.at_level("ERROR", logger="openhands.sdk.agent.acp_agent"),
+        patch(
+            "openhands.sdk.agent.acp_agent.asyncio.create_subprocess_exec",
+            side_effect=FileNotFoundError("missing"),
+        ),
+        pytest.raises(FileNotFoundError),
+    ):
+        agent.init_state(state, on_event=lambda _: None)
+
+    record = next(r for r in caplog.records if r.getMessage() == "ACP startup failed")
+    assert record.provider_key == "codex"
+    assert record.package_version == "9.9.9"
+    assert record.adapter_name is None
+    assert record.adapter_version is None
+    assert record.runtime_version == "0.145.0"
+    assert record.rpc is None
+    assert record.stage == "spawn"
+    assert record.phase == "spawn"
+
+
+def test_startup_failure_includes_child_stderr_exit_and_rpc(tmp_path, caplog):
+    agent = ACPAgent(
+        acp_command=["codex-acp"],
+        acp_server="codex",
+    )
+    state = _make_state(tmp_path)
+    conn = TestACPSessionIdPersistence._make_conn()
+    conn.initialize.side_effect = RuntimeError("handshake failed")
+
+    stderr_chunks = [b"child stderr api_key=sk-live-secret\n", b""]
+
+    async def _readline():
+        return stderr_chunks.pop(0) if stderr_chunks else b""
+
+    process = MagicMock()
+    process.stdin = MagicMock()
+    process.stdout = MagicMock()
+    process.stdout.readline = AsyncMock(return_value=b"")
+    process.wait = AsyncMock(return_value=17)
+    process.returncode = 17
+    process.stderr = MagicMock()
+    process.stderr.readline = _readline
+
+    captured: list[Any] = []
+
+    with (
+        caplog.at_level("ERROR", logger="openhands.sdk.agent.acp_agent"),
+        TestACPSessionIdPersistence._mocked_acp_runtime(agent, conn, process=process),
+        pytest.raises(RuntimeError, match="handshake failed"),
+    ):
+        agent.init_state(state, on_event=captured.append)
+
+    record = next(r for r in caplog.records if r.getMessage() == "ACP startup failed")
+    assert record.rpc == "initialize"
+    assert record.stage == "handshake"
+    assert record.exit_code == 17
+    assert "sk-live-secret" not in record.stderr_tail
+    assert "<redacted>" in record.stderr_tail
+    error_event = next(e for e in captured if isinstance(e, ConversationErrorEvent))
+    assert "rpc=initialize" in error_event.detail
+    assert "exit_code=17" in error_event.detail
 
 
 # ---------------------------------------------------------------------------
@@ -3694,14 +4094,14 @@ class TestACPSessionIdPersistence:
 
     @staticmethod
     @contextmanager
-    def _mocked_acp_runtime(agent, conn) -> Iterator[None]:
+    def _mocked_acp_runtime(agent, conn, process=None) -> Iterator[None]:
         """Run ACP transport mocks on a real AsyncExecutor, then always close it."""
         from openhands.sdk.utils.async_executor import AsyncExecutor
 
         executor = AsyncExecutor()
         agent._executor = executor
         try:
-            with TestACPSessionIdPersistence._transport_patches(conn):
+            with TestACPSessionIdPersistence._transport_patches(conn, process=process):
                 yield
         finally:
             executor.close(timeout=1.0)
