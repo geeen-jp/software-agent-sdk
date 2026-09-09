@@ -49,6 +49,7 @@ from openhands.sdk.agent.acp_agent import (
     _select_auth_method,
     _serialize_tool_content,
     _should_defer_codex_chatgpt_auth,
+    _surfaced_current_model_id,
 )
 from openhands.sdk.agent.base import AgentBase
 from openhands.sdk.context import AgentContext
@@ -4523,6 +4524,66 @@ class TestACPModelStatePersistence:
         assert agent.llm.model == "gpt-5.5/medium"
         assert state.agent_state["acp_current_model_id"] == "gpt-5.5/medium"
 
+    def test_fresh_init_refreshes_current_model_id_after_reasoning_effort(
+        self, tmp_path
+    ):
+        from acp.schema import SetSessionConfigOptionResponse
+
+        agent = _make_agent(
+            acp_model="gpt-5.6-sol",
+            acp_config_options={"reasoning_effort": "high"},
+        )
+        state = _make_state(tmp_path)
+        model_options = [
+            _config_option("model", "old-model", ["old-model", "gpt-5.6-sol"]),
+            _config_option(
+                "reasoning_effort",
+                "low",
+                ["low", "medium", "high", "xhigh"],
+            ),
+        ]
+        conn = TestACPSessionIdPersistence._make_conn(new_session_id="fresh-sess")
+        conn.initialize.return_value.agent_info.name = "codex-acp"
+        conn.initialize.return_value.auth_methods = []
+        new_response = NewSessionResponse(
+            session_id="fresh-sess",
+            config_options=list(model_options),
+        )
+        conn.new_session = AsyncMock(return_value=new_response)
+
+        async def _set_config_option(
+            *, config_id: str, session_id: str, value: str | bool, **kwargs: Any
+        ) -> SetSessionConfigOptionResponse:
+            nonlocal model_options
+            updated: list[SessionConfigOption] = []
+            for option in model_options:
+                if option.id == config_id:
+                    updated.append(_config_option_with_value(option, value))
+                else:
+                    updated.append(option)
+            model_options = updated
+            return SetSessionConfigOptionResponse(config_options=list(model_options))
+
+        conn.set_config_option = AsyncMock(side_effect=_set_config_option)
+        conn.set_session_model = AsyncMock(
+            side_effect=ACPRequestError(code=-32601, message="method not found")
+        )
+
+        with TestACPSessionIdPersistence._mocked_acp_runtime(agent, conn):
+            agent.init_state(state, on_event=lambda _: None)
+
+        assert [call.kwargs for call in conn.set_config_option.await_args_list] == [
+            {"config_id": "model", "session_id": "fresh-sess", "value": "gpt-5.6-sol"},
+            {
+                "config_id": "reasoning_effort",
+                "session_id": "fresh-sess",
+                "value": "high",
+            },
+        ]
+        assert agent.current_model_id == "gpt-5.6-sol/high"
+        assert agent.llm.model == "gpt-5.6-sol/high"
+        assert state.agent_state["acp_current_model_id"] == "gpt-5.6-sol/high"
+
     def test_resume_rejected_override_fails_closed_before_prompt(self, tmp_path):
         agent = _make_agent(acp_model="model-x")
         state = _make_state(tmp_path)
@@ -4907,6 +4968,21 @@ class TestConfigOptionCurrentValue:
             "fast": "true",
             "effort": "low",
         }
+
+
+def test_surfaced_current_model_id_overlays_codex_effort_suffix():
+    options = [
+        _config_option("reasoning_effort", "high", ["low", "medium", "high", "xhigh"]),
+    ]
+    assert (
+        _surfaced_current_model_id("gpt-5.6-sol/low", "codex-acp", options)
+        == "gpt-5.6-sol/high"
+    )
+
+
+def test_surfaced_current_model_id_leaves_non_codex_ids_unchanged():
+    options = [_config_option("effort", "medium", ["low", "medium", "high"])]
+    assert _surfaced_current_model_id("grok-4.6", "cursor-agent", options) == "grok-4.6"
 
 
 def _config_option_with_value(
