@@ -3756,12 +3756,14 @@ class TestSetACPModel:
         conn = MagicMock()
         model_options = [
             _config_option(
-                "model", "old-model", ["old-model", "gpt-5.5", "gpt-5.5/high"]
+                "model",
+                "old-model",
+                ["old-model", "gpt-5.5", "gpt-5.5/high", "gpt-5.6-luna"],
             ),
             _config_option(
                 "reasoning_effort",
                 "medium",
-                ["low", "medium", "high", "xhigh"],
+                ["none", "low", "medium", "high", "xhigh", "max"],
             ),
         ]
 
@@ -3847,6 +3849,21 @@ class TestSetACPModel:
             ]
         )
         assert agent.current_model_id == "gpt-5.5/high"
+
+    def test_switches_codex_via_config_option_splits_max_reasoning_effort(self):
+        agent = self._wire(_make_agent(), "codex-acp", via_config_option=True)
+        agent.set_acp_model("gpt-5.6-luna/max")
+        _agent_conn(agent).set_config_option.assert_has_awaits(
+            [
+                call(config_id="model", value="gpt-5.6-luna", session_id="sess-1"),
+                call(
+                    config_id="reasoning_effort",
+                    value="max",
+                    session_id="sess-1",
+                ),
+            ]
+        )
+        assert agent.current_model_id == "gpt-5.6-luna/max"
 
     def test_switch_method_not_found_raises_no_fallback(self):
         agent = self._wire(_make_agent(), "codex-acp", via_config_option=False)
@@ -4972,11 +4989,29 @@ class TestConfigOptionCurrentValue:
 
 def test_surfaced_current_model_id_overlays_codex_effort_suffix():
     options = [
-        _config_option("reasoning_effort", "high", ["low", "medium", "high", "xhigh"]),
+        _config_option(
+            "reasoning_effort",
+            "high",
+            ["none", "low", "medium", "high", "xhigh", "max"],
+        ),
     ]
     assert (
         _surfaced_current_model_id("gpt-5.6-sol/low", "codex-acp", options)
         == "gpt-5.6-sol/high"
+    )
+
+
+def test_surfaced_current_model_id_overlays_codex_max_effort():
+    options = [
+        _config_option(
+            "reasoning_effort",
+            "max",
+            ["none", "low", "medium", "high", "xhigh", "max"],
+        ),
+    ]
+    assert (
+        _surfaced_current_model_id("gpt-5.6-luna/high", "codex-acp", options)
+        == "gpt-5.6-luna/max"
     )
 
 

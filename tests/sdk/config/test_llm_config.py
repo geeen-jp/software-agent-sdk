@@ -184,6 +184,8 @@ def test_llm_config_post_init_reasoning_effort_default():
     assert config.reasoning_effort == "low"
     config = LLM(model="gpt-4o-mini", reasoning_effort="xhigh", usage_id="test-llm")
     assert config.reasoning_effort == "xhigh"
+    config = LLM(model="gpt-5.6-luna", reasoning_effort="max", usage_id="test-llm")
+    assert config.reasoning_effort == "max"
 
 
 def test_llm_config_post_init_azure_api_version():
