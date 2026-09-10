@@ -94,4 +94,4 @@ def test_reasoning_effort_preserves_legacy_json_schema_enum():
         if isinstance(branch, dict) and "enum" in branch
     )
 
-    assert enum_values == ["low", "medium", "high", "xhigh", "none"]
+    assert enum_values == ["low", "medium", "high", "xhigh", "none", "max"]

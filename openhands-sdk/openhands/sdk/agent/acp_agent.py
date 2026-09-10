@@ -460,7 +460,7 @@ def _classify_acp_init_error(exc: BaseException) -> str:
 # capability + ``session/set_model`` (gemini-cli, older codex/claude).
 _MODEL_CONFIG_OPTION_ID = "model"
 _CODEX_REASONING_EFFORTS: Final[frozenset[str]] = frozenset(
-    {"low", "medium", "high", "xhigh"}
+    {"none", "low", "medium", "high", "xhigh", "max"}
 )
 
 

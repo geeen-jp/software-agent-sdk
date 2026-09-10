@@ -546,7 +546,9 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
         json_schema_extra=field_meta(),
     )
     reasoning_effort: (
-        Literal["low", "medium", "high", "xhigh", "none"] | SkipJsonSchema[str] | None
+        Literal["low", "medium", "high", "xhigh", "none", "max"]
+        | SkipJsonSchema[str]
+        | None
     ) = Field(
         default="high",
         description=(
