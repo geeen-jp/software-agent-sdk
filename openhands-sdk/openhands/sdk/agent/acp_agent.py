@@ -511,6 +511,26 @@ _META_MODEL_ID_KEYS: Final[tuple[str, ...]] = (
 )
 
 
+def _codex_reasoning_effort_from_options(
+    options: list[SessionConfigOption] | None,
+) -> str | None:
+    for raw in _iter_session_config_options(options):
+        effort_opt = getattr(raw, "root", raw)
+        if getattr(effort_opt, "id", None) != "reasoning_effort":
+            continue
+        effort = getattr(effort_opt, "current_value", None)
+        if isinstance(effort, str) and effort in _CODEX_REASONING_EFFORTS:
+            return effort
+    return None
+
+
+def _strip_codex_effort_suffix(model_id: str) -> str:
+    base, sep, effort = model_id.rpartition("/")
+    if sep and base and effort in _CODEX_REASONING_EFFORTS:
+        return base
+    return model_id
+
+
 def _effective_model_from_config_options(
     options: list[SessionConfigOption] | None,
     agent_name: str | None,
@@ -524,14 +544,30 @@ def _effective_model_from_config_options(
         return None
     provider = detect_acp_provider_by_agent_name(agent_name or "")
     if provider is not None and provider.key == "codex":
-        for raw in _iter_session_config_options(options):
-            effort_opt = getattr(raw, "root", raw)
-            if getattr(effort_opt, "id", None) != "reasoning_effort":
-                continue
-            effort = getattr(effort_opt, "current_value", None)
-            if isinstance(effort, str) and effort in _CODEX_REASONING_EFFORTS:
-                return f"{base}/{effort}"
+        effort = _codex_reasoning_effort_from_options(options)
+        if effort is not None:
+            return f"{base}/{effort}"
     return base
+
+
+def _surfaced_current_model_id(
+    current_model_id: str | None,
+    agent_name: str | None,
+    options: list[SessionConfigOption] | None,
+) -> str | None:
+    """Refresh the published model id from verified post-config session state."""
+    reconstructed = _effective_model_from_config_options(options, agent_name)
+    if reconstructed is not None:
+        return reconstructed
+    if current_model_id is None or not options:
+        return current_model_id
+    provider = detect_acp_provider_by_agent_name(agent_name or "")
+    if provider is None or provider.key != "codex":
+        return current_model_id
+    effort = _codex_reasoning_effort_from_options(options)
+    if effort is None:
+        return current_model_id
+    return f"{_strip_codex_effort_suffix(current_model_id)}/{effort}"
 
 
 def _requested_model_matches_observed(
@@ -1096,7 +1132,7 @@ async def _apply_session_config_options(
     initial_options: list[SessionConfigOption] | None,
     *,
     required_session_mode: str | None = None,
-) -> None:
+) -> list[SessionConfigOption] | None:
     """Apply *requested* session config options and verify the observed state.
 
     Runs once per session — after ``new_session`` and after a successful
@@ -1124,6 +1160,10 @@ async def _apply_session_config_options(
             ``read_only`` session mode.
         ValueError: if a requested option would select a permission/session
             mode under ``read_only``.
+
+    Returns:
+        The verified final option state after applying *requested*, or
+        ``None`` when no options were requested.
     """
     assert_config_options_compatible_with_permission_policy(
         client.permission_policy,
@@ -1138,7 +1178,7 @@ async def _apply_session_config_options(
             session_id=session_id,
             config_options=initial_options,
         )
-        return
+        return None
 
     mode_generation_before = client.get_current_mode_generation(session_id)
     require_fresh_mode = (
@@ -1242,6 +1282,7 @@ async def _apply_session_config_options(
         mode_generation_before=mode_generation_before,
         require_fresh_mode=require_fresh_mode,
     )
+    return list(final_state.values())
 
 
 def _extract_token_usage(
@@ -3379,7 +3420,7 @@ class ACPAgent(AgentBase):
                 self._mark_startup(
                     "config", rpc="session/set_config_option", stage="set_config"
                 )
-                await _apply_session_config_options(
+                final_options = await _apply_session_config_options(
                     conn,
                     client,
                     agent_name,
@@ -3387,6 +3428,9 @@ class ACPAgent(AgentBase):
                     self.acp_config_options,
                     config_options,
                     required_session_mode=mode_id,
+                )
+                current_model_id = _surfaced_current_model_id(
+                    current_model_id, agent_name, final_options
                 )
 
                 self._mark_startup("ready", rpc=None, stage="ready")
