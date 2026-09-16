@@ -619,6 +619,41 @@ class FileSecretsStore(SecretsStore):
                 versions[name] = secrets_module.token_urlsafe(24)
             self._save_with_versions(Secrets(custom_secrets=new_secrets), versions)
 
+    def set_secret_if_absent(
+        self, name: str, value: str, description: str | None = None
+    ) -> bool:
+        """Set a secret only when the named entry does not already exist.
+
+        This is used for one-time credential bootstrap.  The check and write
+        share the store lock so two conversations cannot replace a newer
+        canonical credential with the same stale host snapshot.
+        """
+        with _file_lock(self._lock_path):
+            secrets = self.load()
+            if secrets is None:
+                if self._path.exists():
+                    raise RuntimeError(
+                        f"Cannot load secrets from {self._path}. "
+                        "Refusing to overwrite existing data."
+                    )
+                secrets = Secrets()
+
+            current = secrets.custom_secrets.get(name)
+            if current is not None and current.secret is not None:
+                return False
+
+            new_secrets = dict(secrets.custom_secrets)
+            new_secrets[name] = CustomSecret(
+                name=name,
+                secret=SecretStr(value),
+                description=description,
+            )
+            versions = self._load_versions()
+            if name in versions:
+                versions[name] = secrets_module.token_urlsafe(24)
+            self._save_with_versions(Secrets(custom_secrets=new_secrets), versions)
+            return True
+
     def delete_secret(self, name: str) -> bool:
         """Delete a secret with file locking. Returns True if it existed.
 

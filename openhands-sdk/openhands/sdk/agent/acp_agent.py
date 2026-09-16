@@ -60,6 +60,7 @@ from acp.transports import default_environment
 from pydantic import Field, PrivateAttr, SecretStr, field_serializer, field_validator
 
 from openhands.sdk.agent.acp_claude_auth import (
+    CLAUDE_CONFIG_DIR_ENV,
     CLAUDE_CREDENTIALS_FILENAME,
     CLAUDE_CREDENTIALS_SECRET_NAME,
     CLAUDE_OAUTH_ENV_NAMES,
@@ -2476,37 +2477,83 @@ class ACPAgent(AgentBase):
         env_var = provider.data_dir_env_var
         oauth_file_channel = False
         if provider.key == "claude-code":
-            data_dir = self._ensure_claude_config_runtime_dir()
-            with self._file_credential_lock:
-                replace_existing = (
-                    CLAUDE_CREDENTIALS_SECRET_NAME
-                    in self._replace_file_credentials_on_next_materialisation
-                )
-            try:
-                result = seed_claude_oauth_credentials(
-                    data_dir,
-                    state.secret_registry,
-                    replace_existing=replace_existing,
-                    required=self.acp_permission_policy == "read_only",
-                    last_source_digest=self._claude_oauth_source_digest,
-                    explicit_credentials=self._explicit_claude_oauth_credentials(state),
-                )
-            except BaseException:
-                self._cleanup_claude_config_runtime(discard=True)
-                raise
-            self._claude_oauth_source_digest = result.source_digest
-            if replace_existing:
+            if self._file_credential_bindings.get(CLAUDE_CREDENTIALS_SECRET_NAME):
+                oauth_file_channel = self._materialise_bound_claude_oauth(state, env)
+                data_dir = Path(env[CLAUDE_CONFIG_DIR_ENV])
+            else:
+                data_dir = self._ensure_claude_config_runtime_dir()
                 with self._file_credential_lock:
-                    self._replace_file_credentials_on_next_materialisation.discard(
+                    replace_existing = (
                         CLAUDE_CREDENTIALS_SECRET_NAME
+                        in self._replace_file_credentials_on_next_materialisation
                     )
-            oauth_file_channel = result.seeded
+                try:
+                    result = seed_claude_oauth_credentials(
+                        data_dir,
+                        state.secret_registry,
+                        replace_existing=replace_existing,
+                        required=self.acp_permission_policy == "read_only",
+                        last_source_digest=self._claude_oauth_source_digest,
+                        explicit_credentials=self._explicit_claude_oauth_credentials(
+                            state
+                        ),
+                    )
+                except BaseException:
+                    self._cleanup_claude_config_runtime(discard=True)
+                    raise
+                self._claude_oauth_source_digest = result.source_digest
+                if replace_existing:
+                    with self._file_credential_lock:
+                        self._replace_file_credentials_on_next_materialisation.discard(
+                            CLAUDE_CREDENTIALS_SECRET_NAME
+                        )
+                oauth_file_channel = result.seeded
             self._remove_durable_claude_oauth_credentials(state)
         else:
             data_dir = self._acp_file_secret_dir(state, provider.key)
             data_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         env[env_var] = str(data_dir)
         return oauth_file_channel
+
+    def _materialise_bound_claude_oauth(
+        self, state: ConversationState, env: dict[str, str]
+    ) -> bool:
+        """Materialise the canonical Claude OAuth binding into a private dir."""
+        binding = self._file_credential_bindings.get(CLAUDE_CREDENTIALS_SECRET_NAME)
+        if binding is None:
+            return False
+        assert self._executor is not None
+        lifecycle = create_file_credential_lifecycle(
+            CLAUDE_CREDENTIALS_SECRET_NAME,
+            binding,
+            self._executor.run_async,
+        )
+        if lifecycle is None:
+            raise CredentialSyncError("Claude OAuth credential binding is unsupported.")
+        with self._file_credential_lock:
+            if self._closed:
+                raise CredentialSyncError("Credential binding is closed.")
+        try:
+            lifecycle.materialize(state.secret_registry, env)
+            self._remove_durable_claude_oauth_credentials(state)
+        except BaseException:
+            lifecycle.discard()
+            env.pop(CLAUDE_CONFIG_DIR_ENV, None)
+            raise
+        with self._file_credential_lock:
+            closed = self._closed
+            if not closed:
+                self._file_credential_lifecycles[CLAUDE_CREDENTIALS_SECRET_NAME] = (
+                    lifecycle
+                )
+                self._replace_file_credentials_on_next_materialisation.discard(
+                    CLAUDE_CREDENTIALS_SECRET_NAME
+                )
+        if closed:
+            lifecycle.discard()
+            env.pop(CLAUDE_CONFIG_DIR_ENV, None)
+            raise CredentialSyncError("Credential binding is closed.")
+        return True
 
     def _materialise_file_secrets(
         self, state: ConversationState, env: dict[str, str]
@@ -2991,6 +3038,11 @@ class ACPAgent(AgentBase):
         claude_oauth_file_channel = False
         if self.acp_isolate_data_dir:
             claude_oauth_file_channel = self._isolate_acp_data_dir(state, env)
+        elif (
+            command_is_claude
+            and CLAUDE_CREDENTIALS_SECRET_NAME in self._file_credential_bindings
+        ):
+            claude_oauth_file_channel = self._materialise_bound_claude_oauth(state, env)
         self._materialise_file_secrets(state, env)
         # Inject secrets from agent_context for keys not already present.
         if self.agent_context and self.agent_context.secrets:

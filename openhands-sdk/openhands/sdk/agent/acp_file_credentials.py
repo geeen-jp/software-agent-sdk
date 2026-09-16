@@ -103,6 +103,7 @@ def is_valid_codex_auth(value: object) -> bool:
 
 class _CodexAuthLifecycle:
     secret_name = CODEX_AUTH_SECRET_NAME
+    credential_label = "Codex"
 
     def __init__(
         self,
@@ -169,7 +170,7 @@ class _CodexAuthLifecycle:
             value = self._read_current()
             if value is None:
                 raise _TransientCredentialReadError(
-                    "Codex credentials could not be read safely."
+                    f"{self.credential_label} credentials could not be read safely."
                 )
             self._track_if_changed(value)
             self._raise_sticky_error()
@@ -189,7 +190,7 @@ class _CodexAuthLifecycle:
                 value = self._read_stable(attempts=3)
                 if value is None:
                     raise _TransientCredentialReadError(
-                        "Codex credentials could not be read safely."
+                        f"{self.credential_label} credentials could not be read safely."
                     )
                 self._sync_value(value)
                 self._raise_sticky_error()
@@ -497,6 +498,124 @@ class _CodexAuthLifecycle:
         return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
+class _ClaudeOAuthLifecycle(_CodexAuthLifecycle):
+    """Versioned lifecycle for Claude Code's isolated OAuth file.
+
+    Claude Code refreshes both OAuth tokens in ``.credentials.json`` under its
+    ``CLAUDE_CONFIG_DIR``.  The synchronization machinery is the same as the
+    Codex file lifecycle, but the file shape and environment variable differ.
+    The local imports avoid a cycle because ``acp_claude_auth`` reuses
+    :func:`write_secret_file` from this module.
+    """
+
+    secret_name = "CLAUDE_CREDENTIALS_JSON"
+    credential_label = "Claude OAuth"
+
+    def materialize(self, registry: SecretRegistry, env: dict[str, str]) -> None:
+        from openhands.sdk.agent.acp_claude_auth import (
+            is_valid_claude_oauth_credentials,
+        )
+
+        resolved = self._load()
+        if not is_valid_claude_oauth_credentials(resolved.value):
+            raise CredentialNeedsReauthentication(
+                "Claude subscription/OAuth credentials are invalid. "
+                "Sign in with Claude Code again."
+            )
+        runtime_dir = Path(tempfile.mkdtemp(prefix="openhands-claude-acp-"))
+        runtime_dir.chmod(0o700)
+        path = runtime_dir / ".credentials.json"
+        try:
+            write_secret_file(path, resolved.value)
+        except BaseException:
+            shutil.rmtree(runtime_dir, ignore_errors=True)
+            raise
+        self.path = path
+        self._runtime_dir = runtime_dir
+        self._registry = registry
+        self._expected_version = resolved.version
+        self._local_digest = self._digest(resolved.value)
+        self._track(resolved.value)
+        env["CLAUDE_CONFIG_DIR"] = str(runtime_dir)
+        monitor = threading.Thread(
+            target=self._monitor_loop,
+            name="claude-oauth-credential-monitor",
+            daemon=True,
+        )
+        try:
+            monitor.start()
+        except BaseException:
+            env.pop("CLAUDE_CONFIG_DIR", None)
+            self._cleanup_runtime()
+            raise
+        self._monitor = monitor
+        logger.info(
+            "credential_binding_materialized",
+            extra={"credential": self.secret_name},
+        )
+
+    def _read_current(self) -> str | None:
+        from openhands.sdk.agent.acp_claude_auth import (
+            is_valid_claude_oauth_credentials,
+        )
+
+        with self._lock:
+            path = self.path
+        if path is None:
+            return None
+        try:
+            value = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            return None
+        return value if is_valid_claude_oauth_credentials(value) else None
+
+    def _read_stable(self, *, attempts: int) -> str | None:
+        from openhands.sdk.agent.acp_claude_auth import (
+            is_valid_claude_oauth_credentials,
+        )
+
+        with self._lock:
+            path = self.path
+        if path is None:
+            return None
+        for attempt in range(attempts):
+            try:
+                first = path.read_bytes()
+                time.sleep(_STABLE_READ_DELAY_SECONDS)
+                second = path.read_bytes()
+                if first == second:
+                    value = second.decode("utf-8")
+                    if is_valid_claude_oauth_credentials(value):
+                        return value
+            except (OSError, UnicodeError):
+                pass
+            if attempt + 1 < attempts:
+                delay_index = min(attempt, len(_SYNC_RETRY_DELAYS) - 1)
+                time.sleep(_SYNC_RETRY_DELAYS[delay_index])
+        return None
+
+    def _track(self, value: str) -> None:
+        from openhands.sdk.agent.acp_claude_auth import (
+            track_claude_oauth_credentials_for_masking,
+        )
+
+        digest = self._digest(value)
+        with self._lock:
+            if digest in self._tracked_digests:
+                return
+            registry = self._registry
+        if registry is None:
+            return
+        try:
+            track_claude_oauth_credentials_for_masking(registry, value)
+        except Exception as exc:
+            raise CredentialSyncError(
+                "Rotated credentials could not be registered for masking."
+            ) from exc
+        with self._lock:
+            self._tracked_digests.add(digest)
+
+
 def create_file_credential_lifecycle(
     secret_name: str,
     binding: VersionedCredentialBinding | None,
@@ -510,6 +629,7 @@ def create_file_credential_lifecycle(
 
 _FILE_CREDENTIAL_LIFECYCLES = {
     CODEX_AUTH_SECRET_NAME: _CodexAuthLifecycle,
+    "CLAUDE_CREDENTIALS_JSON": _ClaudeOAuthLifecycle,
 }
 
 

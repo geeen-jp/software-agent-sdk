@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 import pytest
 
+from openhands.sdk.agent.acp_claude_auth import CLAUDE_CREDENTIALS_SECRET_NAME
 from openhands.sdk.agent.acp_file_credentials import (
     CODEX_AUTH_SECRET_NAME,
     create_file_credential_lifecycle,
@@ -30,6 +31,22 @@ def _auth(refresh_token: str, access_token: str = "access") -> str:
                 "refresh_token": refresh_token,
                 "access_token": access_token,
             },
+        }
+    )
+
+
+def _claude_auth(
+    refresh_token: str,
+    access_token: str = "access",
+    expires_at: int = 9_999_999_999_000,
+) -> str:
+    return json.dumps(
+        {
+            "claudeAiOauth": {
+                "refreshToken": refresh_token,
+                "accessToken": access_token,
+                "expiresAt": expires_at,
+            }
         }
     )
 
@@ -147,6 +164,18 @@ def _lifecycle(binding: MemoryBinding, registry: SecretRegistry):
     return lifecycle, env
 
 
+def _claude_lifecycle(binding: MemoryBinding, registry: SecretRegistry):
+    lifecycle = create_file_credential_lifecycle(
+        CLAUDE_CREDENTIALS_SECRET_NAME,
+        binding,
+        _run,
+    )
+    assert lifecycle is not None
+    env: dict[str, str] = {}
+    lifecycle.materialize(registry, env)
+    return lifecycle, env
+
+
 def _wait_for_value(binding: MemoryBinding, value: str) -> None:
     deadline = time.monotonic() + 2
     while binding.value != value and time.monotonic() < deadline:
@@ -179,6 +208,52 @@ def test_background_rotation_writes_through_and_masks() -> None:
     finally:
         lifecycle.close()
     assert not path.parent.exists()
+
+
+def test_claude_oauth_rotation_writes_through_and_masks() -> None:
+    initial = _claude_auth("refresh-r0", "access-r0", expires_at=0)
+    rotated = _claude_auth("refresh-r1", "access-r1")
+    binding = MemoryBinding(initial)
+    registry = SecretRegistry()
+    lifecycle, env = _claude_lifecycle(binding, registry)
+    path = lifecycle.path
+    assert path is not None
+    try:
+        path.write_text(rotated, encoding="utf-8")
+        _wait_for_value(binding, rotated)
+        assert env["CLAUDE_CONFIG_DIR"] == str(path.parent)
+        assert path.name == ".credentials.json"
+        assert registry.mask_secrets_in_output("access-r1") == "<secret-hidden>"
+        assert registry.mask_secrets_in_output("refresh-r1") == "<secret-hidden>"
+    finally:
+        lifecycle.close()
+    assert not path.parent.exists()
+
+
+def test_claude_oauth_invalid_canonical_requires_reauthentication() -> None:
+    binding = MemoryBinding("malformed")
+    lifecycle = create_file_credential_lifecycle(
+        CLAUDE_CREDENTIALS_SECRET_NAME,
+        binding,
+        _run,
+    )
+    assert lifecycle is not None
+    with pytest.raises(CredentialNeedsReauthentication, match="Claude"):
+        lifecycle.materialize(SecretRegistry(), {})
+
+
+def test_claude_oauth_unreadable_runtime_reports_claude() -> None:
+    lifecycle, _ = _claude_lifecycle(
+        MemoryBinding(_claude_auth("refresh-r0")), SecretRegistry()
+    )
+    assert lifecycle.path is not None
+    runtime = cast(Any, lifecycle)
+    try:
+        with patch.object(runtime, "_read_stable", return_value=None):
+            with pytest.raises(CredentialSyncError, match="Claude OAuth"):
+                lifecycle.flush()
+    finally:
+        lifecycle.discard()
 
 
 def test_mask_tracking_does_not_sleep_or_write() -> None:

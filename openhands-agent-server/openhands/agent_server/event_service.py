@@ -25,6 +25,7 @@ from openhands.agent_server.models import (
 from openhands.agent_server.pub_sub import PubSub, Subscriber
 from openhands.sdk import LLM, AgentBase, Event, Message, TextContent, get_logger
 from openhands.sdk.agent import ACPAgent
+from openhands.sdk.agent.acp_claude_auth import CLAUDE_CREDENTIALS_SECRET_NAME
 from openhands.sdk.agent.acp_file_credentials import (
     CODEX_AUTH_SECRET_NAME,
     is_valid_codex_auth,
@@ -1659,9 +1660,14 @@ class EventService:
         """Update secrets in the conversation."""
         if not self._conversation:
             raise ValueError("inactive_service")
-        if CODEX_AUTH_SECRET_NAME in self.credential_bindings:
+        managed_file_credentials = {
+            CODEX_AUTH_SECRET_NAME,
+            CLAUDE_CREDENTIALS_SECRET_NAME,
+        }
+        if self.credential_bindings.keys() & managed_file_credentials:
             secrets = dict(secrets)
-            secrets.pop(CODEX_AUTH_SECRET_NAME, None)
+            for name in managed_file_credentials & self.credential_bindings.keys():
+                secrets.pop(name, None)
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, self._conversation.update_secrets, secrets)
 

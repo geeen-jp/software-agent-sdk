@@ -49,10 +49,16 @@ from openhands.agent_server.telemetry.sanitizer import model_family, safe_token
 from openhands.agent_server.utils import safe_rmtree, utc_now
 from openhands.sdk import LLM, AgentContext, Event, Message
 from openhands.sdk.agent import ACPAgent
+from openhands.sdk.agent.acp_claude_auth import (
+    CLAUDE_CREDENTIALS_SECRET_NAME,
+    is_valid_claude_oauth_credentials,
+    resolve_claude_oauth_credentials,
+)
 from openhands.sdk.agent.acp_file_credentials import CODEX_AUTH_SECRET_NAME
 from openhands.sdk.agent.base import AgentBase
 from openhands.sdk.conversation.impl.local_conversation import LocalConversation
 from openhands.sdk.conversation.persistence_const import BASE_STATE
+from openhands.sdk.conversation.secret_registry import SecretRegistry
 from openhands.sdk.conversation.state import (
     ConversationExecutionStatus,
     ConversationState,
@@ -61,13 +67,18 @@ from openhands.sdk.conversation.title_utils import (
     extract_message_text,
     generate_title_from_message,
 )
-from openhands.sdk.credential import CredentialBindingError, VersionedCredentialBinding
+from openhands.sdk.credential import (
+    CredentialBindingError,
+    CredentialNeedsReauthentication,
+    VersionedCredentialBinding,
+)
 from openhands.sdk.event import MessageEvent
 from openhands.sdk.event.conversation_state import ConversationStateUpdateEvent
 from openhands.sdk.git.exceptions import GitCommandError, GitRepositoryError
 from openhands.sdk.git.utils import run_git_command, validate_git_repository
 from openhands.sdk.mcp.utils import MCPToolProvider
 from openhands.sdk.observability import OPERATION_METADATA_KEY, observe
+from openhands.sdk.secret import SecretSource
 from openhands.sdk.tool import BROWSER_TOOL_NAME, Tool, is_tool_usable
 from openhands.sdk.tool.client_tool import register_client_tools
 from openhands.sdk.utils.cipher import Cipher
@@ -862,6 +873,14 @@ class ConversationService:
     def _is_codex_agent(agent: AgentBase | None) -> bool:
         return isinstance(agent, ACPAgent) and agent.acp_server == "codex"
 
+    @staticmethod
+    def _is_isolated_claude_agent(agent: AgentBase | None) -> bool:
+        return (
+            isinstance(agent, ACPAgent)
+            and agent.acp_server == "claude-code"
+            and agent.acp_isolate_data_dir
+        )
+
     async def _has_local_codex_credential(self) -> bool:
         if self.secrets_store is None:
             return False
@@ -870,6 +889,66 @@ class ConversationService:
             CODEX_AUTH_SECRET_NAME,
         )
         return value is not None
+
+    async def _has_local_claude_credential(self) -> bool:
+        if self.secrets_store is None:
+            return False
+        value = await asyncio.to_thread(
+            self.secrets_store.get_secret,
+            CLAUDE_CREDENTIALS_SECRET_NAME,
+        )
+        return value is not None
+
+    @staticmethod
+    def _secret_value(value: object) -> str | None:
+        if isinstance(value, str):
+            return value
+        if not isinstance(value, SecretSource):
+            return None
+        try:
+            resolved = value.get_value()
+        except Exception:
+            return None
+        return resolved if isinstance(resolved, str) else None
+
+    async def _ensure_local_claude_credential(
+        self,
+        agent: AgentBase | None,
+        explicit_credentials: object | None = None,
+        *,
+        allow_host_source: bool = True,
+    ) -> bool:
+        """Bootstrap Claude OAuth once, without replacing the canonical value."""
+        if not self._is_isolated_claude_agent(agent) or self.secrets_store is None:
+            return False
+        if await self._has_local_claude_credential():
+            return True
+
+        candidate = self._secret_value(explicit_credentials)
+        if not is_valid_claude_oauth_credentials(candidate):
+            context = agent.agent_context if isinstance(agent, ACPAgent) else None
+            context_secret = (
+                context.secrets.get(CLAUDE_CREDENTIALS_SECRET_NAME)
+                if context is not None and context.secrets
+                else None
+            )
+            candidate = self._secret_value(context_secret)
+        if not is_valid_claude_oauth_credentials(candidate):
+            if not allow_host_source:
+                return False
+            try:
+                candidate = resolve_claude_oauth_credentials(SecretRegistry())
+            except CredentialNeedsReauthentication:
+                return False
+        if not isinstance(candidate, str):
+            return False
+
+        await asyncio.to_thread(
+            self.secrets_store.set_secret_if_absent,
+            CLAUDE_CREDENTIALS_SECRET_NAME,
+            candidate,
+        )
+        return await self._has_local_claude_credential()
 
     async def _resolve_credential_bindings(
         self,
@@ -898,6 +977,27 @@ class ConversationService:
                 self.secrets_store,
                 CODEX_AUTH_SECRET_NAME,
             )
+        if (
+            CLAUDE_CREDENTIALS_SECRET_NAME not in bindings
+            and self._is_isolated_claude_agent(agent)
+        ):
+            if (
+                CLAUDE_CREDENTIALS_SECRET_NAME
+                not in stored.required_runtime_credential_bindings
+            ):
+                await self._ensure_local_claude_credential(agent)
+            if await self._has_local_claude_credential():
+                assert self.secrets_store is not None
+                from openhands.agent_server.credential_binding import (
+                    LocalVersionedCredentialBinding,
+                )
+
+                bindings[CLAUDE_CREDENTIALS_SECRET_NAME] = (
+                    LocalVersionedCredentialBinding(
+                        self.secrets_store,
+                        CLAUDE_CREDENTIALS_SECRET_NAME,
+                    )
+                )
         return bindings
 
     async def _conversation_info(
@@ -1183,6 +1283,11 @@ class ConversationService:
         missing_bindings = (
             record.stored.required_runtime_credential_bindings - pending_bindings.keys()
         )
+        if (
+            CLAUDE_CREDENTIALS_SECRET_NAME in missing_bindings
+            and await self._has_local_claude_credential()
+        ):
+            missing_bindings.remove(CLAUDE_CREDENTIALS_SECRET_NAME)
         if require_runtime_bindings and missing_bindings:
             raise CredentialBindingActivationRequired(
                 "credential_binding_activation_required"
@@ -1432,9 +1537,21 @@ class ConversationService:
                     # ``is_open()`` above guarantees a live conversation, so the
                     # public getter never raises here.
                     existing_agent = existing_event_service.get_conversation().agent
+                    await self._ensure_local_claude_credential(
+                        existing_agent,
+                        request.secrets.get(CLAUDE_CREDENTIALS_SECRET_NAME),
+                        allow_host_source=CLAUDE_CREDENTIALS_SECRET_NAME
+                        not in (
+                            existing_event_service.stored.required_runtime_credential_bindings
+                        ),
+                    )
                     if (
                         self._is_codex_agent(existing_agent)
                         and CODEX_AUTH_SECRET_NAME
+                        not in existing_event_service.credential_bindings
+                    ) or (
+                        self._is_isolated_claude_agent(existing_agent)
+                        and CLAUDE_CREDENTIALS_SECRET_NAME
                         not in existing_event_service.credential_bindings
                     ):
                         # Reuse the live agent we already resolved above instead
@@ -1470,6 +1587,18 @@ class ConversationService:
                                 ]
                             }
                         )
+                    if (
+                        CLAUDE_CREDENTIALS_SECRET_NAME in request.secrets
+                        and CLAUDE_CREDENTIALS_SECRET_NAME
+                        not in existing_event_service.credential_bindings
+                    ):
+                        await existing_event_service.apply_resume_secrets(
+                            {
+                                CLAUDE_CREDENTIALS_SECRET_NAME: request.secrets[
+                                    CLAUDE_CREDENTIALS_SECRET_NAME
+                                ]
+                            }
+                        )
                     state = await existing_event_service.get_state()
                     self._conversation_records[conversation_id] = _ConversationRecord(
                         stored=existing_event_service.stored,
@@ -1493,23 +1622,54 @@ class ConversationService:
                 reattach_agent = await asyncio.to_thread(
                     self._agent_from_base_state, conversation_id
                 )
+                await self._ensure_local_claude_credential(
+                    reattach_agent,
+                    request.secrets.get(CLAUDE_CREDENTIALS_SECRET_NAME),
+                    allow_host_source=CLAUDE_CREDENTIALS_SECRET_NAME
+                    not in (
+                        existing_record.stored.required_runtime_credential_bindings
+                    ),
+                )
                 managed_codex_credential = self._is_codex_agent(reattach_agent) and (
                     CODEX_AUTH_SECRET_NAME
                     in self._credential_bindings.get(conversation_id, {})
                     or await self._has_local_codex_credential()
                 )
-                fallback_secret = request.secrets.get(CODEX_AUTH_SECRET_NAME)
-                if managed_codex_credential or fallback_secret is not None:
-                    original_stored = existing_record.stored
-                    injected_fallback = (
-                        not managed_codex_credential and fallback_secret is not None
+                managed_claude_credential = (
+                    CLAUDE_CREDENTIALS_SECRET_NAME
+                    in self._credential_bindings.get(conversation_id, {})
+                    or (
+                        self._is_isolated_claude_agent(reattach_agent)
+                        and await self._has_local_claude_credential()
                     )
-                    if injected_fallback:
+                )
+                fallback_secret = request.secrets.get(CODEX_AUTH_SECRET_NAME)
+                claude_fallback_secret = request.secrets.get(
+                    CLAUDE_CREDENTIALS_SECRET_NAME
+                )
+                if (
+                    managed_codex_credential
+                    or managed_claude_credential
+                    or fallback_secret is not None
+                    or claude_fallback_secret is not None
+                ):
+                    original_stored = existing_record.stored
+                    injected_fallbacks: dict[str, object] = {}
+                    if not managed_codex_credential and fallback_secret is not None:
+                        injected_fallbacks[CODEX_AUTH_SECRET_NAME] = fallback_secret
+                    if (
+                        not managed_claude_credential
+                        and claude_fallback_secret is not None
+                    ):
+                        injected_fallbacks[CLAUDE_CREDENTIALS_SECRET_NAME] = (
+                            claude_fallback_secret
+                        )
+                    if injected_fallbacks:
                         existing_record.stored = original_stored.model_copy(
                             update={
                                 "secrets": {
                                     **original_stored.secrets,
-                                    CODEX_AUTH_SECRET_NAME: fallback_secret,
+                                    **injected_fallbacks,
                                 }
                             }
                         )
@@ -1520,7 +1680,7 @@ class ConversationService:
                             conversation_id, agent=reattach_agent
                         )
                     finally:
-                        if injected_fallback:
+                        if injected_fallbacks:
                             existing_record.stored = original_stored
                     if event_service is not None:
                         state = await event_service.get_state()
@@ -1610,20 +1770,41 @@ class ConversationService:
             request, conversation_id, self.conversation_worktree_root
         )
 
+        await self._ensure_local_claude_credential(
+            request.agent,
+            request.secrets.get(CLAUDE_CREDENTIALS_SECRET_NAME),
+        )
         managed_codex_credential = self._is_codex_agent(request.agent) and (
             CODEX_AUTH_SECRET_NAME in self._credential_bindings.get(conversation_id, {})
             or await self._has_local_codex_credential()
         )
-        if managed_codex_credential:
+        managed_claude_credential = (
+            CLAUDE_CREDENTIALS_SECRET_NAME
+            in self._credential_bindings.get(conversation_id, {})
+            or (
+                self._is_isolated_claude_agent(request.agent)
+                and await self._has_local_claude_credential()
+            )
+        )
+        managed_secret_names = {
+            name
+            for name, managed in (
+                (CODEX_AUTH_SECRET_NAME, managed_codex_credential),
+                (CLAUDE_CREDENTIALS_SECRET_NAME, managed_claude_credential),
+            )
+            if managed
+        }
+        if managed_secret_names:
             durable_secrets = dict(request.secrets)
-            durable_secrets.pop(CODEX_AUTH_SECRET_NAME, None)
+            for name in managed_secret_names:
+                durable_secrets.pop(name, None)
+            managed_agent = request.agent
+            for name in managed_secret_names:
+                managed_agent = _without_agent_context_secret(managed_agent, name)
             request = request.model_copy(
                 update={
                     "secrets": durable_secrets,
-                    "agent": _without_agent_context_secret(
-                        request.agent,
-                        CODEX_AUTH_SECRET_NAME,
-                    ),
+                    "agent": managed_agent,
                 }
             )
 
@@ -2317,6 +2498,15 @@ class ConversationService:
         credential_bindings = await self._resolve_credential_bindings(
             stored, agent=agent
         )
+        if CLAUDE_CREDENTIALS_SECRET_NAME in credential_bindings:
+            stored = stored.model_copy(
+                update={
+                    "required_runtime_credential_bindings": (
+                        stored.required_runtime_credential_bindings
+                        | {CLAUDE_CREDENTIALS_SECRET_NAME}
+                    )
+                }
+            )
         event_service = EventService(
             stored=stored,
             conversations_dir=self.conversations_dir,
