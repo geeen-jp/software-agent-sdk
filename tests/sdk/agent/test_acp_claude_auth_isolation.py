@@ -20,7 +20,8 @@ from openhands.sdk.agent.acp_claude_auth import (
 )
 from openhands.sdk.agent.acp_file_credentials import write_secret_file
 from openhands.sdk.conversation.secret_registry import SecretRegistry
-from openhands.sdk.credential import CredentialNeedsReauthentication
+from openhands.sdk.credential import CredentialNeedsReauthentication, ResolvedCredential
+from openhands.sdk.utils.async_executor import AsyncExecutor
 
 
 def _oauth_payload(refresh: str = "refresh-token", access: str = "access-token") -> str:
@@ -380,6 +381,48 @@ def test_acp_agent_isolate_data_dir_seeds_claude_credentials(
     agent._cleanup_claude_config_runtime(discard=True)
     assert not isolated.exists()
     assert list(persist.rglob(CLAUDE_CREDENTIALS_FILENAME)) == []
+
+
+def test_acp_agent_isolation_uses_versioned_claude_binding(
+    tmp_path: Path,
+) -> None:
+    class Binding:
+        async def load(self) -> ResolvedCredential:
+            return ResolvedCredential(_oauth_payload("canonical"), "v0")
+
+        async def replace(self, expected_version: str, value: str) -> str:
+            assert expected_version == "v0"
+            assert is_valid_claude_oauth_credentials(value)
+            return "v1"
+
+    from openhands.sdk.conversation.state import ConversationState
+    from openhands.sdk.workspace.local import LocalWorkspace
+
+    agent = ACPAgent(
+        acp_command=["npx", "-y", "@agentclientprotocol/claude-agent-acp"],
+        acp_server="claude-code",
+        acp_isolate_data_dir=True,
+    )
+    agent._executor = AsyncExecutor()
+    agent.activate_file_credential_binding(CLAUDE_CREDENTIALS_SECRET_NAME, Binding())
+    state = ConversationState.create(
+        id=uuid.uuid4(),
+        agent=agent,
+        workspace=LocalWorkspace(working_dir=str(tmp_path / "workspace")),
+        persistence_dir=str(tmp_path / "persist"),
+    )
+    env: dict[str, str] = {}
+
+    agent._isolate_acp_data_dir(state, env)
+    path = Path(env["CLAUDE_CONFIG_DIR"]) / CLAUDE_CREDENTIALS_FILENAME
+    assert path.is_file()
+    assert json.loads(path.read_text())["claudeAiOauth"]["refreshToken"] == "canonical"
+    try:
+        assert agent._claude_config_runtime_dir is None
+        assert CLAUDE_CREDENTIALS_SECRET_NAME in agent._file_credential_lifecycles
+    finally:
+        agent.close()
+    assert not path.parent.exists()
 
 
 def test_writable_isolate_without_oauth_keeps_isolated_dir(

@@ -33,6 +33,7 @@ from openhands.agent_server.persistence import (
 )
 from openhands.sdk import AgentContext
 from openhands.sdk.agent import ACPAgent
+from openhands.sdk.agent.acp_claude_auth import CLAUDE_CREDENTIALS_SECRET_NAME
 from openhands.sdk.credential import (
     CredentialConflict,
     CredentialNeedsReauthentication,
@@ -42,6 +43,22 @@ from openhands.sdk.credential import (
 from openhands.sdk.secret import StaticSecret
 from openhands.sdk.utils.cipher import Cipher
 from openhands.sdk.workspace import LocalWorkspace
+
+
+def _claude_oauth(
+    refresh: str = "refresh-r0",
+    access: str = "access-r0",
+    expires_at: int = 9_999_999_999_000,
+) -> str:
+    return json.dumps(
+        {
+            "claudeAiOauth": {
+                "refreshToken": refresh,
+                "accessToken": access,
+                "expiresAt": expires_at,
+            }
+        }
+    )
 
 
 @dataclass
@@ -377,6 +394,138 @@ async def test_direct_conversations_share_rotated_canonical_value(tmp_path) -> N
         StoredConversation(id=uuid4(), workspace=workspace), agent=agent
     )
     assert (await second["CODEX_AUTH_JSON"].load()).value == "r1"
+
+
+@pytest.mark.asyncio
+async def test_claude_isolated_conversations_share_rotated_canonical_value(
+    tmp_path,
+) -> None:
+    store = FileSecretsStore(tmp_path / "settings")
+    initial = _claude_oauth(expires_at=0)
+    store.set_secret(CLAUDE_CREDENTIALS_SECRET_NAME, initial)
+    service = ConversationService(
+        conversations_dir=tmp_path / "conversations",
+        secrets_store=store,
+    )
+    agent = ACPAgent(
+        acp_command=["claude-agent-acp"],
+        acp_server="claude-code",
+        acp_isolate_data_dir=True,
+    )
+    workspace = LocalWorkspace(working_dir=tmp_path / "workspace")
+
+    first = await service._resolve_credential_bindings(
+        StoredConversation(id=uuid4(), workspace=workspace), agent=agent
+    )
+    first_binding = first[CLAUDE_CREDENTIALS_SECRET_NAME]
+    resolved = await first_binding.load()
+    rotated = _claude_oauth("refresh-r1", "access-r1")
+    await first_binding.replace(resolved.version, rotated)
+
+    second = await service._resolve_credential_bindings(
+        StoredConversation(id=uuid4(), workspace=workspace), agent=agent
+    )
+    assert (await second[CLAUDE_CREDENTIALS_SECRET_NAME].load()).value == rotated
+
+
+@pytest.mark.asyncio
+async def test_claude_isolated_start_bootstraps_once_and_scrubs_secret(
+    tmp_path,
+) -> None:
+    store = FileSecretsStore(tmp_path / "settings")
+    initial = _claude_oauth()
+    stale_credentials = _claude_oauth("stale-refresh", "stale-access")
+    request = StartConversationRequest(
+        agent=ACPAgent(
+            acp_command=["claude-agent-acp"],
+            acp_server="claude-code",
+            acp_isolate_data_dir=True,
+        ),
+        workspace=LocalWorkspace(working_dir=tmp_path / "workspace"),
+        secrets={
+            CLAUDE_CREDENTIALS_SECRET_NAME: StaticSecret(value=SecretStr(initial))
+        },
+    )
+
+    async with ConversationService(
+        conversations_dir=tmp_path / "conversations",
+        secrets_store=store,
+    ) as service:
+        info, created = await service.start_conversation(request)
+        assert created
+        event_service = await service.get_event_service(info.id)
+        assert event_service is not None
+        assert store.get_secret(CLAUDE_CREDENTIALS_SECRET_NAME) == initial
+        assert CLAUDE_CREDENTIALS_SECRET_NAME not in event_service.stored.secrets
+        assert CLAUDE_CREDENTIALS_SECRET_NAME in event_service.credential_bindings
+        assert (
+            CLAUDE_CREDENTIALS_SECRET_NAME
+            in event_service.stored.required_runtime_credential_bindings
+        )
+
+        stale_request = request.model_copy(
+            update={
+                "secrets": {
+                    CLAUDE_CREDENTIALS_SECRET_NAME: StaticSecret(
+                        value=SecretStr(stale_credentials)
+                    )
+                }
+            }
+        )
+        second_info, second_created = await service.start_conversation(stale_request)
+        assert second_created
+        second_event_service = await service.get_event_service(second_info.id)
+        assert second_event_service is not None
+        assert store.get_secret(CLAUDE_CREDENTIALS_SECRET_NAME) == initial
+
+
+@pytest.mark.asyncio
+async def test_claude_isolated_resume_reconnects_and_missing_canonical_is_explicit(
+    tmp_path,
+) -> None:
+    conversations_dir = tmp_path / "conversations"
+    store_dir = tmp_path / "settings"
+    store = FileSecretsStore(store_dir)
+    request = StartConversationRequest(
+        agent=ACPAgent(
+            acp_command=["claude-agent-acp"],
+            acp_server="claude-code",
+            acp_isolate_data_dir=True,
+        ),
+        workspace=LocalWorkspace(working_dir=tmp_path / "workspace"),
+        secrets={
+            CLAUDE_CREDENTIALS_SECRET_NAME: StaticSecret(
+                value=SecretStr(_claude_oauth())
+            )
+        },
+    )
+
+    async with ConversationService(
+        conversations_dir=conversations_dir,
+        secrets_store=store,
+    ) as service:
+        info, _ = await service.start_conversation(request)
+        await service.prepare_for_sandbox_pause()
+
+    async with ConversationService(
+        conversations_dir=conversations_dir,
+        secrets_store=FileSecretsStore(store_dir),
+    ) as restarted:
+        event_service = await restarted.get_event_service(info.id)
+        assert event_service is not None
+        assert CLAUDE_CREDENTIALS_SECRET_NAME in event_service.credential_bindings
+
+    store.delete_secret(CLAUDE_CREDENTIALS_SECRET_NAME)
+    async with ConversationService(
+        conversations_dir=conversations_dir,
+        secrets_store=FileSecretsStore(store_dir),
+    ) as missing:
+        with patch(
+            "openhands.agent_server.conversation_service.resolve_claude_oauth_credentials",
+            side_effect=AssertionError("stale host source must not be used"),
+        ):
+            with pytest.raises(CredentialBindingActivationRequired):
+                await missing.get_event_service(info.id)
 
 
 @pytest.mark.asyncio
