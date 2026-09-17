@@ -1592,8 +1592,11 @@ class ConversationService:
                     # public getter never raises here.
                     existing_agent = existing_event_service.get_conversation().agent
                     if (
-                        CODEX_AUTH_SECRET_NAME
-                        not in existing_event_service.credential_bindings
+                        self._is_isolated_codex_agent(existing_agent)
+                        and CODEX_AUTH_SECRET_NAME
+                        not in getattr(
+                            existing_event_service, "credential_bindings", {}
+                        )
                         and CODEX_AUTH_SECRET_NAME
                         not in self._credential_bindings.get(conversation_id, {})
                     ):
