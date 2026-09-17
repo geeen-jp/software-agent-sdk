@@ -68,6 +68,19 @@ def codex_auth_file(env: dict[str, str]) -> Path:
     return Path.home() / _CHATGPT_AUTH_PATH
 
 
+def codex_auth_source_root(*, source_root: Path | None = None) -> Path:
+    """Resolve the host Codex config directory at credential lookup time.
+
+    ``CODEX_HOME`` belongs to the child ACP process and may already point to
+    an isolated conversation directory. Host bootstrap must therefore resolve
+    the user's normal config directory directly instead of consulting that
+    effective runtime environment.
+    """
+    if source_root is not None:
+        return source_root
+    return Path.home() / _CHATGPT_AUTH_PATH.parent
+
+
 def codex_auth_file_is_chatgpt(env: dict[str, str]) -> bool:
     path = codex_auth_file(env)
     if not path.is_file():
@@ -98,6 +111,21 @@ def is_valid_codex_auth(value: object) -> bool:
         isinstance(tokens, dict)
         and isinstance(tokens.get("refresh_token"), str)
         and bool(tokens["refresh_token"])
+    )
+
+
+def resolve_codex_auth_credentials(*, source_root: Path | None = None) -> str:
+    """Read valid host ChatGPT credentials without modifying the source file."""
+    path = codex_auth_source_root(source_root=source_root) / "auth.json"
+    try:
+        value = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        value = None
+    if isinstance(value, str) and is_valid_codex_auth(value):
+        return value
+    raise CredentialNeedsReauthentication(
+        "Codex ChatGPT subscription credentials are missing or invalid. "
+        "Sign in with Codex before starting an isolated session."
     )
 
 

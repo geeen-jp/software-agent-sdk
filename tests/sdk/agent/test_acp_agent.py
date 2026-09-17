@@ -9,6 +9,7 @@ import uuid
 from collections.abc import Iterator, Mapping
 from concurrent.futures import Future
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
@@ -58,6 +59,7 @@ from openhands.sdk.conversation.state import (
     ConversationExecutionStatus,
     ConversationState,
 )
+from openhands.sdk.credential import ResolvedCredential
 from openhands.sdk.event import (
     ACPToolCallEvent,
     ActionEvent,
@@ -3072,6 +3074,75 @@ class TestSelectAuthMethod:
         ):
             agent._start_acp_server(state)
         conn.new_session.assert_not_awaited()
+
+    def test_isolated_codex_binding_materializes_private_auth_file(self, tmp_path):
+        credentials = json.dumps(
+            {
+                "auth_mode": "chatgpt",
+                "tokens": {
+                    "refresh_token": "refresh-binding",
+                    "access_token": "access-binding",
+                },
+            }
+        )
+        binding = MagicMock()
+        binding.load = AsyncMock(return_value=ResolvedCredential(credentials, "v0"))
+        binding.replace = AsyncMock(return_value="v1")
+        agent = ACPAgent(
+            acp_command=["codex-acp"],
+            acp_server="codex",
+            acp_isolate_data_dir=True,
+        )
+        agent.activate_file_credential_binding("CODEX_AUTH_JSON", binding)
+        state = ConversationState.create(
+            id=uuid.uuid4(),
+            agent=agent,
+            workspace=LocalWorkspace(working_dir=str(tmp_path / "workspace")),
+            persistence_dir=str(tmp_path / "conversation"),
+        )
+        conn = TestACPSessionIdPersistence._make_conn()
+        conn.initialize.return_value.agent_info.name = "codex-acp"
+        conn.initialize.return_value.auth_methods = [
+            self._make_auth_method("api-key"),
+            self._make_auth_method("chat-gpt"),
+        ]
+        captured: dict[str, str] = {}
+        process = MagicMock()
+        process.stdin = MagicMock()
+        process.stdout = MagicMock()
+        process.stdout.readline = AsyncMock(return_value=b"")
+        process.wait = AsyncMock(return_value=0)
+        process.returncode = 0
+
+        async def _capture_subprocess(*_args, env=None, **_kwargs):
+            captured.update(env or {})
+            return process
+
+        runtime_dir: Path | None = None
+        try:
+            with TestACPSessionIdPersistence._mocked_acp_runtime(
+                agent, conn, process=process
+            ):
+                with patch(
+                    "openhands.sdk.agent.acp_agent.asyncio.create_subprocess_exec",
+                    new=_capture_subprocess,
+                ):
+                    agent._start_acp_server(state)
+                runtime_dir = Path(captured["CODEX_HOME"])
+                auth_path = runtime_dir / "auth.json"
+                assert runtime_dir.stat().st_mode & 0o777 == 0o700
+                assert auth_path.stat().st_mode & 0o777 == 0o600
+                assert auth_path.read_text(encoding="utf-8") == credentials
+                assert conn.new_session.await_count == 1
+                assert conn.authenticate.await_count == 0
+                agent.close()
+        finally:
+            if not agent._closed:
+                agent.close()
+
+        assert runtime_dir is not None
+        assert not runtime_dir.exists()
+        assert not (tmp_path / "conversation" / "acp" / "codex" / "auth.json").exists()
 
     def test_codex_chatgpt_file_auth_defers_explicit_auth(self, tmp_path, caplog):
         agent = ACPAgent(
