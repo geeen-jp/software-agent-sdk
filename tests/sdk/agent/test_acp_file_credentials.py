@@ -12,6 +12,7 @@ from openhands.sdk.agent.acp_claude_auth import CLAUDE_CREDENTIALS_SECRET_NAME
 from openhands.sdk.agent.acp_file_credentials import (
     CODEX_AUTH_SECRET_NAME,
     create_file_credential_lifecycle,
+    resolve_codex_auth_credentials,
 )
 from openhands.sdk.conversation.secret_registry import SecretRegistry
 from openhands.sdk.credential import (
@@ -190,6 +191,35 @@ def _stop_monitor(lifecycle: Any) -> None:
     runtime._monitor.join(timeout=1)
 
 
+def test_resolve_codex_auth_credentials_reads_runtime_host_source(tmp_path) -> None:
+    source_root = tmp_path / "home" / ".codex"
+    source_root.mkdir(parents=True)
+    credentials = _auth("host-refresh", "host-access")
+    auth_path = source_root / "auth.json"
+    auth_path.write_text(credentials, encoding="utf-8")
+
+    with patch(
+        "openhands.sdk.agent.acp_file_credentials.Path.home",
+        return_value=tmp_path / "home",
+    ):
+        assert resolve_codex_auth_credentials() == credentials
+    assert auth_path.read_text(encoding="utf-8") == credentials
+
+
+@pytest.mark.parametrize(
+    "contents",
+    [None, "not-json", json.dumps({"auth_mode": "chatgpt", "tokens": {}})],
+)
+def test_resolve_codex_auth_credentials_fails_closed(tmp_path, contents) -> None:
+    source_root = tmp_path / ".codex"
+    source_root.mkdir()
+    if contents is not None:
+        (source_root / "auth.json").write_text(contents, encoding="utf-8")
+
+    with pytest.raises(CredentialNeedsReauthentication, match="Codex"):
+        resolve_codex_auth_credentials(source_root=source_root)
+
+
 def test_background_rotation_writes_through_and_masks() -> None:
     initial = _auth("refresh-r0", "access-r0")
     rotated = _auth("refresh-r1", "access-r1")
@@ -198,6 +228,8 @@ def test_background_rotation_writes_through_and_masks() -> None:
     lifecycle, env = _lifecycle(binding, registry)
     path = lifecycle.path
     assert path is not None
+    assert path.parent.stat().st_mode & 0o777 == 0o700
+    assert path.stat().st_mode & 0o777 == 0o600
     try:
         path.write_text(rotated, encoding="utf-8")
         _wait_for_value(binding, rotated)
@@ -208,6 +240,27 @@ def test_background_rotation_writes_through_and_masks() -> None:
     finally:
         lifecycle.close()
     assert not path.parent.exists()
+
+
+def test_parallel_lifecycles_use_distinct_private_runtime_files() -> None:
+    first, second = MemoryBinding(_auth("refresh-a")), MemoryBinding(_auth("refresh-b"))
+    first_lifecycle, first_env = _lifecycle(first, SecretRegistry())
+    second_lifecycle, second_env = _lifecycle(second, SecretRegistry())
+    first_path = first_lifecycle.path
+    second_path = second_lifecycle.path
+    assert first_path is not None
+    assert second_path is not None
+    try:
+        assert first_path.parent != second_path.parent
+        assert first_env["CODEX_HOME"] == str(first_path.parent)
+        assert second_env["CODEX_HOME"] == str(second_path.parent)
+        assert first_path.read_text(encoding="utf-8") == first.value
+        assert second_path.read_text(encoding="utf-8") == second.value
+    finally:
+        first_lifecycle.close()
+        second_lifecycle.close()
+    assert not first_path.parent.exists()
+    assert not second_path.parent.exists()
 
 
 def test_claude_oauth_rotation_writes_through_and_masks() -> None:

@@ -34,6 +34,7 @@ from openhands.agent_server.persistence import (
 from openhands.sdk import AgentContext
 from openhands.sdk.agent import ACPAgent
 from openhands.sdk.agent.acp_claude_auth import CLAUDE_CREDENTIALS_SECRET_NAME
+from openhands.sdk.agent.acp_file_credentials import CODEX_AUTH_SECRET_NAME
 from openhands.sdk.credential import (
     CredentialConflict,
     CredentialNeedsReauthentication,
@@ -57,6 +58,21 @@ def _claude_oauth(
                 "accessToken": access,
                 "expiresAt": expires_at,
             }
+        }
+    )
+
+
+def _codex_auth(
+    refresh: str = "refresh-r0",
+    access: str = "access-r0",
+) -> str:
+    return json.dumps(
+        {
+            "auth_mode": "chatgpt",
+            "tokens": {
+                "refresh_token": refresh,
+                "access_token": access,
+            },
         }
     )
 
@@ -394,6 +410,142 @@ async def test_direct_conversations_share_rotated_canonical_value(tmp_path) -> N
         StoredConversation(id=uuid4(), workspace=workspace), agent=agent
     )
     assert (await second["CODEX_AUTH_JSON"].load()).value == "r1"
+
+
+@pytest.mark.asyncio
+async def test_codex_isolated_start_bootstraps_host_and_resume_uses_canonical(
+    tmp_path,
+) -> None:
+    store_dir = tmp_path / "settings"
+    store = FileSecretsStore(store_dir)
+    host_credentials = _codex_auth("host-refresh", "host-access")
+    host_auth = tmp_path / "host" / ".codex" / "auth.json"
+    host_auth.parent.mkdir(parents=True)
+    host_auth.write_text(host_credentials, encoding="utf-8")
+    request = StartConversationRequest(
+        agent=ACPAgent(
+            acp_command=["codex-acp"],
+            acp_server="codex",
+            acp_isolate_data_dir=True,
+        ),
+        workspace=LocalWorkspace(working_dir=tmp_path / "workspace"),
+    )
+
+    with patch(
+        "openhands.sdk.agent.acp_file_credentials.Path.home",
+        return_value=tmp_path / "host",
+    ):
+        async with ConversationService(
+            conversations_dir=tmp_path / "conversations",
+            secrets_store=store,
+        ) as service:
+            info, created = await service.start_conversation(request)
+            assert created
+            event_service = await service.get_event_service(info.id)
+            assert event_service is not None
+            assert store.get_secret(CODEX_AUTH_SECRET_NAME) == host_credentials
+            assert CODEX_AUTH_SECRET_NAME not in event_service.stored.secrets
+            assert CODEX_AUTH_SECRET_NAME in event_service.credential_bindings
+            assert host_auth.read_text(encoding="utf-8") == host_credentials
+            rotated_credentials = _codex_auth("rotated-refresh", "rotated-access")
+            store.set_secret(CODEX_AUTH_SECRET_NAME, rotated_credentials)
+            await service.prepare_for_sandbox_pause()
+
+        host_auth.unlink()
+
+        with patch(
+            "openhands.agent_server.conversation_service.resolve_codex_auth_credentials",
+            side_effect=AssertionError("resume must use the canonical credential"),
+        ):
+            async with ConversationService(
+                conversations_dir=tmp_path / "conversations",
+                secrets_store=FileSecretsStore(store_dir),
+            ) as restarted:
+                event_service = await restarted.get_event_service(info.id)
+                assert event_service is not None
+                assert CODEX_AUTH_SECRET_NAME in event_service.credential_bindings
+                resolved = await event_service.credential_bindings[
+                    CODEX_AUTH_SECRET_NAME
+                ].load()
+                assert resolved.value == rotated_credentials
+
+
+@pytest.mark.asyncio
+async def test_codex_isolated_explicit_binding_precedes_host_snapshot(tmp_path) -> None:
+    store = FileSecretsStore(tmp_path / "settings")
+    host_credentials = _codex_auth("host-refresh", "host-access")
+    explicit_credentials = _codex_auth("explicit-refresh", "explicit-access")
+    host_auth = tmp_path / "host" / ".codex" / "auth.json"
+    host_auth.parent.mkdir(parents=True)
+    host_auth.write_text(host_credentials, encoding="utf-8")
+    request = StartConversationRequest(
+        agent=ACPAgent(
+            acp_command=["codex-acp"],
+            acp_server="codex",
+            acp_isolate_data_dir=True,
+        ),
+        workspace=LocalWorkspace(working_dir=tmp_path / "workspace"),
+        secrets={
+            CODEX_AUTH_SECRET_NAME: StaticSecret(value=SecretStr(explicit_credentials))
+        },
+    )
+
+    with patch(
+        "openhands.sdk.agent.acp_file_credentials.Path.home",
+        return_value=tmp_path / "host",
+    ):
+        async with ConversationService(
+            conversations_dir=tmp_path / "conversations",
+            secrets_store=store,
+        ) as service:
+            info, _ = await service.start_conversation(request)
+            event_service = await service.get_event_service(info.id)
+            assert event_service is not None
+            assert store.get_secret(CODEX_AUTH_SECRET_NAME) == explicit_credentials
+            assert host_auth.read_text(encoding="utf-8") == host_credentials
+
+
+@pytest.mark.asyncio
+async def test_codex_isolated_pending_binding_precedes_host_snapshot(tmp_path) -> None:
+    conversation_id = uuid4()
+    store = FileSecretsStore(tmp_path / "settings")
+    host_credentials = _codex_auth("host-refresh", "host-access")
+    host_auth = tmp_path / "host" / ".codex" / "auth.json"
+    host_auth.parent.mkdir(parents=True)
+    host_auth.write_text(host_credentials, encoding="utf-8")
+    binding = HttpVersionedCredentialBinding(
+        "https://app.test/api/credential",
+        {"Authorization": "Bearer binding"},
+    )
+    request = StartConversationRequest(
+        conversation_id=conversation_id,
+        agent=ACPAgent(
+            acp_command=["codex-acp"],
+            acp_server="codex",
+            acp_isolate_data_dir=True,
+        ),
+        workspace=LocalWorkspace(working_dir=tmp_path / "workspace"),
+    )
+
+    with patch(
+        "openhands.sdk.agent.acp_file_credentials.Path.home",
+        return_value=tmp_path / "host",
+    ):
+        async with ConversationService(
+            conversations_dir=tmp_path / "conversations",
+            secrets_store=store,
+        ) as service:
+            await service.activate_credential_binding(
+                conversation_id,
+                CODEX_AUTH_SECRET_NAME,
+                binding,
+            )
+            info, _ = await service.start_conversation(request)
+            event_service = await service.get_event_service(info.id)
+            assert event_service is not None
+            assert event_service.credential_bindings[CODEX_AUTH_SECRET_NAME] is binding
+            assert store.get_secret(CODEX_AUTH_SECRET_NAME) is None
+            assert host_auth.read_text(encoding="utf-8") == host_credentials
 
 
 @pytest.mark.asyncio

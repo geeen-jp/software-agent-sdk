@@ -54,7 +54,11 @@ from openhands.sdk.agent.acp_claude_auth import (
     is_valid_claude_oauth_credentials,
     resolve_claude_oauth_credentials,
 )
-from openhands.sdk.agent.acp_file_credentials import CODEX_AUTH_SECRET_NAME
+from openhands.sdk.agent.acp_file_credentials import (
+    CODEX_AUTH_SECRET_NAME,
+    is_valid_codex_auth,
+    resolve_codex_auth_credentials,
+)
 from openhands.sdk.agent.base import AgentBase
 from openhands.sdk.conversation.impl.local_conversation import LocalConversation
 from openhands.sdk.conversation.persistence_const import BASE_STATE
@@ -881,6 +885,14 @@ class ConversationService:
             and agent.acp_isolate_data_dir
         )
 
+    @staticmethod
+    def _is_isolated_codex_agent(agent: AgentBase | None) -> bool:
+        return (
+            isinstance(agent, ACPAgent)
+            and agent.acp_server == "codex"
+            and agent.acp_isolate_data_dir
+        )
+
     async def _has_local_codex_credential(self) -> bool:
         if self.secrets_store is None:
             return False
@@ -950,6 +962,45 @@ class ConversationService:
         )
         return await self._has_local_claude_credential()
 
+    async def _ensure_local_codex_credential(
+        self,
+        agent: AgentBase | None,
+        explicit_credentials: object | None = None,
+        *,
+        allow_host_source: bool = True,
+    ) -> bool:
+        """Bootstrap isolated Codex from the host subscription credential."""
+        if not self._is_isolated_codex_agent(agent) or self.secrets_store is None:
+            return False
+        if await self._has_local_codex_credential():
+            return True
+
+        candidate = self._secret_value(explicit_credentials)
+        if not is_valid_codex_auth(candidate):
+            context = agent.agent_context if isinstance(agent, ACPAgent) else None
+            context_secret = (
+                context.secrets.get(CODEX_AUTH_SECRET_NAME)
+                if context is not None and context.secrets
+                else None
+            )
+            candidate = self._secret_value(context_secret)
+        if not is_valid_codex_auth(candidate):
+            if not allow_host_source:
+                return False
+            try:
+                candidate = resolve_codex_auth_credentials()
+            except CredentialNeedsReauthentication:
+                return False
+        if not isinstance(candidate, str):
+            return False
+
+        await asyncio.to_thread(
+            self.secrets_store.set_secret_if_absent,
+            CODEX_AUTH_SECRET_NAME,
+            candidate,
+        )
+        return await self._has_local_codex_credential()
+
     async def _resolve_credential_bindings(
         self,
         stored: StoredConversation,
@@ -963,20 +1014,23 @@ class ConversationService:
         if agent is None:
             agent = await asyncio.to_thread(self._agent_from_base_state, stored.id)
         bindings = self._credential_bindings.pop(stored.id, {})
-        if (
-            CODEX_AUTH_SECRET_NAME not in bindings
-            and self._is_codex_agent(agent)
-            and await self._has_local_codex_credential()
-        ):
-            assert self.secrets_store is not None
-            from openhands.agent_server.credential_binding import (
-                LocalVersionedCredentialBinding,
-            )
+        if CODEX_AUTH_SECRET_NAME not in bindings and self._is_codex_agent(agent):
+            if (
+                self._is_isolated_codex_agent(agent)
+                and CODEX_AUTH_SECRET_NAME
+                not in stored.required_runtime_credential_bindings
+            ):
+                await self._ensure_local_codex_credential(agent)
+            if await self._has_local_codex_credential():
+                assert self.secrets_store is not None
+                from openhands.agent_server.credential_binding import (
+                    LocalVersionedCredentialBinding,
+                )
 
-            bindings[CODEX_AUTH_SECRET_NAME] = LocalVersionedCredentialBinding(
-                self.secrets_store,
-                CODEX_AUTH_SECRET_NAME,
-            )
+                bindings[CODEX_AUTH_SECRET_NAME] = LocalVersionedCredentialBinding(
+                    self.secrets_store,
+                    CODEX_AUTH_SECRET_NAME,
+                )
         if (
             CLAUDE_CREDENTIALS_SECRET_NAME not in bindings
             and self._is_isolated_claude_agent(agent)
@@ -1537,6 +1591,23 @@ class ConversationService:
                     # ``is_open()`` above guarantees a live conversation, so the
                     # public getter never raises here.
                     existing_agent = existing_event_service.get_conversation().agent
+                    if (
+                        self._is_isolated_codex_agent(existing_agent)
+                        and CODEX_AUTH_SECRET_NAME
+                        not in getattr(
+                            existing_event_service, "credential_bindings", {}
+                        )
+                        and CODEX_AUTH_SECRET_NAME
+                        not in self._credential_bindings.get(conversation_id, {})
+                    ):
+                        await self._ensure_local_codex_credential(
+                            existing_agent,
+                            request.secrets.get(CODEX_AUTH_SECRET_NAME),
+                            allow_host_source=CODEX_AUTH_SECRET_NAME
+                            not in (
+                                existing_event_service.stored.required_runtime_credential_bindings
+                            ),
+                        )
                     await self._ensure_local_claude_credential(
                         existing_agent,
                         request.secrets.get(CLAUDE_CREDENTIALS_SECRET_NAME),
@@ -1622,6 +1693,17 @@ class ConversationService:
                 reattach_agent = await asyncio.to_thread(
                     self._agent_from_base_state, conversation_id
                 )
+                if CODEX_AUTH_SECRET_NAME not in self._credential_bindings.get(
+                    conversation_id, {}
+                ):
+                    await self._ensure_local_codex_credential(
+                        reattach_agent,
+                        request.secrets.get(CODEX_AUTH_SECRET_NAME),
+                        allow_host_source=CODEX_AUTH_SECRET_NAME
+                        not in (
+                            existing_record.stored.required_runtime_credential_bindings
+                        ),
+                    )
                 await self._ensure_local_claude_credential(
                     reattach_agent,
                     request.secrets.get(CLAUDE_CREDENTIALS_SECRET_NAME),
@@ -1770,6 +1852,13 @@ class ConversationService:
             request, conversation_id, self.conversation_worktree_root
         )
 
+        if CODEX_AUTH_SECRET_NAME not in self._credential_bindings.get(
+            conversation_id, {}
+        ):
+            await self._ensure_local_codex_credential(
+                request.agent,
+                request.secrets.get(CODEX_AUTH_SECRET_NAME),
+            )
         await self._ensure_local_claude_credential(
             request.agent,
             request.secrets.get(CLAUDE_CREDENTIALS_SECRET_NAME),
