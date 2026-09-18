@@ -107,6 +107,38 @@ def test_settings_and_secrets_stores_fall_back_to_home(
     assert not (repo / "workspace" / ".openhands" / "secrets.json").exists()
 
 
+def test_secrets_store_uses_dedicated_managed_directory(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    reset_stores()
+    ephemeral = tmp_path / "agent-persistence"
+    provider = tmp_path / "provider-credentials"
+    monkeypatch.setenv("OH_PERSISTENCE_DIR", str(ephemeral))
+    monkeypatch.setenv("OH_SECRETS_DIR", str(provider))
+    try:
+        store = get_secrets_store()
+        assert store.persistence_dir == provider
+        assert store.persistence_dir != ephemeral
+    finally:
+        reset_stores()
+
+
+def test_managed_secrets_survive_store_restart(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    provider = tmp_path / "provider-credentials"
+    monkeypatch.setenv("OH_SECRETS_DIR", str(provider))
+    reset_stores()
+    try:
+        first = get_secrets_store()
+        first.set_secret("CLAUDE_CREDENTIALS_JSON", "rotated-credential")
+        reset_stores()
+        second = get_secrets_store()
+        assert second.get_secret("CLAUDE_CREDENTIALS_JSON") == "rotated-credential"
+    finally:
+        reset_stores()
+
+
 def test_profile_stores_do_not_read_home_directory(
     isolated_persistence_dir: Path,
 ) -> None:

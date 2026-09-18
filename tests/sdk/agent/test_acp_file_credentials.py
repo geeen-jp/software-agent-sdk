@@ -321,6 +321,31 @@ def test_claude_oauth_unreadable_runtime_reports_claude() -> None:
         lifecycle.discard()
 
 
+def test_claude_oauth_close_retains_runtime_when_final_flush_fails() -> None:
+    lifecycle, _ = _claude_lifecycle(
+        MemoryBinding(_claude_auth("refresh-r0")), SecretRegistry()
+    )
+    assert lifecycle.path is not None
+    runtime = cast(Any, lifecycle)
+    runtime_dir = lifecycle.path.parent
+    try:
+        with patch.object(
+            runtime,
+            "_flush",
+            side_effect=CredentialSyncError("final flush failed"),
+        ):
+            with pytest.raises(CredentialSyncError, match="final flush failed"):
+                lifecycle.close()
+        assert runtime_dir.exists()
+        assert lifecycle.path is not None
+        assert lifecycle.path.parent == runtime_dir
+        lifecycle.close()
+        assert not runtime_dir.exists()
+        assert lifecycle.path is None
+    finally:
+        lifecycle.discard()
+
+
 def test_mask_tracking_does_not_sleep_or_write() -> None:
     initial = _auth("refresh-r0", "access-r0")
     rotated = _auth("refresh-r1", "access-r1")

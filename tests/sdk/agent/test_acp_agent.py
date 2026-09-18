@@ -1250,6 +1250,20 @@ class TestACPAgentStep:
 
 
 class TestACPAgentCleanup:
+    def test_close_retries_file_credential_after_final_flush_failure(self):
+        agent = _make_agent()
+        lifecycle = MagicMock()
+        lifecycle.close.side_effect = [RuntimeError("final flush failed"), None]
+        agent._file_credential_lifecycles["CLAUDE_CREDENTIALS_JSON"] = lifecycle
+
+        with pytest.raises(RuntimeError, match="final flush failed"):
+            agent.close()
+        assert "CLAUDE_CREDENTIALS_JSON" in agent._file_credential_lifecycles
+
+        agent.close()
+        assert "CLAUDE_CREDENTIALS_JSON" not in agent._file_credential_lifecycles
+        assert lifecycle.close.call_count == 2
+
     def test_close_terminates_process(self):
         agent = _make_agent()
         mock_process = MagicMock()
