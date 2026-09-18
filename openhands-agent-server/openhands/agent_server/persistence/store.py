@@ -832,6 +832,8 @@ _llm_profile_store: LLMProfileStore | None = None
 _agent_profile_store: AgentProfileStore | None = None
 _store_lock = threading.Lock()
 
+SECRETS_PERSISTENCE_DIR_ENV = "OH_SECRETS_DIR"
+
 
 def _get_persistence_dir(config: Config | None = None) -> Path:
     """Get the persistence directory from config or default."""
@@ -859,6 +861,20 @@ def _get_profile_persistence_dir() -> Path:
     if env_dir:
         return Path(env_dir)
     return Path.home() / ".openhands"
+
+
+def _get_secrets_persistence_dir() -> Path:
+    """Get the authoritative provider-credential persistence directory.
+
+    ``OH_SECRETS_DIR`` is deliberately separate from ``OH_PERSISTENCE_DIR``:
+    managed runtime cleanup may remove conversation/agent state while provider
+    credential rotations must survive a restart. Without the dedicated override,
+    the existing profile persistence hierarchy remains the local default.
+    """
+    env_dir = os.environ.get(SECRETS_PERSISTENCE_DIR_ENV)
+    if env_dir:
+        return Path(env_dir)
+    return _get_profile_persistence_dir()
 
 
 def _get_cipher(config: Config | None = None) -> Cipher | None:
@@ -926,7 +942,7 @@ def get_secrets_store(config: Config | None = None) -> FileSecretsStore:
         # Double-check after acquiring lock
         if _secrets_store is None:
             _secrets_store = FileSecretsStore(
-                persistence_dir=_get_profile_persistence_dir(),
+                persistence_dir=_get_secrets_persistence_dir(),
                 cipher=_get_cipher(config),
             )
         return _secrets_store

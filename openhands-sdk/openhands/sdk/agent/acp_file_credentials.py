@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import shutil
 import tempfile
 import threading
 import time
-from collections.abc import Callable, Coroutine
+from collections.abc import Callable, Coroutine, Mapping
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -28,6 +29,7 @@ from openhands.sdk.utils.files import atomic_write_text
 logger = get_logger(__name__)
 
 CODEX_AUTH_SECRET_NAME = "CODEX_AUTH_JSON"
+CODEX_AUTH_SOURCE_ROOT_ENV = "OPENHANDS_CODEX_AUTH_SOURCE"
 
 _CHATGPT_AUTH_PATH = Path(".codex") / "auth.json"
 _MONITOR_INTERVAL_SECONDS = 0.1
@@ -61,27 +63,34 @@ class ACPFileCredentialLifecycle(Protocol):
     def discard(self) -> None: ...
 
 
-def codex_auth_file(env: dict[str, str]) -> Path:
+def codex_auth_file(env: Mapping[str, str]) -> Path:
     codex_home = env.get("CODEX_HOME")
     if codex_home:
         return Path(codex_home) / "auth.json"
     return Path.home() / _CHATGPT_AUTH_PATH
 
 
-def codex_auth_source_root(*, source_root: Path | None = None) -> Path:
+def codex_auth_source_root(
+    *,
+    source_root: Path | None = None,
+    environ: Mapping[str, str] | None = None,
+) -> Path:
     """Resolve the host Codex config directory at credential lookup time.
 
-    ``CODEX_HOME`` belongs to the child ACP process and may already point to
-    an isolated conversation directory. Host bootstrap must therefore resolve
-    the user's normal config directory directly instead of consulting that
-    effective runtime environment.
+    ``CODEX_HOME`` belongs to the child ACP process and may already point to an
+    isolated conversation directory.  The runtime bootstrap therefore uses a
+    separate, explicit source-root variable for the host ChatGPT credential.
     """
     if source_root is not None:
         return source_root
+    env = os.environ if environ is None else environ
+    configured = env.get(CODEX_AUTH_SOURCE_ROOT_ENV)
+    if configured:
+        return Path(configured)
     return Path.home() / _CHATGPT_AUTH_PATH.parent
 
 
-def codex_auth_file_is_chatgpt(env: dict[str, str]) -> bool:
+def codex_auth_file_is_chatgpt(env: Mapping[str, str]) -> bool:
     path = codex_auth_file(env)
     if not path.is_file():
         return False
@@ -114,9 +123,15 @@ def is_valid_codex_auth(value: object) -> bool:
     )
 
 
-def resolve_codex_auth_credentials(*, source_root: Path | None = None) -> str:
+def resolve_codex_auth_credentials(
+    *,
+    source_root: Path | None = None,
+    environ: Mapping[str, str] | None = None,
+) -> str:
     """Read valid host ChatGPT credentials without modifying the source file."""
-    path = codex_auth_source_root(source_root=source_root) / "auth.json"
+    path = (
+        codex_auth_source_root(source_root=source_root, environ=environ) / "auth.json"
+    )
     try:
         value = path.read_text(encoding="utf-8")
     except (OSError, UnicodeError):

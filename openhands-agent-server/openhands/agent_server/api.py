@@ -60,6 +60,7 @@ from openhands.agent_server.profiles_router import profiles_router
 from openhands.agent_server.provider_connections_router import (
     provider_connections_router,
 )
+from openhands.agent_server.runtime_router import runtime_router
 from openhands.agent_server.server_details_router import (
     get_server_info,
     mark_initialization_complete,
@@ -426,6 +427,7 @@ def _add_api_routes(app: FastAPI) -> None:
     api_router.include_router(hooks_router)
     api_router.include_router(llm_router)
     api_router.include_router(provider_connections_router)
+    api_router.include_router(runtime_router)
     api_router.include_router(mcp_router)
     api_router.include_router(settings_router)
     api_router.include_router(workspaces_router)

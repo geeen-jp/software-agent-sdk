@@ -21,6 +21,7 @@ CLAUDE_CREDENTIALS_FILENAME = ".credentials.json"
 CLAUDE_CREDENTIALS_SECRET_NAME = "CLAUDE_CREDENTIALS_JSON"
 CLAUDE_OAUTH_TOKEN_ENV = "CLAUDE_CODE_OAUTH_TOKEN"
 CLAUDE_CONFIG_DIR_ENV = "CLAUDE_CONFIG_DIR"
+CLAUDE_OAUTH_SOURCE_ROOT_ENV = "OPENHANDS_CLAUDE_CREDENTIALS_SOURCE"
 CLAUDE_OAUTH_ENV_NAMES = frozenset(
     {
         CLAUDE_CREDENTIALS_SECRET_NAME,
@@ -90,7 +91,7 @@ def claude_oauth_source_root(
     if source_root is not None:
         return source_root
     env = os.environ if environ is None else environ
-    config_dir = env.get(CLAUDE_CONFIG_DIR_ENV)
+    config_dir = env.get(CLAUDE_OAUTH_SOURCE_ROOT_ENV) or env.get(CLAUDE_CONFIG_DIR_ENV)
     if config_dir:
         return Path(config_dir)
     return Path.home() / ".claude"

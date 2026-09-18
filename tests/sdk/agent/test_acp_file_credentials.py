@@ -206,6 +206,18 @@ def test_resolve_codex_auth_credentials_reads_runtime_host_source(tmp_path) -> N
     assert auth_path.read_text(encoding="utf-8") == credentials
 
 
+def test_resolve_codex_auth_credentials_uses_explicit_source_environment(
+    tmp_path, monkeypatch
+) -> None:
+    source_root = tmp_path / "managed-codex-source"
+    source_root.mkdir()
+    credentials = _auth("managed-refresh", "managed-access")
+    (source_root / "auth.json").write_text(credentials, encoding="utf-8")
+    monkeypatch.setenv("OPENHANDS_CODEX_AUTH_SOURCE", str(source_root))
+
+    assert resolve_codex_auth_credentials() == credentials
+
+
 @pytest.mark.parametrize(
     "contents",
     [None, "not-json", json.dumps({"auth_mode": "chatgpt", "tokens": {}})],
@@ -305,6 +317,31 @@ def test_claude_oauth_unreadable_runtime_reports_claude() -> None:
         with patch.object(runtime, "_read_stable", return_value=None):
             with pytest.raises(CredentialSyncError, match="Claude OAuth"):
                 lifecycle.flush()
+    finally:
+        lifecycle.discard()
+
+
+def test_claude_oauth_close_retains_runtime_when_final_flush_fails() -> None:
+    lifecycle, _ = _claude_lifecycle(
+        MemoryBinding(_claude_auth("refresh-r0")), SecretRegistry()
+    )
+    assert lifecycle.path is not None
+    runtime = cast(Any, lifecycle)
+    runtime_dir = lifecycle.path.parent
+    try:
+        with patch.object(
+            runtime,
+            "_flush",
+            side_effect=CredentialSyncError("final flush failed"),
+        ):
+            with pytest.raises(CredentialSyncError, match="final flush failed"):
+                lifecycle.close()
+        assert runtime_dir.exists()
+        assert lifecycle.path is not None
+        assert lifecycle.path.parent == runtime_dir
+        lifecycle.close()
+        assert not runtime_dir.exists()
+        assert lifecycle.path is None
     finally:
         lifecycle.discard()
 

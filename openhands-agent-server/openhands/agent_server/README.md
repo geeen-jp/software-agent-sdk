@@ -99,6 +99,30 @@ Create a JSON configuration file (default: `workspace/openhands_agent_server_con
 
 **Note**: Directory configuration (`working_dir`) will be handled at the conversation level rather than globally. These directories are specified when starting a conversation through the API.
 
+### Managed runtime readiness
+
+The production-shaped workflow supervisor starts one Agent Server with a
+generated `session_api_keys` value and explicit host provider source roots.
+Workflow clients must send that same value in `X-Session-API-Key`; they must
+not create a second key or choose another endpoint.
+
+Authenticated `GET /api/runtime/readiness` returns only safe readiness data:
+the session-key auth mode, boolean Claude OAuth and Codex ChatGPT provider
+readiness, stable failure names, and the build SHA. Credential contents are
+never returned. The managed supervisor checks this endpoint before starting
+workflow and scheduler admission.
+
+The source-root environment variables are:
+
+- `OPENHANDS_CLAUDE_CREDENTIALS_SOURCE`, containing the directory with
+  `.credentials.json`;
+- `OPENHANDS_CODEX_AUTH_SOURCE`, containing the directory with `auth.json`.
+
+The SDK validates and copies each source into an isolated conversation-owned
+binding, observes refresh/rotation, masks credential values, and removes the
+isolated file during conversation cleanup. The host source files are read-only
+inputs to the managed runtime.
+
 ### Telemetry
 
 The agent server can emit a small set of **product-analytics** events to PostHog.
