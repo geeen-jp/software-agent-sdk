@@ -206,6 +206,18 @@ def test_resolve_codex_auth_credentials_reads_runtime_host_source(tmp_path) -> N
     assert auth_path.read_text(encoding="utf-8") == credentials
 
 
+def test_resolve_codex_auth_credentials_uses_explicit_source_environment(
+    tmp_path, monkeypatch
+) -> None:
+    source_root = tmp_path / "managed-codex-source"
+    source_root.mkdir()
+    credentials = _auth("managed-refresh", "managed-access")
+    (source_root / "auth.json").write_text(credentials, encoding="utf-8")
+    monkeypatch.setenv("OPENHANDS_CODEX_AUTH_SOURCE", str(source_root))
+
+    assert resolve_codex_auth_credentials() == credentials
+
+
 @pytest.mark.parametrize(
     "contents",
     [None, "not-json", json.dumps({"auth_mode": "chatgpt", "tokens": {}})],
