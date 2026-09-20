@@ -17,6 +17,7 @@ from openhands.sdk.settings.acp_providers import (
     GEMINI_CLI_VERSION,
     ACPModelOption,
     ACPProviderInfo,
+    ACPStructuredOutputCompatibilityError,
     _build_session_meta,
     _build_session_structured_output_meta,
     _merge_claude_session_meta,
@@ -400,23 +401,81 @@ class TestStructuredOutputSessionMeta:
         )
 
     def test_claude_mapping_uses_exact_output_format_path(self):
+        caller_schema = {
+            "type": "object",
+            "properties": {
+                "result": {
+                    "type": "object",
+                    "properties": {"value": {"type": "string"}},
+                    "required": ["value"],
+                    "additionalProperties": False,
+                }
+            },
+            "required": ["result"],
+            "additionalProperties": False,
+        }
+        before = json.loads(json.dumps(caller_schema))
+        config = StructuredOutputConfig(mode="json_schema", schema=caller_schema)
         result = _build_session_structured_output_meta(
-            "claude-agent-acp 0.63.0", self._config()
+            "claude-agent-acp 0.63.0", config
         )
         assert result == {
             "claudeCode": {
                 "options": {
                     "outputFormat": {
                         "type": "json_schema",
-                        "schema": {
-                            "type": "object",
-                            "properties": {"result": {"type": "string"}},
-                            "required": ["result"],
-                        },
+                        "schema": caller_schema,
                     }
                 }
             }
         }
+        assert caller_schema == before
+        result["claudeCode"]["options"]["outputFormat"]["schema"]["properties"][
+            "result"
+        ]["properties"]["value"]["type"] = "integer"
+        assert caller_schema == before
+
+    @pytest.mark.parametrize("keyword", ["oneOf", "anyOf", "allOf"])
+    def test_top_level_composition_fails_closed(self, keyword):
+        schema = {
+            "type": "object",
+            keyword: [{"type": "object"}],
+        }
+        config = StructuredOutputConfig(mode="json_schema", schema=schema)
+
+        with pytest.raises(
+            ACPStructuredOutputCompatibilityError,
+            match=rf"top-level '{keyword}'",
+        ):
+            _build_session_structured_output_meta("claude-agent-acp", config)
+
+    def test_root_union_without_object_type_reports_composition(self):
+        config = StructuredOutputConfig(
+            mode="json_schema",
+            schema={"anyOf": [{"type": "string"}, {"type": "null"}]},
+        )
+
+        with pytest.raises(
+            ACPStructuredOutputCompatibilityError,
+            match="top-level 'anyOf'",
+        ):
+            _build_session_structured_output_meta("claude-agent-acp", config)
+
+    def test_nested_composition_and_refs_are_left_unchanged(self):
+        schema = {
+            "type": "object",
+            "$defs": {"value": {"type": "string"}},
+            "properties": {
+                "value": {"anyOf": [{"$ref": "#/$defs/value"}, {"type": "null"}]}
+            },
+            "required": ["value"],
+            "additionalProperties": True,
+        }
+        config = StructuredOutputConfig(mode="json_schema", schema=schema)
+
+        result = _build_session_structured_output_meta("claude-agent-acp", config)
+
+        assert result["claudeCode"]["options"]["outputFormat"]["schema"] == schema
 
     def test_model_and_structured_output_metadata_coexist(self):
         result = _build_session_meta(

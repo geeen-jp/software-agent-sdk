@@ -44,6 +44,45 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from .structured_output import StructuredOutputConfig
 
 
+class ACPStructuredOutputCompatibilityError(ValueError):
+    """Raised when a schema cannot be represented by the qualified ACP path."""
+
+
+_CLAUDE_UNSUPPORTED_TOP_LEVEL_COMBINATORS = ("oneOf", "anyOf", "allOf")
+
+
+def validate_claude_structured_output_schema(
+    schema: Mapping[str, Any],
+) -> None:
+    """Validate the exact root boundary of Claude ACP structured output.
+
+    The pinned ``claude-agent-acp``/Claude Agent SDK path sends this schema as
+    a custom tool input schema. That boundary requires a root object and
+    rejects root-level composition keywords, even though the same keywords
+    are accepted in nested schemas. A root union (or conditional root
+    ``allOf``) cannot be flattened into one object without changing branch
+    membership, required fields, or branch constraints, so the SDK fails
+    closed instead of inventing a provider-specific broadening.
+
+    This deliberately does not normalize nested JSON Schema features. The
+    caller's schema remains the semantic authority and the qualified provider
+    currently accepts the nested features unchanged.
+    """
+    for keyword in _CLAUDE_UNSUPPORTED_TOP_LEVEL_COMBINATORS:
+        if keyword in schema:
+            raise ACPStructuredOutputCompatibilityError(
+                "Claude ACP structured output does not support top-level "
+                f"{keyword!r}; no generic semantics-preserving projection is "
+                "available"
+            )
+
+    if schema.get("type") != "object":
+        raise ACPStructuredOutputCompatibilityError(
+            "Claude ACP structured output requires a top-level JSON Schema "
+            "object with type='object'"
+        )
+
+
 @dataclass(frozen=True)
 class ACPModelOption:
     """One selectable model for a built-in ACP provider's model picker."""
@@ -716,6 +755,7 @@ def _build_session_structured_output_meta(
         mode=structured_output.mode,
         schema=copy.deepcopy(structured_output.schema),
     ).schema
+    validate_claude_structured_output_schema(schema)
     return {
         "claudeCode": {
             "options": {

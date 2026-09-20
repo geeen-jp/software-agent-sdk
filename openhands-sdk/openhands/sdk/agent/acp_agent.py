@@ -124,6 +124,7 @@ from openhands.sdk.settings.acp_providers import (
     resolve_acp_package_version,
     resolve_acp_runtime_version,
     resolve_effective_acp_provider_key,
+    validate_claude_structured_output_schema,
 )
 from openhands.sdk.settings.structured_output import StructuredOutputConfig
 from openhands.sdk.tool import Tool  # noqa: TC002
@@ -2166,6 +2167,7 @@ class ACPAgent(AgentBase):
                     "structured_output is unsupported for ACP provider "
                     f"{configured_provider!r}; only Claude ACP is qualified"
                 )
+            validate_claude_structured_output_schema(self.structured_output.schema)
         # Propagate the actual model name to the sentinel LLM and its
         # metrics so that logs, serialized state, and cost/token entries
         # show the real model instead of the "acp-managed" placeholder.
