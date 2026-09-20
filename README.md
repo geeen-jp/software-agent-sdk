@@ -98,6 +98,59 @@ The documentation includes:
 - [Guides](https://docs.openhands.dev/sdk/guides/hello-world) - Hello World, custom tools, MCP, skills, and more
 - [Agent Server API Reference](https://docs.openhands.dev/sdk/guides/agent-server/api-reference/server-details/alive) - REST API reference for the remote agent server
 
+### ACP structured output
+
+`StructuredOutputConfig` provides a provider-neutral, programmatic way to
+request structured output from an ACP agent. The caller supplies the canonical
+JSON Schema through `schema`; `StructuredOutputMode` currently supports only
+`"json_schema"`.
+
+For example, configure the same request either directly on `ACPAgent` or
+through `ACPAgentSettings`:
+
+```python
+from openhands.sdk import ACPAgentSettings, StructuredOutputConfig
+from openhands.sdk.agent import ACPAgent
+
+structured_output = StructuredOutputConfig(
+    mode="json_schema",
+    schema={
+        "type": "object",
+        "properties": {
+            "summary": {"type": "string"},
+            "severity": {"type": "string", "enum": ["low", "medium", "high"]},
+        },
+        "required": ["summary", "severity"],
+        "additionalProperties": False,
+    },
+)
+
+agent = ACPAgent(
+    acp_command=["npx", "-y", "@agentclientprotocol/claude-agent-acp"],
+    structured_output=structured_output,
+)
+
+# Or use the settings factory:
+settings = ACPAgentSettings(
+    acp_server="claude-code",
+    structured_output=structured_output,
+)
+agent = settings.create_agent()
+```
+
+The current qualified provider mapping is Claude ACP. The SDK maps the
+caller-supplied schema to Claude's provider-native JSON Schema output
+mechanism; its internal `_meta.claudeCode.options.outputFormat` path is
+provider-specific session metadata, not an ACP standard field. This setting
+is not an arbitrary raw ACP `_meta` passthrough.
+
+The caller owns the schema's meaning and validates the returned semantic
+result. The SDK owns only provider/ACP attachment mechanics and does not
+interpret workflow or domain outcomes. Requesting structured output for a
+provider without a qualified mapping fails explicitly; the SDK does not
+silently ignore the request or downgrade it to prompt-only behavior. Provider
+support must be explicitly implemented and qualified.
+
 ## Examples
 
 The `examples/` directory contains comprehensive usage examples:
