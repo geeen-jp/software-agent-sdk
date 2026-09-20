@@ -16,6 +16,7 @@ from openhands.sdk import (
     ConversationSettings,
     OpenHandsAgentSettings,
     SettingProminence,
+    StructuredOutputConfig,
     Tool,
     default_agent_settings,
     export_agent_settings_schema,
@@ -332,6 +333,65 @@ def test_acp_create_request_lifts_context_secrets_into_request_secrets() -> None
     assert set(request.secrets) == {"ANTHROPIC_API_KEY", "GITHUB_TOKEN"}
     assert request.secrets["ANTHROPIC_API_KEY"].get_value() == "sk-provider"
     assert request.secrets["GITHUB_TOKEN"].get_value() == "ghp_x"
+
+
+def test_acp_structured_output_propagates_to_agent_and_round_trips() -> None:
+    config = StructuredOutputConfig(
+        mode="json_schema",
+        schema={
+            "type": "object",
+            "properties": {"result": {"type": "string"}},
+            "required": ["result"],
+        },
+    )
+    settings = ACPAgentSettings(
+        acp_server="claude-code",
+        structured_output=config,
+    )
+
+    agent = settings.create_agent()
+
+    assert agent.structured_output == config
+    assert settings.model_dump(mode="json")["structured_output"] == {
+        "mode": "json_schema",
+        "schema": config.schema,
+    }
+    restored = ACPAgent.model_validate_json(agent.model_dump_json())
+    assert restored.structured_output == config
+
+
+def test_acp_structured_output_unset_preserves_existing_serialization() -> None:
+    settings = ACPAgentSettings()
+    agent = settings.create_agent()
+
+    assert "structured_output" not in settings.model_dump(mode="json")
+    assert "structured_output" not in agent.model_dump(mode="json")
+
+
+def test_structured_output_rejects_invalid_schema_before_provider_dispatch() -> None:
+    with pytest.raises(ValidationError, match="JSON-serializable"):
+        StructuredOutputConfig(mode="json_schema", schema={"value": object()})
+
+    with pytest.raises(ValidationError, match="nested object keys must be strings"):
+        StructuredOutputConfig(
+            mode="json_schema",
+            schema={"properties": {1: {"type": "string"}}},
+        )
+
+    with pytest.raises(ValidationError, match="JSON object"):
+        StructuredOutputConfig.model_validate(
+            {"mode": "json_schema", "schema": ["not-an-object"]}
+        )
+
+    with pytest.raises(ValidationError):
+        StructuredOutputConfig.model_validate({"mode": "json_object", "schema": {}})
+
+
+def test_acp_structured_output_rejects_unsupported_provider() -> None:
+    config = StructuredOutputConfig(mode="json_schema", schema={"type": "object"})
+
+    with pytest.raises(ValidationError, match="only for acp_server='claude-code'"):
+        ACPAgentSettings(acp_server="codex", structured_output=config)
 
 
 # ---------------------------------------------------------------------------

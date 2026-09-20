@@ -32,6 +32,7 @@ own copies of this metadata.
 
 from __future__ import annotations
 
+import copy
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import PurePosixPath
@@ -39,6 +40,8 @@ from types import MappingProxyType
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+from .structured_output import StructuredOutputConfig
 
 
 @dataclass(frozen=True)
@@ -678,3 +681,122 @@ def build_session_model_meta(agent_name: str, acp_model: str | None) -> dict[str
     if provider is None or provider.session_meta_key is None:
         return {}
     return {provider.session_meta_key: {"options": {"model": acp_model}}}
+
+
+def _build_session_structured_output_meta(
+    agent_name: str,
+    structured_output: StructuredOutputConfig | None,
+) -> dict[str, Any]:
+    """Build the qualified provider metadata for structured output.
+
+    Claude ACP 0.63.0 forwards ``claudeCode.options`` to the pinned Claude
+    Agent SDK 0.3.220, whose ``Options.outputFormat`` accepts the JSON Schema
+    shape.
+    No other provider mapping is inferred here; unsupported providers fail
+    closed before ``session/new`` or ``session/load`` is called.
+    """
+    if structured_output is None:
+        return {}
+
+    provider = detect_acp_provider_by_agent_name(agent_name)
+    if provider is None or provider.key != "claude-code":
+        raise ValueError(
+            "ACP structured_output is unsupported for provider "
+            f"{agent_name!r}; only the qualified Claude ACP mapping is available"
+        )
+    if structured_output.mode != "json_schema":
+        raise ValueError(
+            f"ACP structured_output mode {structured_output.mode!r} is not supported"
+        )
+
+    # The model validates this at construction time. Re-check at the provider
+    # boundary so a caller cannot mutate the nested dict into an invalid
+    # payload between settings validation and session startup.
+    schema = StructuredOutputConfig(
+        mode=structured_output.mode,
+        schema=copy.deepcopy(structured_output.schema),
+    ).schema
+    return {
+        "claudeCode": {
+            "options": {
+                "outputFormat": {
+                    "type": "json_schema",
+                    "schema": schema,
+                }
+            }
+        }
+    }
+
+
+def _merge_claude_session_meta(
+    existing_meta: Mapping[str, Any],
+    additional_meta: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Merge the SDK-owned Claude session metadata without clobbering it.
+
+    This intentionally handles only the ``claudeCode.options`` subtree used by
+    the SDK's bounded session settings. A duplicate option key is a conflict,
+    not a last-write-wins merge.
+    """
+    result = copy.deepcopy(dict(existing_meta))
+    if not additional_meta:
+        return result
+
+    additional_claude = additional_meta.get("claudeCode")
+    if not isinstance(additional_claude, Mapping):
+        raise ValueError("Claude session metadata must contain a claudeCode object")
+    additional_options = additional_claude.get("options")
+    if not isinstance(additional_options, Mapping):
+        raise ValueError(
+            "Claude session metadata must contain a claudeCode.options object"
+        )
+
+    if "claudeCode" not in result:
+        result["claudeCode"] = copy.deepcopy(dict(additional_claude))
+        return result
+    existing_claude = result["claudeCode"]
+    if not isinstance(existing_claude, Mapping):
+        raise ValueError("Conflicting claudeCode session metadata")
+
+    existing_claude = dict(existing_claude)
+    existing_options = existing_claude.get("options", {})
+    if not isinstance(existing_options, Mapping):
+        raise ValueError("Conflicting claudeCode.options session metadata")
+
+    conflicts = set(existing_options).intersection(additional_options)
+    if conflicts:
+        names = ", ".join(sorted(str(name) for name in conflicts))
+        raise ValueError(
+            "Conflicting Claude session metadata option(s): "
+            f"{names}; refusing ambiguous overwrite"
+        )
+
+    existing_claude["options"] = {
+        **copy.deepcopy(dict(existing_options)),
+        **copy.deepcopy(dict(additional_options)),
+    }
+    for key, value in additional_claude.items():
+        if key == "options":
+            continue
+        if key in existing_claude and existing_claude[key] != value:
+            raise ValueError(
+                "Conflicting Claude session metadata key "
+                f"{key!r}; refusing ambiguous overwrite"
+            )
+        existing_claude.setdefault(key, copy.deepcopy(value))
+    result["claudeCode"] = existing_claude
+    return result
+
+
+def _build_session_meta(
+    agent_name: str,
+    *,
+    acp_model: str | None = None,
+    structured_output: StructuredOutputConfig | None = None,
+) -> dict[str, Any]:
+    """Build new-session metadata from the bounded SDK-owned options."""
+    model_meta = build_session_model_meta(agent_name, acp_model)
+    structured_meta = _build_session_structured_output_meta(
+        agent_name, structured_output
+    )
+    return _merge_claude_session_meta(model_meta, structured_meta)

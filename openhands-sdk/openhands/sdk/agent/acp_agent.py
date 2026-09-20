@@ -116,7 +116,8 @@ from openhands.sdk.observability.laminar import maybe_init_laminar, observe
 from openhands.sdk.secret import SecretSource
 from openhands.sdk.settings.acp_providers import (
     ACPFileSecretSpec,
-    build_session_model_meta,
+    _build_session_meta,
+    _build_session_structured_output_meta,
     default_acp_file_secrets,
     detect_acp_provider_by_agent_name,
     detect_acp_provider_by_command,
@@ -124,6 +125,7 @@ from openhands.sdk.settings.acp_providers import (
     resolve_acp_runtime_version,
     resolve_effective_acp_provider_key,
 )
+from openhands.sdk.settings.structured_output import StructuredOutputConfig
 from openhands.sdk.tool import Tool  # noqa: TC002
 from openhands.sdk.tool.builtins.finish import FinishAction, FinishObservation
 from openhands.sdk.utils import maybe_truncate
@@ -2083,6 +2085,14 @@ class ACPAgent(AgentBase):
             "If None, the server picks its default."
         ),
     )
+    structured_output: StructuredOutputConfig | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+        description=(
+            "Provider-neutral structured-output configuration. The current "
+            "implementation maps JSON Schema to Claude ACP session metadata."
+        ),
+    )
     acp_client_capabilities: ClientCapabilities | None = Field(
         default=None,
         description=(
@@ -2146,6 +2156,16 @@ class ACPAgent(AgentBase):
 
     def model_post_init(self, __context: object) -> None:
         super().model_post_init(__context)
+        if self.structured_output is not None:
+            configured_provider = resolve_effective_acp_provider_key(
+                acp_server=self.acp_server,
+                command=self.acp_command,
+            )
+            if configured_provider != "claude-code":
+                raise ValueError(
+                    "structured_output is unsupported for ACP provider "
+                    f"{configured_provider!r}; only Claude ACP is qualified"
+                )
         # Propagate the actual model name to the sentinel LLM and its
         # metrics so that logs, serialized state, and cost/token entries
         # show the real model instead of the "acp-managed" placeholder.
@@ -3327,10 +3347,19 @@ class ACPAgent(AgentBase):
                         self._mark_startup(
                             "load_session", rpc="session/load", stage="load_session"
                         )
+                        # claude-agent-acp 0.63.0 fingerprints session/load by
+                        # cwd and mcpServers, not _meta. Each normal SDK startup
+                        # uses a new ACP subprocess, so load carries only the
+                        # structured-output metadata; acp_model is reapplied
+                        # through the existing resume path below.
+                        load_meta = _build_session_structured_output_meta(
+                            agent_name, self.structured_output
+                        )
                         load_response = await conn.load_session(
                             cwd=working_dir,
                             session_id=prior_session_id,
                             mcp_servers=acp_mcp_servers,
+                            **load_meta,
                         )
                         session_id = prior_session_id
                         self._resumed_existing_session = True
@@ -3363,7 +3392,11 @@ class ACPAgent(AgentBase):
                     self._mark_startup(
                         "new_session", rpc="session/new", stage="new_session"
                     )
-                    session_meta = build_session_model_meta(agent_name, self.acp_model)
+                    session_meta = _build_session_meta(
+                        agent_name,
+                        acp_model=self.acp_model,
+                        structured_output=self.structured_output,
+                    )
                     response = await conn.new_session(
                         cwd=working_dir,
                         mcp_servers=acp_mcp_servers,

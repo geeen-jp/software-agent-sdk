@@ -17,6 +17,9 @@ from openhands.sdk.settings.acp_providers import (
     GEMINI_CLI_VERSION,
     ACPModelOption,
     ACPProviderInfo,
+    _build_session_meta,
+    _build_session_structured_output_meta,
+    _merge_claude_session_meta,
     build_session_model_meta,
     detect_acp_provider_by_agent_name,
     detect_acp_provider_by_command,
@@ -26,6 +29,7 @@ from openhands.sdk.settings.acp_providers import (
     resolve_acp_runtime_version,
     resolve_effective_acp_provider_key,
 )
+from openhands.sdk.settings.structured_output import StructuredOutputConfig
 
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -381,6 +385,91 @@ class TestBuildSessionModelMeta:
     def test_unknown_agent_returns_empty(self):
         result = build_session_model_meta("unknown-agent", "some-model")
         assert result == {}
+
+
+class TestStructuredOutputSessionMeta:
+    @staticmethod
+    def _config() -> StructuredOutputConfig:
+        return StructuredOutputConfig(
+            mode="json_schema",
+            schema={
+                "type": "object",
+                "properties": {"result": {"type": "string"}},
+                "required": ["result"],
+            },
+        )
+
+    def test_claude_mapping_uses_exact_output_format_path(self):
+        result = _build_session_structured_output_meta(
+            "claude-agent-acp 0.63.0", self._config()
+        )
+        assert result == {
+            "claudeCode": {
+                "options": {
+                    "outputFormat": {
+                        "type": "json_schema",
+                        "schema": {
+                            "type": "object",
+                            "properties": {"result": {"type": "string"}},
+                            "required": ["result"],
+                        },
+                    }
+                }
+            }
+        }
+
+    def test_model_and_structured_output_metadata_coexist(self):
+        result = _build_session_meta(
+            "claude-agent-acp",
+            acp_model="claude-opus-4-6",
+            structured_output=self._config(),
+        )
+        assert result["claudeCode"]["options"]["model"] == "claude-opus-4-6"
+        assert result["claudeCode"]["options"]["outputFormat"]["type"] == (
+            "json_schema"
+        )
+
+    @pytest.mark.parametrize("agent_name", ["codex-acp", "gemini-cli", "custom"])
+    def test_unsupported_provider_fails_closed(self, agent_name):
+        with pytest.raises(ValueError, match="unsupported"):
+            _build_session_structured_output_meta(agent_name, self._config())
+
+    def test_mutated_schema_fails_at_provider_boundary(self):
+        config = self._config()
+        config.schema["invalid"] = object()
+
+        with pytest.raises(ValueError, match="JSON-serializable"):
+            _build_session_structured_output_meta("claude-agent-acp", config)
+
+    def test_conflicting_output_format_fails_without_overwrite(self):
+        existing = {
+            "claudeCode": {
+                "options": {"outputFormat": {"type": "json_schema", "schema": {}}},
+                "preserved": True,
+            },
+            "unrelated": {"value": 1},
+        }
+        with pytest.raises(ValueError, match="outputFormat"):
+            _merge_claude_session_meta(
+                existing,
+                _build_session_structured_output_meta(
+                    "claude-agent-acp", self._config()
+                ),
+            )
+        assert existing["unrelated"] == {"value": 1}
+        assert existing["claudeCode"]["options"]["outputFormat"] == {
+            "type": "json_schema",
+            "schema": {},
+        }
+
+    def test_conflicting_claude_subtree_fails_closed(self):
+        with pytest.raises(ValueError, match="Conflicting claudeCode"):
+            _merge_claude_session_meta(
+                {"claudeCode": None},
+                _build_session_structured_output_meta(
+                    "claude-agent-acp", self._config()
+                ),
+            )
 
 
 class TestACPFileSecrets:

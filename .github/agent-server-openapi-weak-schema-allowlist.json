@@ -492,6 +492,12 @@
     "owner": "OpenHands OSS"
   },
   {
+    "pointer": "/components/schemas/StructuredOutputConfig/properties/schema/additionalProperties",
+    "kind": "unrestricted-additional-properties",
+    "reason": "Caller-owned JSON Schema is intentionally opaque; the SDK validates only object shape and JSON serializability, not schema semantics.",
+    "owner": "OpenHands OSS"
+  },
+  {
     "pointer": "/components/schemas/SubAgentInfo/properties/metadata/additionalProperties",
     "kind": "unrestricted-additional-properties",
     "reason": "Tool metadata is intentionally extensible across tool providers.",

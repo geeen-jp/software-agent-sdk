@@ -73,6 +73,7 @@ from .metadata import (
     SettingsFieldMetadata,
     SettingsSectionMetadata,
 )
+from .structured_output import StructuredOutputConfig
 
 
 if TYPE_CHECKING:
@@ -1583,6 +1584,15 @@ class ACPAgentSettings(AgentSettingsBase):
             ).model_dump(),
         },
     )
+    structured_output: StructuredOutputConfig | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+        description=(
+            "Provider-neutral structured-output configuration. The current SDK "
+            "supports JSON Schema through the qualified Claude ACP mapping; "
+            "leave unset to preserve the existing ACP behavior."
+        ),
+    )
     acp_session_mode: str | None = Field(
         default=None,
         description=(
@@ -1743,6 +1753,20 @@ class ACPAgentSettings(AgentSettingsBase):
         """Registry entry for :attr:`acp_server`, or ``None`` for ``'custom'``."""
         return get_acp_provider(self.acp_server)
 
+    @field_validator("structured_output")
+    @classmethod
+    def _validate_structured_output_provider(
+        cls,
+        value: StructuredOutputConfig | None,
+        info: ValidationInfo,
+    ) -> StructuredOutputConfig | None:
+        if value is not None and info.data.get("acp_server") != "claude-code":
+            raise ValueError(
+                "structured_output is currently supported only for "
+                "acp_server='claude-code'"
+            )
+        return value
+
     @property
     def api_key_env_var(self) -> str | None:
         """Env var name the ACP subprocess expects for its API key.
@@ -1891,6 +1915,7 @@ class ACPAgentSettings(AgentSettingsBase):
             acp_args=list(self.acp_args),
             acp_env=dict(self.acp_env),
             acp_model=self.acp_model,
+            structured_output=self.structured_output,
             acp_config_options=dict(self.acp_config_options),
             acp_client_capabilities=self.acp_client_capabilities,
             acp_session_mode=self.acp_session_mode,
