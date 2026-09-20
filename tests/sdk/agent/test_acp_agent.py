@@ -27,6 +27,7 @@ from acp.schema import (
     SessionModelState,
     SetSessionConfigOptionResponse,
 )
+from pydantic import ValidationError
 
 from openhands.sdk import StructuredOutputConfig
 from openhands.sdk.agent.acp_agent import (
@@ -178,6 +179,27 @@ class TestACPAgentInstantiation:
         llms = list(agent.get_all_llms())
         assert len(llms) == 1
         assert llms[0].model == "acp-managed"
+
+    @pytest.mark.parametrize("keyword", ["oneOf", "anyOf", "allOf"])
+    def test_claude_top_level_composition_fails_before_runtime(self, keyword):
+        config = StructuredOutputConfig(
+            mode="json_schema",
+            schema={"type": "object", keyword: [{"type": "object"}]},
+        )
+
+        with pytest.raises(
+            ValidationError,
+            match=rf"top-level '{keyword}'",
+        ):
+            ACPAgent(
+                acp_command=[
+                    "npx",
+                    "-y",
+                    "@agentclientprotocol/claude-agent-acp@0.63.0",
+                ],
+                acp_server="claude-code",
+                structured_output=config,
+            )
 
     def test_agent_is_frozen(self):
         agent = _make_agent()

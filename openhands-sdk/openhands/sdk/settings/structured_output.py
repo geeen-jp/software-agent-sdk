@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 from collections.abc import Mapping
 from typing import Any, Literal
@@ -57,7 +58,10 @@ class StructuredOutputConfig(BaseModel):
         if not isinstance(value, Mapping):
             raise ValueError("structured_output.schema must be a JSON object")
 
-        schema = dict(value)
+        # The caller owns the schema's semantics. Keep the SDK's validated
+        # copy independent from both the caller's nested mappings and any
+        # provider projection/copy performed later in the lifecycle.
+        schema = copy.deepcopy(dict(value))
         if any(not isinstance(key, str) for key in schema):
             raise ValueError("structured_output.schema keys must be strings")
         try:
