@@ -28,6 +28,7 @@ from acp.schema import (
     SetSessionConfigOptionResponse,
 )
 
+from openhands.sdk import StructuredOutputConfig
 from openhands.sdk.agent.acp_agent import (
     ACPAgent,
     ACPAuthSelectionError,
@@ -86,6 +87,17 @@ def _make_agent(**kwargs) -> ACPAgent:
         servers = mcp_config.get("mcpServers", mcp_config)
         kwargs["mcp_config"] = coerce_mcp_config(servers)
     return ACPAgent(acp_command=["echo", "test"], **kwargs)
+
+
+def _structured_output_config() -> StructuredOutputConfig:
+    return StructuredOutputConfig(
+        mode="json_schema",
+        schema={
+            "type": "object",
+            "properties": {"result": {"type": "string"}},
+            "required": ["result"],
+        },
+    )
 
 
 def _make_state(tmp_path) -> ConversationState:
@@ -180,6 +192,13 @@ class TestACPAgentInstantiation:
         assert (
             agent.llm.metrics.accumulated_token_usage.model == "gemini-3-flash-preview"
         )
+
+    def test_structured_output_rejects_unsupported_provider(self):
+        with pytest.raises(ValueError, match="unsupported for ACP provider"):
+            _make_agent(
+                acp_server="codex",
+                structured_output=_structured_output_config(),
+            )
 
     def test_acp_model_propagated_to_llm_model(self):
         """acp_model overrides the sentinel model name so logs/state show
@@ -5446,6 +5465,100 @@ class TestACPSessionConfigOptions:
             session_id="sess-new",
         )
         conn.set_config_option.assert_not_called()
+
+    def test_claude_fresh_session_sends_structured_output_meta(self, tmp_path):
+        config = _structured_output_config()
+        agent = _make_agent(
+            acp_server="claude-code",
+            structured_output=config,
+        )
+        state = _make_state(tmp_path)
+        conn = _make_config_conn(agent_name="claude-agent-acp")
+
+        TestACPSessionIdPersistence._patched_start_acp_server(agent, state, conn=conn)
+
+        conn.new_session.assert_awaited_once_with(
+            cwd=str(tmp_path),
+            mcp_servers=[],
+            claudeCode={
+                "options": {
+                    "outputFormat": {
+                        "type": "json_schema",
+                        "schema": config.schema,
+                    }
+                }
+            },
+        )
+
+    def test_claude_resumed_session_preserves_structured_output_meta(self, tmp_path):
+        config = _structured_output_config()
+        agent = _make_agent(
+            acp_server="claude-code",
+            structured_output=config,
+        )
+        state = _make_state(tmp_path)
+        state.agent_state = {
+            **state.agent_state,
+            "acp_session_id": "stored-sess",
+            "acp_session_cwd": str(tmp_path),
+        }
+        conn = _make_config_conn(agent_name="claude-agent-acp")
+
+        TestACPSessionIdPersistence._patched_start_acp_server(agent, state, conn=conn)
+
+        conn.load_session.assert_awaited_once_with(
+            cwd=str(tmp_path),
+            session_id="stored-sess",
+            mcp_servers=[],
+            claudeCode={
+                "options": {
+                    "outputFormat": {
+                        "type": "json_schema",
+                        "schema": config.schema,
+                    }
+                }
+            },
+        )
+        conn.new_session.assert_not_awaited()
+
+    def test_claude_resumed_session_combines_structured_output_and_model(
+        self, tmp_path
+    ):
+        """Load carries output metadata; the existing resume path reapplies model."""
+        config = _structured_output_config()
+        agent = _make_agent(
+            acp_server="claude-code",
+            acp_model="claude-opus-4-6",
+            structured_output=config,
+        )
+        state = _make_state(tmp_path)
+        state.agent_state = {
+            **state.agent_state,
+            "acp_session_id": "stored-sess",
+            "acp_session_cwd": str(tmp_path),
+        }
+        conn = _make_config_conn(agent_name="claude-agent-acp")
+
+        TestACPSessionIdPersistence._patched_start_acp_server(agent, state, conn=conn)
+
+        conn.load_session.assert_awaited_once_with(
+            cwd=str(tmp_path),
+            session_id="stored-sess",
+            mcp_servers=[],
+            claudeCode={
+                "options": {
+                    "outputFormat": {
+                        "type": "json_schema",
+                        "schema": config.schema,
+                    }
+                }
+            },
+        )
+        conn.new_session.assert_not_awaited()
+        conn.set_session_model.assert_awaited_once_with(
+            model_id="claude-opus-4-6",
+            session_id="stored-sess",
+        )
 
     def test_missing_option_fails_init_state_and_cleans_up(self, tmp_path):
         """A requested option the server does not expose aborts initialization."""

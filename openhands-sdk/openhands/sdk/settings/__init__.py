@@ -27,6 +27,7 @@ from .metadata import (
     SettingsSectionMetadata,
     field_meta,
 )
+from .structured_output import StructuredOutputConfig, StructuredOutputMode
 
 
 if TYPE_CHECKING:
@@ -126,6 +127,8 @@ __all__ = [
     "field_meta",
     "get_acp_provider",
     "validate_agent_settings",
+    "StructuredOutputConfig",
+    "StructuredOutputMode",
 ]
 
 

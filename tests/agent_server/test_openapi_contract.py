@@ -101,6 +101,16 @@ def test_settings_contract_exposes_typed_mcp_response_and_patch() -> None:
     ]["anyOf"]
 
 
+def test_structured_output_contract_keeps_caller_schema_opaque() -> None:
+    document = build_public_openapi()
+    structured_output = document["components"]["schemas"]["StructuredOutputConfig"]
+
+    assert structured_output["properties"]["mode"]["const"] == "json_schema"
+    schema = structured_output["properties"]["schema"]
+    assert schema["type"] == "object"
+    assert schema["additionalProperties"] is True
+
+
 def test_mcp_server_crud_operations_use_canonical_contract_types() -> None:
     document = build_public_openapi()
     operations = document["paths"]["/api/settings/mcp/{settings_key}"]
