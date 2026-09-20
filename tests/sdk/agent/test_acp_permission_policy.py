@@ -292,6 +292,7 @@ def _start_acp_server_with_mocked_transport(
     init_response.agent_info = MagicMock()
     init_response.agent_info.name = agent_name
     init_response.agent_info.version = "1.0"
+    init_response.agent_capabilities = None
     init_response.auth_methods = []
     conn.initialize = AsyncMock(return_value=init_response)
     new_response = MagicMock()
@@ -647,6 +648,7 @@ def _start_acp_server_with_session_config(
     init_response.agent_info = MagicMock()
     init_response.agent_info.name = agent_name
     init_response.agent_info.version = "1.0"
+    init_response.agent_capabilities = None
     init_response.auth_methods = []
     conn.initialize = AsyncMock(return_value=init_response)
     current = list(config_options or [])

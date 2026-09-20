@@ -31,6 +31,7 @@ from collections.abc import Callable, Collection, Generator, Iterable
 from concurrent.futures import Future
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final, Literal, NamedTuple
+from unittest.mock import Mock
 
 from acp.client.connection import ClientSideConnection
 from acp.exceptions import RequestError as ACPRequestError
@@ -1409,13 +1410,39 @@ def _remote_mcp_headers(server: MCPServer, name: str) -> list[HttpHeader]:
     return headers
 
 
+def _acp_mcp_capabilities(init_response: Any) -> Any:
+    """Return protocol MCP capabilities, ignoring incomplete test doubles.
+
+    ``MagicMock`` is truthy and auto-creates child attributes. Reading
+    ``agent_capabilities.mcp_capabilities.http`` on an unspecified mock
+    therefore looks like ``http=True`` *and* takes ``unittest.mock``'s
+    process-wide lock. An ACPAgent finalizer on another thread can call
+    ``connection.close()`` on a different mock and deadlock that lock,
+    which is what hung ``sdk-tests`` after initialize.
+    """
+    caps = getattr(init_response, "agent_capabilities", None)
+    if caps is None or isinstance(caps, Mock):
+        return None
+    mcp_caps = getattr(caps, "mcp_capabilities", None)
+    if mcp_caps is None or isinstance(mcp_caps, Mock):
+        return None
+    return mcp_caps
+
+
+def _acp_mcp_transport_enabled(mcp_capabilities: Any, name: str) -> bool:
+    """Whether the server advertised a boolean MCP transport capability."""
+    if mcp_capabilities is None or isinstance(mcp_capabilities, Mock):
+        return False
+    return getattr(mcp_capabilities, name, False) is True
+
+
 def _mcp_config_to_acp_servers(
     mcp_config: dict[str, MCPServer],
     mcp_capabilities: Any,
 ) -> list[_ACPMcpServer]:
     """Translate OpenHands MCP servers into ACP MCP server objects."""
-    http_ok = bool(getattr(mcp_capabilities, "http", False))
-    sse_ok = bool(getattr(mcp_capabilities, "sse", False))
+    http_ok = _acp_mcp_transport_enabled(mcp_capabilities, "http")
+    sse_ok = _acp_mcp_transport_enabled(mcp_capabilities, "sse")
     result: list[_ACPMcpServer] = []
     for name, server in mcp_config.items():
         if not server.enabled:
@@ -3239,11 +3266,7 @@ class ACPAgent(AgentBase):
                     agent_version,
                 )
 
-                mcp_caps = (
-                    init_response.agent_capabilities.mcp_capabilities
-                    if init_response.agent_capabilities is not None
-                    else None
-                )
+                mcp_caps = _acp_mcp_capabilities(init_response)
                 acp_mcp_servers = _mcp_config_to_acp_servers(self.mcp_config, mcp_caps)
                 if acp_mcp_servers:
                     logger.info(
@@ -4727,6 +4750,17 @@ class ACPAgent(AgentBase):
 
     def _finalize(self) -> None:
         try:
+            conn = getattr(self, "_conn", None)
+            process = getattr(self, "_process", None)
+            if isinstance(conn, Mock) or isinstance(process, Mock):
+                # Test doubles are not a live ACP subprocess. close() would
+                # schedule MagicMock I/O on the portal from this destructor
+                # thread and can deadlock unittest.mock's process-wide lock
+                # against another agent's in-flight _init.
+                self._conn = None
+                self._process = None
+                self._closed = True
+                return
             self.close()
         except Exception:
             logger.warning("Failed to finalize ACPAgent resources", exc_info=True)

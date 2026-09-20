@@ -529,6 +529,7 @@ def test_writable_start_without_oauth_uses_isolated_dir_and_env_auth(
     init_response.agent_info = MagicMock()
     init_response.agent_info.name = "claude-agent-acp"
     init_response.agent_info.version = "1.0"
+    init_response.agent_capabilities = None
     init_response.auth_methods = []
     conn.initialize = AsyncMock(return_value=init_response)
     new_response = MagicMock()
@@ -785,6 +786,7 @@ def _capture_start_env(agent: ACPAgent, tmp_path: Path) -> dict[str, str]:
     init_response.agent_info = MagicMock()
     init_response.agent_info.name = "custom-acp"
     init_response.agent_info.version = "1.0"
+    init_response.agent_capabilities = None
     init_response.auth_methods = []
     conn.initialize = AsyncMock(return_value=init_response)
     new_response = MagicMock()

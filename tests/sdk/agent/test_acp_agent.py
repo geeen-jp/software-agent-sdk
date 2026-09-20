@@ -3168,6 +3168,7 @@ class TestSelectAuthMethod:
         process.stdout.readline = AsyncMock(return_value=b"")
         process.wait = AsyncMock(return_value=0)
         process.returncode = 0
+        process.stderr = None
 
         async def _capture_subprocess(*_args, env=None, **_kwargs):
             captured.update(env or {})
@@ -4186,6 +4187,13 @@ def test_magicmock_session_payloads_do_not_hang_extractors():
     assert _select_auth_method(MagicMock(), {}) is None
 
 
+@pytest.mark.timeout(2)
+def test_magicmock_mcp_capabilities_are_not_treated_as_enabled():
+    """Unspecified MagicMock capabilities must not look like http/sse=True."""
+    assert _mcp_config_to_acp_servers({}, MagicMock()) == []
+    assert _mcp_config_to_acp_servers({}, MagicMock().mcp_capabilities) == []
+
+
 # ---------------------------------------------------------------------------
 # ACP session resume via ConversationState.agent_state (issue #2867)
 # ---------------------------------------------------------------------------
@@ -4214,6 +4222,7 @@ class TestACPSessionIdPersistence:
             process.stdout.readline = AsyncMock(return_value=b"")
             process.wait = AsyncMock(return_value=0)
             process.returncode = 0
+            process.stderr = None
 
         async def _fake_create_subprocess_exec(*_args, **_kwargs):
             return process
@@ -4280,6 +4289,7 @@ class TestACPSessionIdPersistence:
         init_response.agent_info = MagicMock()
         init_response.agent_info.name = "claude-agent-acp"
         init_response.agent_info.version = "1.0"
+        init_response.agent_capabilities = None
         init_response.auth_methods = []
         conn.initialize = AsyncMock(return_value=init_response)
 
@@ -4783,6 +4793,7 @@ class TestACPModelStatePersistence:
         assert "acp_available_models" not in state.agent_state
 
 
+@pytest.mark.timeout(5)
 class TestACPSecretsEnvInjection:
     """Tests for secret injection into the ACP subprocess environment.
 
@@ -4802,6 +4813,7 @@ class TestACPSecretsEnvInjection:
         process.stdout.readline = AsyncMock(return_value=b"")
         process.wait = AsyncMock(return_value=0)
         process.returncode = 0
+        process.stderr = None
 
         async def _fake_create_subprocess_exec(*_args, env=None, **_kwargs):
             captured.update(env or {})
@@ -4900,6 +4912,7 @@ class TestACPEnvConflictSuppression:
         process.stdout.readline = AsyncMock(return_value=b"")
         process.wait = AsyncMock(return_value=0)
         process.returncode = 0
+        process.stderr = None
 
         async def _fake_create_subprocess_exec(*_args, env=None, **_kwargs):
             captured.update(env or {})
@@ -5202,6 +5215,7 @@ def _make_config_conn(
     init_response.agent_info = MagicMock()
     init_response.agent_info.name = agent_name
     init_response.agent_info.version = "1.0"
+    init_response.agent_capabilities = None
     init_response.auth_methods = []
     conn.initialize = AsyncMock(return_value=init_response)
 
@@ -6470,9 +6484,11 @@ class TestACPMcpForwarding:
 
     @staticmethod
     def _conn_with_caps(*, http=True, sse=True, load_exc=None):
+        from types import SimpleNamespace
+
         conn = TestACPSessionIdPersistence._make_conn(load_exc=load_exc)
-        conn.initialize.return_value.agent_capabilities.mcp_capabilities = (
-            TestMcpConfigToAcpServers._caps(http=http, sse=sse)
+        conn.initialize.return_value.agent_capabilities = SimpleNamespace(
+            mcp_capabilities=TestMcpConfigToAcpServers._caps(http=http, sse=sse)
         )
         return conn
 
