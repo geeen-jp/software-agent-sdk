@@ -678,6 +678,13 @@ async def _apply_acp_model(
                 config_id=config_id, value=value, session_id=session_id
             )
             last_options = response.config_options
+        if client is not None and last_options:
+            # Selecting a model can reveal dependent options (for example
+            # Gemini reasoning_effort or Muse context/effort). Preserve the
+            # complete response as the authoritative state for the following
+            # config pass; the server may not emit a ConfigOptionUpdate for
+            # this response.
+            client.record_config_options(session_id, last_options)
         return _resolve_effective_model(
             requested=model,
             agent_name=agent_name,
@@ -815,16 +822,19 @@ def _verify_read_only_mode_after_config(
     agent_name: str,
     session_id: str,
     config_options: list[SessionConfigOption] | None,
+    provider_key: str | None = None,
     mode_generation_before: int = 0,
     require_fresh_mode: bool = False,
 ) -> None:
     """Fail closed if session configuration replaced the verified read_only mode.
 
     Codex ACP 1.1.7 updates ``agentMode`` in memory and exposes it as config
-    option ``mode``; it does not emit ``current_mode_update``. That provider
-    may prove ``read_only`` with ``mode``/``currentValue=read-only`` instead
-    of a fresh mode notification. Other providers still require a fresh
-    ``CurrentModeUpdate`` after config writes.
+    option ``mode``; it does not emit ``current_mode_update``. Cursor likewise
+    keeps the confirmed ``ask`` mode effective while updating model-dependent
+    options without emitting a second mode notification. Those providers may
+    prove ``read_only`` from their provider-specific effective state instead of
+    requiring a fresh mode notification. Other providers still require a
+    fresh ``CurrentModeUpdate`` after config writes.
     """
     if (
         normalize_acp_permission_policy(policy) != "read_only"
@@ -833,6 +843,8 @@ def _verify_read_only_mode_after_config(
         return
     observed = client.get_current_mode_id(session_id)
     generation = client.get_current_mode_generation(session_id)
+    provider = detect_acp_provider_by_agent_name(agent_name)
+    effective_provider_key = provider.key if provider is not None else provider_key
     if observed is not None and observed != required_mode_id:
         if require_fresh_mode:
             raise ACPSessionModeError(
@@ -858,6 +870,13 @@ def _verify_read_only_mode_after_config(
         if not is_permission_mode_config_option(option_id):
             continue
         current = _config_option_current_value(option)
+        # Cursor returns the mode config option as part of the complete model
+        # config state, but that value can lag the authoritative
+        # session/set_mode result (for example it may still say ``agent``
+        # after the confirmed mode is ``ask``). Cursor's current-mode
+        # observation above is the authority for this provider.
+        if effective_provider_key == "cursor":
+            continue
         if current != required_mode_id:
             raise ACPSessionModeError(
                 f"ACP server {agent_name!r} session {session_id} configuration "
@@ -865,14 +884,21 @@ def _verify_read_only_mode_after_config(
                 f"mode {required_mode_id!r}."
             )
     if require_fresh_mode:
-        provider = detect_acp_provider_by_agent_name(agent_name)
-        if provider is not None and provider.key == "codex":
+        if effective_provider_key == "codex":
             if not saw_codex_mode or codex_mode_value != required_mode_id:
                 raise ACPSessionModeError(
                     f"ACP server {agent_name!r} session {session_id} did not "
                     f"prove read_only session mode {required_mode_id!r} after "
                     "applying session configuration "
                     f"(mode={codex_mode_value!r}, observed={observed!r})."
+                )
+            return
+        if effective_provider_key == "cursor":
+            if observed != required_mode_id:
+                raise ACPSessionModeError(
+                    f"ACP server {agent_name!r} session {session_id} did not "
+                    f"confirm read_only session mode {required_mode_id!r} "
+                    f"after applying session configuration (observed={observed!r})."
                 )
             return
         if generation <= mode_generation_before or observed != required_mode_id:
@@ -1137,6 +1163,7 @@ async def _apply_session_config_options(
     initial_options: list[SessionConfigOption] | None,
     *,
     required_session_mode: str | None = None,
+    provider_key: str | None = None,
 ) -> list[SessionConfigOption] | None:
     """Apply *requested* session config options and verify the observed state.
 
@@ -1182,6 +1209,7 @@ async def _apply_session_config_options(
             agent_name=agent_name,
             session_id=session_id,
             config_options=initial_options,
+            provider_key=provider_key,
         )
         return None
 
@@ -1193,6 +1221,11 @@ async def _apply_session_config_options(
 
     state_by_id = _config_options_index(initial_options)
     observed_by_id = _config_options_index(client.get_config_options(session_id))
+    if observed_by_id:
+        # A model selection can replace the option catalog. Prefer that later,
+        # complete state over the session/new snapshot so model-dependent
+        # option type/choices cannot be taken from a stale pre-model state.
+        state_by_id = {**state_by_id, **observed_by_id}
     if not state_by_id and not observed_by_id:
         raise ACPSessionConfigError(
             f"ACP server {agent_name!r} session {session_id} reported no session "
@@ -1284,6 +1317,7 @@ async def _apply_session_config_options(
         agent_name=agent_name,
         session_id=session_id,
         config_options=list(final_state.values()),
+        provider_key=provider_key,
         mode_generation_before=mode_generation_before,
         require_fresh_mode=require_fresh_mode,
     )
@@ -1767,6 +1801,12 @@ class _OpenHandsACPBridge:
         """Return the last complete config option state seen for *session_id*."""
         return self._config_options_by_session.get(session_id)
 
+    def record_config_options(
+        self, session_id: str, options: list[SessionConfigOption]
+    ) -> None:
+        """Record a complete config state returned by a direct request."""
+        self._config_options_by_session[session_id] = list(options)
+
     def get_current_mode_id(self, session_id: str) -> str | None:
         """Return the last confirmed session mode id for *session_id*."""
         return self._current_mode_by_session.get(session_id)
@@ -2163,8 +2203,9 @@ class ACPAgent(AgentBase):
             "Conversation-local permission policy for ACP sessions. "
             "``writable`` preserves the default auto-approve behavior. "
             "``read_only`` refuses unverified provider write paths and, for "
-            "Claude Code and Codex, uses a permission-requesting session mode "
-            "plus denied request_permission callbacks. Unsupported providers "
+            "Claude Code, Codex, and Cursor, uses a provider-specific "
+            "read-only session mode plus denied request_permission callbacks. "
+            "Unsupported providers "
             "and unknown policy values fail closed."
         ),
     )
@@ -3538,6 +3579,7 @@ class ACPAgent(AgentBase):
                     self.acp_config_options,
                     config_options,
                     required_session_mode=mode_id,
+                    provider_key=runtime_key,
                 )
                 current_model_id = _surfaced_current_model_id(
                     current_model_id, agent_name, final_options

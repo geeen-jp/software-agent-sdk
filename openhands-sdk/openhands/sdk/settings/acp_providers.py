@@ -459,6 +459,26 @@ CODEX_RUNTIME_VERSION = "0.145.0"
 GEMINI_CLI_VERSION = "0.46.0"
 
 
+# Cursor's ``agent acp`` binary is installed and versioned by Cursor rather
+# than by the OpenHands agent-server image.  Keep it out of the built-in
+# install/model-picker registry, but still expose its command identity to the
+# ACP lifecycle so a caller can request the qualified read-only ``ask`` mode
+# without treating an arbitrary custom command as safe.
+_CURSOR_PROVIDER = ACPProviderInfo(
+    key="cursor",
+    display_name="Cursor",
+    default_command=("cursor-agent", "acp"),
+    api_key_env_var=None,
+    base_url_env_var=None,
+    default_session_mode="agent",
+    agent_name_patterns=("cursor",),
+    supports_set_session_model=True,
+    session_meta_key=None,
+    supports_runtime_model_switch=True,
+    binary_name="cursor-agent",
+)
+
+
 ACP_PROVIDERS: Mapping[str, ACPProviderInfo] = MappingProxyType(
     {
         "claude-code": ACPProviderInfo(
@@ -690,12 +710,25 @@ def detect_acp_provider_by_command(
     known provider (e.g. data-dir isolation) safely no-op.
     """
     bases: list[str] = []
+    raw_bases: list[str] = []
     for token in command:
-        base = token.rsplit("/", 1)[-1].lower()
+        raw_base = token.rsplit("/", 1)[-1].lower()
+        raw_bases.append(raw_base)
+        base = raw_base
         at = base.rfind("@")
         if at > 0:  # strip a trailing @version pin (not a leading @scope)
             base = base[:at]
         bases.append(base)
+    # Cursor is a host-installed CLI, not one of the SDK's npm-managed
+    # providers. Its exact argv[0] basename is nevertheless a trusted identity
+    # for the provider-specific read-only enforcement path. Do not accept a
+    # wrapper, shell command, later argument, or @version-looking alias.
+    if (
+        raw_bases
+        and _CURSOR_PROVIDER.binary_name
+        and raw_bases[0] == _CURSOR_PROVIDER.binary_name
+    ):
+        return _CURSOR_PROVIDER
     for info in ACP_PROVIDERS.values():
         if any(
             base.startswith(pat) for base in bases for pat in info.agent_name_patterns

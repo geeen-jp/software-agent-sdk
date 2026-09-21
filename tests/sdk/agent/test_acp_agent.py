@@ -36,6 +36,7 @@ from openhands.sdk.agent.acp_agent import (
     ACPSessionConfigError,
     ACPSessionModelError,
     SessionConfigOption,
+    _apply_acp_model,
     _apply_session_config_options,
     _bound_offered_auth_ids,
     _classify_acp_init_error,
@@ -5811,6 +5812,114 @@ class TestApplySessionConfigOptions:
             [_config_option("model", "auto")],
         )
         assert conn.set_config_option.await_count == 2
+
+    async def test_model_response_records_dependent_config_options(self):
+        """A model selection response is the complete state for the next pass."""
+        bridge = _OpenHandsACPBridge()
+        conn = self._conn(
+            SetSessionConfigOptionResponse(
+                config_options=[
+                    _config_option("model", "gemini-3.8-flash"),
+                    _config_option("reasoning_effort", "medium"),
+                ]
+            )
+        )
+
+        effective = await _apply_acp_model(
+            conn,
+            "sess-1",
+            "gemini-3.8-flash",
+            agent_name="cursor",
+            via_config_option=True,
+            client=bridge,
+        )
+
+        assert effective == "gemini-3.8-flash"
+        recorded = bridge.get_config_options("sess-1")
+        assert recorded is not None
+        assert {option.id for option in recorded} == {
+            "model",
+            "reasoning_effort",
+        }
+
+    async def test_model_response_state_overrides_stale_initial_option_state(self):
+        bridge = _OpenHandsACPBridge()
+        bridge.record_config_options(
+            "sess-1",
+            [_config_option("effort", "low", ["low", "medium"])],
+        )
+        conn = self._conn(
+            SetSessionConfigOptionResponse(
+                config_options=[_config_option("effort", "medium", ["low", "medium"])]
+            )
+        )
+
+        await _apply_session_config_options(
+            conn,
+            bridge,
+            "cursor",
+            "sess-1",
+            {"effort": "medium"},
+            [_boolean_config_option("effort", True)],
+        )
+
+        conn.set_config_option.assert_awaited_once_with(
+            config_id="effort",
+            session_id="sess-1",
+            value="medium",
+        )
+
+    async def test_model_selection_and_dependent_option_application_are_one_flow(self):
+        bridge = _OpenHandsACPBridge()
+        conn = self._conn(
+            SetSessionConfigOptionResponse(
+                config_options=[
+                    _config_option("model", "gemini-3.8-flash"),
+                    _config_option(
+                        "reasoning_effort", "high", ["low", "medium", "high"]
+                    ),
+                ]
+            ),
+            SetSessionConfigOptionResponse(
+                config_options=[
+                    _config_option("model", "gemini-3.8-flash"),
+                    _config_option(
+                        "reasoning_effort", "medium", ["low", "medium", "high"]
+                    ),
+                ]
+            ),
+        )
+
+        effective = await _apply_acp_model(
+            conn,
+            "sess-1",
+            "gemini-3.8-flash",
+            agent_name="cursor",
+            via_config_option=True,
+            client=bridge,
+        )
+        await _apply_session_config_options(
+            conn,
+            bridge,
+            "cursor",
+            "sess-1",
+            {"reasoning_effort": "medium"},
+            [_config_option("model", "auto")],
+        )
+
+        assert effective == "gemini-3.8-flash"
+        assert [call.kwargs for call in conn.set_config_option.await_args_list] == [
+            {
+                "config_id": "model",
+                "session_id": "sess-1",
+                "value": "gemini-3.8-flash",
+            },
+            {
+                "config_id": "reasoning_effort",
+                "session_id": "sess-1",
+                "value": "medium",
+            },
+        ]
 
     async def test_observed_update_verifies_a_stateless_response(self):
         """Servers that publish state asynchronously still verify."""

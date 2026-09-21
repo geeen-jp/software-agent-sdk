@@ -1694,8 +1694,8 @@ class ACPAgentSettings(AgentSettingsBase):
             "Forwarded to :attr:`~openhands.sdk.agent.ACPAgent.acp_permission_policy`. "
             "``writable`` preserves the default auto-approve behavior. "
             "``read_only`` is fail-closed: unverified providers and bypass "
-            "session modes are refused; Claude Code and Codex use a "
-            "permission-requesting mode plus denied request_permission "
+            "session modes are refused; Claude Code, Codex, and Cursor use "
+            "a provider-specific read-only mode plus denied request_permission "
             "callbacks."
         ),
     )

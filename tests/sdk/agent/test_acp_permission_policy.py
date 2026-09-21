@@ -249,6 +249,28 @@ def test_read_only_claude_uses_permission_requesting_mode() -> None:
     )
 
 
+def test_read_only_cursor_uses_ask_mode() -> None:
+    assert (
+        resolve_session_mode_for_policy(
+            "read_only",
+            provider_key="cursor",
+            explicit_mode=None,
+            default_session_mode="agent",
+        )
+        == "ask"
+    )
+
+
+def test_read_only_cursor_refuses_write_mode() -> None:
+    with pytest.raises(ValueError, match="not a verified read_only"):
+        resolve_session_mode_for_policy(
+            "read_only",
+            provider_key="cursor",
+            explicit_mode="agent",
+            default_session_mode="agent",
+        )
+
+
 def test_policy_instances_are_isolated_per_bridge() -> None:
     writable_bridge = _OpenHandsACPBridge(permission_policy="writable")
     read_only_bridge = _OpenHandsACPBridge(permission_policy="read_only")
@@ -1030,6 +1052,110 @@ async def test_read_only_config_accepts_fresh_mode_after_writes() -> None:
         required_session_mode="default",
     )
     conn.set_config_option.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_read_only_cursor_uses_confirmed_ask_over_stale_mode_option() -> None:
+    """Cursor's mode option may lag the authoritative session mode."""
+    conn = MagicMock()
+    client = _OpenHandsACPBridge(permission_policy="read_only")
+    await client.session_update(
+        "sess-1",
+        CurrentModeUpdate(
+            session_update="current_mode_update",
+            current_mode_id="ask",
+        ),
+    )
+    conn.set_config_option = AsyncMock(
+        return_value=SetSessionConfigOptionResponse(
+            config_options=[
+                _select_config_option("mode", "agent", ["agent", "ask"]),
+                _select_config_option("effort", "medium", ["low", "medium"]),
+            ]
+        )
+    )
+
+    await _apply_session_config_options(
+        conn,
+        client,
+        "cursor-agent",
+        "sess-1",
+        {"effort": "medium"},
+        [
+            _select_config_option("mode", "agent", ["agent", "ask"]),
+            _select_config_option("effort", "low", ["low", "medium"]),
+        ],
+        required_session_mode="ask",
+        provider_key="cursor",
+    )
+
+    conn.set_config_option.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_read_only_cursor_rejects_contradictory_effective_mode() -> None:
+    conn = MagicMock()
+    client = _OpenHandsACPBridge(permission_policy="read_only")
+    await client.session_update(
+        "sess-1",
+        CurrentModeUpdate(
+            session_update="current_mode_update",
+            current_mode_id="agent",
+        ),
+    )
+    conn.set_config_option = AsyncMock(
+        return_value=SetSessionConfigOptionResponse(
+            config_options=[
+                _select_config_option("mode", "agent", ["agent", "ask"]),
+                _select_config_option("effort", "medium", ["low", "medium"]),
+            ]
+        )
+    )
+
+    with pytest.raises(ACPSessionModeError, match="did not prove"):
+        await _apply_session_config_options(
+            conn,
+            client,
+            "cursor-agent",
+            "sess-1",
+            {"effort": "medium"},
+            [
+                _select_config_option("mode", "agent", ["agent", "ask"]),
+                _select_config_option("effort", "low", ["low", "medium"]),
+            ],
+            required_session_mode="ask",
+            provider_key="cursor",
+        )
+
+
+@pytest.mark.asyncio
+async def test_read_only_cursor_fails_without_effective_mode_evidence() -> None:
+    """Advertised ask alone is not enough after config writes."""
+    conn = MagicMock()
+    client = _OpenHandsACPBridge(permission_policy="read_only")
+    conn.set_config_option = AsyncMock(
+        return_value=SetSessionConfigOptionResponse(
+            config_options=[
+                _select_config_option("mode", "ask", ["agent", "ask"]),
+                _select_config_option("effort", "medium", ["low", "medium"]),
+            ]
+        )
+    )
+
+    with pytest.raises(ACPSessionModeError, match="did not confirm"):
+        await _apply_session_config_options(
+            conn,
+            client,
+            "cursor-agent",
+            "sess-1",
+            {"effort": "medium"},
+            [
+                _select_config_option("mode", "ask", ["agent", "ask"]),
+                _select_config_option("effort", "low", ["low", "medium"]),
+            ],
+            required_session_mode="ask",
+            provider_key="cursor",
+        )
 
 
 def test_read_only_codex_startup_accepts_mode_config_without_current_mode_update(
