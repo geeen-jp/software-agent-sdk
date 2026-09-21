@@ -172,13 +172,7 @@ def test_get_agent_final_response_rejects_later_failed_structured_output():
 
 
 def test_get_agent_final_response_preserves_normal_finish_text():
-    """A real FinishAction message wins over unrelated structured output."""
-    structured = ACPToolCallEvent(
-        tool_call_id="structured-output-id",
-        title="StructuredOutput",
-        status="completed",
-        raw_input={"outcome": "IGNORED"},
-    )
+    """A normal FinishAction remains authoritative without structured output."""
     finish = ActionEvent(
         source="agent",
         thought=[],
@@ -191,7 +185,30 @@ def test_get_agent_final_response_preserves_normal_finish_text():
         llm_response_id="finish-response-id",
     )
 
-    assert get_agent_final_response([structured, finish]) == "normal final text"
+    assert get_agent_final_response([finish]) == "normal final text"
+
+
+def test_get_agent_final_response_prefers_structured_output_over_finish_text():
+    """A completed current-turn result wins over explanatory FinishAction prose."""
+    structured = ACPToolCallEvent(
+        tool_call_id="structured-output-id",
+        title="StructuredOutput",
+        status="completed",
+        raw_input={"outcome": "PASSED"},
+    )
+    finish = ActionEvent(
+        source="agent",
+        thought=[],
+        action=FinishAction(message="Review completed successfully."),
+        tool_name="finish",
+        tool_call_id="finish-id",
+        tool_call=MessageToolCall(
+            id="finish-id", name="finish", arguments="{}", origin="completion"
+        ),
+        llm_response_id="finish-response-id",
+    )
+
+    assert get_agent_final_response([structured, finish]) == '{"outcome":"PASSED"}'
 
 
 def test_get_agent_final_response_with_message_event():

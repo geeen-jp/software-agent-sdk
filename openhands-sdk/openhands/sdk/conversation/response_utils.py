@@ -18,10 +18,11 @@ def _get_completed_structured_output(events: Sequence[Event], finish_index: int)
 
     Claude ACP exposes native JSON-schema output as a completed
     ``StructuredOutput`` tool-call update. ACPAgent still emits its normal
-    FinishAction delimiter, but some ACP versions put the placeholder
-    ``(No response from ACP server)`` in that action instead of copying the
-    structured payload into assistant text. Keep this provider transport
-    detail here so callers continue to consume one final-response surface.
+    FinishAction delimiter, but ACP versions may either put the placeholder
+    ``(No response from ACP server)`` in that action or copy unrelated prose
+    into it instead of copying the structured payload into assistant text.
+    Keep this provider transport detail here so callers continue to consume
+    one final-response surface.
     """
     for event in reversed(events[:finish_index]):
         if not isinstance(event, ACPToolCallEvent):
@@ -72,8 +73,6 @@ def get_agent_final_response(events: Sequence[Event]) -> str:
             # Extract message from finish tool call
             if event.action is not None and isinstance(event.action, FinishAction):
                 message = event.action.message
-                if message != _NO_RESPONSE_FROM_ACP:
-                    return message
                 structured = _get_completed_structured_output(events, index)
                 return structured or message
             else:
