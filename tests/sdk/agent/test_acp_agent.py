@@ -2501,6 +2501,48 @@ class TestACPCancelInflightToolCalls:
         assert aaa_idx < bbb_idx
 
 
+class TestACPFlushInflightToolCalls:
+    """Tests for terminalizing leftover ACP tool-call updates."""
+
+    def test_structured_output_is_failed_when_flush_synthesizes_terminal_state(
+        self,
+    ):
+        """Incomplete native output must not look like a completed result."""
+        agent = _make_agent()
+        agent._client = _OpenHandsACPBridge()
+        emitted: list = []
+        agent._client.on_event = emitted.append
+        agent._client.accumulated_tool_calls.extend(
+            [
+                {
+                    "tool_call_id": "structured-output-id",
+                    "title": "StructuredOutput",
+                    "tool_kind": "other",
+                    "status": "in_progress",
+                    "raw_input": {"outcome": "PARTIAL"},
+                },
+                {
+                    "tool_call_id": "regular-tool-id",
+                    "title": "Read",
+                    "tool_kind": "read",
+                    "status": "in_progress",
+                    "raw_input": {"path": "README.md"},
+                },
+            ]
+        )
+
+        agent._flush_inflight_tool_calls_as_completed()
+
+        assert [event.tool_call_id for event in emitted] == [
+            "structured-output-id",
+            "regular-tool-id",
+        ]
+        assert emitted[0].status == "failed"
+        assert emitted[0].is_error
+        assert emitted[1].status == "completed"
+        assert not emitted[1].is_error
+
+
 class TestACPToolCallEmission:
     """Tests for ACPToolCallEvent emission in step()."""
 
