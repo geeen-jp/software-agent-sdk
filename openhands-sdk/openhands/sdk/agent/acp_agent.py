@@ -1221,6 +1221,11 @@ async def _apply_session_config_options(
 
     state_by_id = _config_options_index(initial_options)
     observed_by_id = _config_options_index(client.get_config_options(session_id))
+    if observed_by_id:
+        # A model selection can replace the option catalog. Prefer that later,
+        # complete state over the session/new snapshot so model-dependent
+        # option type/choices cannot be taken from a stale pre-model state.
+        state_by_id = {**state_by_id, **observed_by_id}
     if not state_by_id and not observed_by_id:
         raise ACPSessionConfigError(
             f"ACP server {agent_name!r} session {session_id} reported no session "

@@ -710,16 +710,24 @@ def detect_acp_provider_by_command(
     known provider (e.g. data-dir isolation) safely no-op.
     """
     bases: list[str] = []
+    raw_bases: list[str] = []
     for token in command:
-        base = token.rsplit("/", 1)[-1].lower()
+        raw_base = token.rsplit("/", 1)[-1].lower()
+        raw_bases.append(raw_base)
+        base = raw_base
         at = base.rfind("@")
         if at > 0:  # strip a trailing @version pin (not a leading @scope)
             base = base[:at]
         bases.append(base)
     # Cursor is a host-installed CLI, not one of the SDK's npm-managed
-    # providers.  Its exact binary name is nevertheless a trusted identity
-    # for the provider-specific read-only enforcement path.
-    if _CURSOR_PROVIDER.binary_name and _CURSOR_PROVIDER.binary_name in bases:
+    # providers. Its exact argv[0] basename is nevertheless a trusted identity
+    # for the provider-specific read-only enforcement path. Do not accept a
+    # wrapper, shell command, later argument, or @version-looking alias.
+    if (
+        raw_bases
+        and _CURSOR_PROVIDER.binary_name
+        and raw_bases[0] == _CURSOR_PROVIDER.binary_name
+    ):
         return _CURSOR_PROVIDER
     for info in ACP_PROVIDERS.values():
         if any(

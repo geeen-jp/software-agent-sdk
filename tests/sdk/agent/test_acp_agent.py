@@ -5842,6 +5842,33 @@ class TestApplySessionConfigOptions:
             "reasoning_effort",
         }
 
+    async def test_model_response_state_overrides_stale_initial_option_state(self):
+        bridge = _OpenHandsACPBridge()
+        bridge.record_config_options(
+            "sess-1",
+            [_config_option("effort", "low", ["low", "medium"])],
+        )
+        conn = self._conn(
+            SetSessionConfigOptionResponse(
+                config_options=[_config_option("effort", "medium", ["low", "medium"])]
+            )
+        )
+
+        await _apply_session_config_options(
+            conn,
+            bridge,
+            "cursor",
+            "sess-1",
+            {"effort": "medium"},
+            [_boolean_config_option("effort", True)],
+        )
+
+        conn.set_config_option.assert_awaited_once_with(
+            config_id="effort",
+            session_id="sess-1",
+            value="medium",
+        )
+
     async def test_observed_update_verifies_a_stateless_response(self):
         """Servers that publish state asynchronously still verify."""
         bridge = _OpenHandsACPBridge()

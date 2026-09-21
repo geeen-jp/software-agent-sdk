@@ -214,6 +214,22 @@ class TestDetectACPProviderByCommand:
         assert info.key == "cursor"
         assert info.default_session_mode == "agent"
 
+    def test_cursor_requires_exact_argv0_identity(self):
+        for command in (
+            ["cursor-agent-wrapper", "acp"],
+            ["/opt/wrapper", "cursor-agent", "acp"],
+            ["sh", "-c", "cursor-agent acp"],
+            ["cursor-agent@2026.09.18", "acp"],
+        ):
+            assert detect_acp_provider_by_command(command) is None, command
+
+    def test_cursor_does_not_override_a_real_provider_in_argv0(self):
+        info = detect_acp_provider_by_command(
+            ["codex-acp", "--launcher", "cursor-agent"]
+        )
+        assert info is not None
+        assert info.key == "codex"
+
     def test_rejects_incidental_substring_in_custom_command(self):
         # Plain substring matching would misattribute these to codex; the
         # basename + prefix rule rejects them (basenames start with "my-"/"not-").
