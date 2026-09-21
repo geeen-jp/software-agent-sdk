@@ -5869,6 +5869,58 @@ class TestApplySessionConfigOptions:
             value="medium",
         )
 
+    async def test_model_selection_and_dependent_option_application_are_one_flow(self):
+        bridge = _OpenHandsACPBridge()
+        conn = self._conn(
+            SetSessionConfigOptionResponse(
+                config_options=[
+                    _config_option("model", "gemini-3.8-flash"),
+                    _config_option(
+                        "reasoning_effort", "high", ["low", "medium", "high"]
+                    ),
+                ]
+            ),
+            SetSessionConfigOptionResponse(
+                config_options=[
+                    _config_option("model", "gemini-3.8-flash"),
+                    _config_option(
+                        "reasoning_effort", "medium", ["low", "medium", "high"]
+                    ),
+                ]
+            ),
+        )
+
+        effective = await _apply_acp_model(
+            conn,
+            "sess-1",
+            "gemini-3.8-flash",
+            agent_name="cursor",
+            via_config_option=True,
+            client=bridge,
+        )
+        await _apply_session_config_options(
+            conn,
+            bridge,
+            "cursor",
+            "sess-1",
+            {"reasoning_effort": "medium"},
+            [_config_option("model", "auto")],
+        )
+
+        assert effective == "gemini-3.8-flash"
+        assert [call.kwargs for call in conn.set_config_option.await_args_list] == [
+            {
+                "config_id": "model",
+                "session_id": "sess-1",
+                "value": "gemini-3.8-flash",
+            },
+            {
+                "config_id": "reasoning_effort",
+                "session_id": "sess-1",
+                "value": "medium",
+            },
+        ]
+
     async def test_observed_update_verifies_a_stateless_response(self):
         """Servers that publish state asynchronously still verify."""
         bridge = _OpenHandsACPBridge()

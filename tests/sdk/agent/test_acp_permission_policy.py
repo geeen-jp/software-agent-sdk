@@ -1128,6 +1128,36 @@ async def test_read_only_cursor_rejects_contradictory_effective_mode() -> None:
         )
 
 
+@pytest.mark.asyncio
+async def test_read_only_cursor_fails_without_effective_mode_evidence() -> None:
+    """Advertised ask alone is not enough after config writes."""
+    conn = MagicMock()
+    client = _OpenHandsACPBridge(permission_policy="read_only")
+    conn.set_config_option = AsyncMock(
+        return_value=SetSessionConfigOptionResponse(
+            config_options=[
+                _select_config_option("mode", "ask", ["agent", "ask"]),
+                _select_config_option("effort", "medium", ["low", "medium"]),
+            ]
+        )
+    )
+
+    with pytest.raises(ACPSessionModeError, match="did not confirm"):
+        await _apply_session_config_options(
+            conn,
+            client,
+            "cursor-agent",
+            "sess-1",
+            {"effort": "medium"},
+            [
+                _select_config_option("mode", "ask", ["agent", "ask"]),
+                _select_config_option("effort", "low", ["low", "medium"]),
+            ],
+            required_session_mode="ask",
+            provider_key="cursor",
+        )
+
+
 def test_read_only_codex_startup_accepts_mode_config_without_current_mode_update(
     tmp_path,
 ) -> None:
