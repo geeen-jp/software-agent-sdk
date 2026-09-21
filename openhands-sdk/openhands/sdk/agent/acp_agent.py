@@ -3697,7 +3697,13 @@ class ACPAgent(AgentBase):
         for tc in self._client.accumulated_tool_calls:
             if tc.get("status") in _TERMINAL_TOOL_CALL_STATUSES:
                 continue
-            tc["status"] = "completed"
+            title = tc.get("title")
+            if isinstance(title, str) and title.casefold() == "structuredoutput":
+                # A structured-output call without a terminal ACP update must
+                # never be promoted as a usable final response.
+                tc["status"] = "failed"
+            else:
+                tc["status"] = "completed"
             self._client._emit_tool_call_event(tc)
 
     async def _do_acp_prompt(

@@ -91,6 +91,109 @@ def test_get_agent_final_response_requires_finish_for_structured_output():
     assert get_agent_final_response([structured]) == ""
 
 
+def test_get_agent_final_response_does_not_reuse_previous_turn_output():
+    """A prior turn's structured output is not a later turn's final result."""
+    previous_structured = ACPToolCallEvent(
+        tool_call_id="previous-structured-output-id",
+        title="StructuredOutput",
+        status="completed",
+        raw_input={"outcome": "PREVIOUS"},
+    )
+    previous_finish = ActionEvent(
+        source="agent",
+        thought=[],
+        action=FinishAction(message='{"outcome":"PREVIOUS"}'),
+        tool_name="finish",
+        tool_call_id="previous-finish-id",
+        tool_call=MessageToolCall(
+            id="previous-finish-id",
+            name="finish",
+            arguments="{}",
+            origin="completion",
+        ),
+        llm_response_id="previous-finish-response-id",
+    )
+    current_user = MessageEvent(
+        source="user",
+        llm_message=Message(role="user", content=[TextContent(text="next")]),
+    )
+    current_finish = ActionEvent(
+        source="agent",
+        thought=[],
+        action=FinishAction(message="(No response from ACP server)"),
+        tool_name="finish",
+        tool_call_id="current-finish-id",
+        tool_call=MessageToolCall(
+            id="current-finish-id",
+            name="finish",
+            arguments="{}",
+            origin="completion",
+        ),
+        llm_response_id="current-finish-response-id",
+    )
+
+    assert (
+        get_agent_final_response(
+            [previous_structured, previous_finish, current_user, current_finish]
+        )
+        == "(No response from ACP server)"
+    )
+
+
+def test_get_agent_final_response_rejects_later_failed_structured_output():
+    """A later failed structured call blocks an earlier completed payload."""
+    completed = ACPToolCallEvent(
+        tool_call_id="completed-structured-output-id",
+        title="StructuredOutput",
+        status="completed",
+        raw_input={"outcome": "PASSED"},
+    )
+    failed = ACPToolCallEvent(
+        tool_call_id="failed-structured-output-id",
+        title="StructuredOutput",
+        status="failed",
+        raw_input={"outcome": "STALE"},
+    )
+    finish = ActionEvent(
+        source="agent",
+        thought=[],
+        action=FinishAction(message="(No response from ACP server)"),
+        tool_name="finish",
+        tool_call_id="finish-id",
+        tool_call=MessageToolCall(
+            id="finish-id", name="finish", arguments="{}", origin="completion"
+        ),
+        llm_response_id="finish-response-id",
+    )
+
+    assert get_agent_final_response([completed, failed, finish]) == (
+        "(No response from ACP server)"
+    )
+
+
+def test_get_agent_final_response_preserves_normal_finish_text():
+    """A real FinishAction message wins over unrelated structured output."""
+    structured = ACPToolCallEvent(
+        tool_call_id="structured-output-id",
+        title="StructuredOutput",
+        status="completed",
+        raw_input={"outcome": "IGNORED"},
+    )
+    finish = ActionEvent(
+        source="agent",
+        thought=[],
+        action=FinishAction(message="normal final text"),
+        tool_name="finish",
+        tool_call_id="finish-id",
+        tool_call=MessageToolCall(
+            id="finish-id", name="finish", arguments="{}", origin="completion"
+        ),
+        llm_response_id="finish-response-id",
+    )
+
+    assert get_agent_final_response([structured, finish]) == "normal final text"
+
+
 def test_get_agent_final_response_with_message_event():
     """Test extracting final response from a message event."""
     # Create a message event
