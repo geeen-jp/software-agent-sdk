@@ -36,6 +36,7 @@ from openhands.sdk.agent.acp_agent import (
     ACPSessionConfigError,
     ACPSessionModelError,
     SessionConfigOption,
+    _apply_acp_model,
     _apply_session_config_options,
     _bound_offered_auth_ids,
     _classify_acp_init_error,
@@ -5811,6 +5812,35 @@ class TestApplySessionConfigOptions:
             [_config_option("model", "auto")],
         )
         assert conn.set_config_option.await_count == 2
+
+    async def test_model_response_records_dependent_config_options(self):
+        """A model selection response is the complete state for the next pass."""
+        bridge = _OpenHandsACPBridge()
+        conn = self._conn(
+            SetSessionConfigOptionResponse(
+                config_options=[
+                    _config_option("model", "gemini-3.8-flash"),
+                    _config_option("reasoning_effort", "medium"),
+                ]
+            )
+        )
+
+        effective = await _apply_acp_model(
+            conn,
+            "sess-1",
+            "gemini-3.8-flash",
+            agent_name="cursor",
+            via_config_option=True,
+            client=bridge,
+        )
+
+        assert effective == "gemini-3.8-flash"
+        recorded = bridge.get_config_options("sess-1")
+        assert recorded is not None
+        assert {option.id for option in recorded} == {
+            "model",
+            "reasoning_effort",
+        }
 
     async def test_observed_update_verifies_a_stateless_response(self):
         """Servers that publish state asynchronously still verify."""

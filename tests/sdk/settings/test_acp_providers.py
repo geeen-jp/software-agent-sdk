@@ -206,6 +206,14 @@ class TestDetectACPProviderByCommand:
     def test_returns_none_for_empty_command(self):
         assert detect_acp_provider_by_command([]) is None
 
+    def test_cursor_is_detected_from_exact_host_binary(self):
+        info = detect_acp_provider_by_command(
+            ["/home/operator/.local/bin/cursor-agent", "acp"]
+        )
+        assert info is not None
+        assert info.key == "cursor"
+        assert info.default_session_mode == "agent"
+
     def test_rejects_incidental_substring_in_custom_command(self):
         # Plain substring matching would misattribute these to codex; the
         # basename + prefix rule rejects them (basenames start with "my-"/"not-").

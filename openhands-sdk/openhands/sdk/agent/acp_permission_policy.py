@@ -28,6 +28,10 @@ _READ_ONLY_SESSION_MODES: Mapping[str, str] = MappingProxyType(
     {
         "claude-code": "default",
         "codex": "read-only",
+        # Cursor's ACP ``ask`` mode disables edits/command execution.  The
+        # command identity is recognized only for the exact cursor-agent
+        # binary; arbitrary custom ACP commands remain fail-closed.
+        "cursor": "ask",
     }
 )
 _CODEX_INITIAL_AGENT_MODE_ENV = "INITIAL_AGENT_MODE"
