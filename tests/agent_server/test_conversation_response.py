@@ -13,7 +13,7 @@ from openhands.agent_server.conversation_service import ConversationService
 from openhands.agent_server.dependencies import get_conversation_service
 from openhands.agent_server.event_service import EventService
 from openhands.sdk import Message
-from openhands.sdk.event import ActionEvent, MessageEvent
+from openhands.sdk.event import ACPToolCallEvent, ActionEvent, MessageEvent
 from openhands.sdk.llm import MessageToolCall, TextContent
 from openhands.sdk.tool.builtins.finish import FinishAction
 
@@ -137,6 +137,39 @@ def test_event_service_get_agent_final_response_with_finish():
 
     result = event_service._get_agent_final_response_sync()
     assert result == "Done!"
+
+
+def test_event_service_get_agent_final_response_with_structured_output():
+    """EventService exposes completed ACP structured output as the final result."""
+    event_service = EventService(stored=MagicMock(), conversations_dir=Path("test_dir"))
+
+    structured_output = ACPToolCallEvent(
+        tool_call_id="structured-output-id",
+        title="StructuredOutput",
+        status="completed",
+        raw_input={"schema_version": "1", "outcome": "PASSED"},
+    )
+    finish_action = FinishAction(message="(No response from ACP server)")
+    action_event = ActionEvent(
+        source="agent",
+        thought=[],
+        action=finish_action,
+        tool_name="finish",
+        tool_call_id="finish-id",
+        tool_call=MessageToolCall(
+            id="finish-id", name="finish", arguments="{}", origin="completion"
+        ),
+        llm_response_id="finish-response-id",
+    )
+
+    conversation = MagicMock()
+    state = MagicMock()
+    state.events = [structured_output, action_event]
+    conversation._state = state
+    event_service._conversation = conversation
+
+    result = event_service._get_agent_final_response_sync()
+    assert result == '{"schema_version":"1","outcome":"PASSED"}'
 
 
 def test_event_service_get_agent_final_response_with_message():

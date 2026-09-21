@@ -1,7 +1,7 @@
 """Tests for the get_agent_final_response utility function."""
 
 from openhands.sdk.conversation.response_utils import get_agent_final_response
-from openhands.sdk.event import ActionEvent, MessageEvent
+from openhands.sdk.event import ACPToolCallEvent, ActionEvent, MessageEvent
 from openhands.sdk.llm import Message, MessageToolCall, TextContent
 from openhands.sdk.tool.builtins.finish import FinishAction
 
@@ -27,6 +27,68 @@ def test_get_agent_final_response_with_finish_action():
     result = get_agent_final_response(events)
 
     assert result == "Task completed successfully!"
+
+
+def test_get_agent_final_response_uses_completed_structured_output_before_placeholder():
+    """Native ACP structured output remains visible through final response API."""
+    structured = ACPToolCallEvent(
+        tool_call_id="structured-output-id",
+        title="StructuredOutput",
+        status="completed",
+        raw_input={"schema_version": "1", "outcome": "PASSED"},
+    )
+    finish = ActionEvent(
+        source="agent",
+        thought=[],
+        action=FinishAction(message="(No response from ACP server)"),
+        tool_name="finish",
+        tool_call_id="finish-id",
+        tool_call=MessageToolCall(
+            id="finish-id", name="finish", arguments="{}", origin="completion"
+        ),
+        llm_response_id="finish-response-id",
+    )
+
+    assert get_agent_final_response([structured, finish]) == (
+        '{"schema_version":"1","outcome":"PASSED"}'
+    )
+
+
+def test_get_agent_final_response_does_not_use_failed_structured_output():
+    """A failed native output call must not be promoted to a final result."""
+    structured = ACPToolCallEvent(
+        tool_call_id="structured-output-id",
+        title="StructuredOutput",
+        status="failed",
+        raw_input={"schema_version": "1", "outcome": "PASSED"},
+    )
+    finish = ActionEvent(
+        source="agent",
+        thought=[],
+        action=FinishAction(message="(No response from ACP server)"),
+        tool_name="finish",
+        tool_call_id="finish-id",
+        tool_call=MessageToolCall(
+            id="finish-id", name="finish", arguments="{}", origin="completion"
+        ),
+        llm_response_id="finish-response-id",
+    )
+
+    assert get_agent_final_response([structured, finish]) == (
+        "(No response from ACP server)"
+    )
+
+
+def test_get_agent_final_response_requires_finish_for_structured_output():
+    """An intermediate structured-output event must not be treated as terminal."""
+    structured = ACPToolCallEvent(
+        tool_call_id="structured-output-id",
+        title="StructuredOutput",
+        status="completed",
+        raw_input={"schema_version": "1", "outcome": "PASSED"},
+    )
+
+    assert get_agent_final_response([structured]) == ""
 
 
 def test_get_agent_final_response_with_message_event():
