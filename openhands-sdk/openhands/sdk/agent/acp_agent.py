@@ -631,6 +631,28 @@ def _is_qualified_claude_exact_model(
     )
 
 
+def _should_emit_claude_raw_sdk_messages(
+    agent_name: str | None,
+    adapter_version: str | None,
+    permission_policy: ACPPermissionPolicy,
+) -> bool:
+    """Enable root-model provenance for every qualified read-only Claude session.
+
+    A session may begin with a selector and later switch to an exact model.
+    Raw SDK emission is session-scoped in claude-agent-acp, so enabling it only
+    for the initial exact request would make that valid runtime-switch path
+    unverifiable. The bridge retains provenance only while an exact turn is
+    active; non-exact turns therefore incur no retained raw payload.
+    """
+    provider = detect_acp_provider_by_agent_name(agent_name or "")
+    return bool(
+        normalize_acp_permission_policy(permission_policy) == "read_only"
+        and provider is not None
+        and provider.key == "claude-code"
+        and adapter_version == CLAUDE_AGENT_ACP_VERSION
+    )
+
+
 def _resolve_effective_model(
     *,
     requested: str,
@@ -1472,89 +1494,88 @@ def _extract_token_usage(
     return (0, 0, 0, 0, 0)
 
 
-def _usage_counter_tuple(usage: Any) -> tuple[int, int, int, int] | None:
-    """Return the four billing counters from a Claude usage object.
+_SYNTHETIC_MODEL_RE = re.compile(r"^<[^>]+>$")
 
-    The Claude ACP adapter uses camelCase counters inside ``model_usage``;
-    accepting the snake_case spellings as well keeps protocol-shaped fixtures
-    explicit without making the extraction depend on a Pydantic model class.
-    Missing or malformed counters are not evidence.
+
+class _TurnModelEvidence(NamedTuple):
+    """Minimum model provenance retained for one active ACP prompt attempt."""
+
+    root_models: tuple[str, ...]
+    delegated_models: tuple[str, ...]
+    message_start_models: tuple[str, ...]
+    invalid_root_evidence: bool
+    invalid_turn_binding: bool
+
+
+def _concrete_provider_model(value: Any) -> str | None:
+    """Return a provider model id, rejecting empty and synthetic placeholders."""
+    if not isinstance(value, str):
+        return None
+    model = value.strip()
+    if not model or _SYNTHETIC_MODEL_RE.fullmatch(model):
+        return None
+    return model
+
+
+def _raw_message_scope(
+    message: Mapping[str, Any],
+) -> Literal["root", "delegated", "unknown"]:
+    """Classify a Claude SDK message using provider-owned ancestry markers.
+
+    Claude Agent SDK 0.3.280 includes ``parent_tool_use_id`` on live SDK
+    messages. ``parent_agent_id`` and ``isSidechain`` are optional across
+    message kinds/versions, so they refine the classification when present but
+    are not required for a live root assistant message.
     """
-    if not isinstance(usage, Mapping):
-        return None
-
-    def counter(*names: str) -> int | None:
-        for name in names:
-            value = usage.get(name)
-            if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
-                return value
-        return None
-
-    input_tokens = counter("inputTokens", "input_tokens")
-    output_tokens = counter("outputTokens", "output_tokens")
-    cached_read = counter("cachedInputTokens", "cachedReadTokens", "cached_read_tokens")
-    cached_write = counter("cachedWriteTokens", "cached_write_tokens")
-    if (
-        input_tokens is None
-        or output_tokens is None
-        or cached_read is None
-        or cached_write is None
-    ):
-        return None
-    return (input_tokens, output_tokens, cached_read, cached_write)
+    if "parent_tool_use_id" not in message:
+        return "unknown"
+    if message["parent_tool_use_id"] is not None:
+        return "delegated"
+    if message.get("parent_agent_id") is not None:
+        return "delegated"
+    if message.get("isSidechain") is True:
+        return "delegated"
+    if "isSidechain" in message and message["isSidechain"] not in (False, None):
+        return "unknown"
+    return "root"
 
 
-def _extract_served_model(response: Any) -> str | None:
-    """Extract one same-turn served model from Claude's quota metadata.
+def _raw_user_message_scope(
+    message: Mapping[str, Any],
+) -> Literal["prompt", "tool_result", "unknown"]:
+    """Classify a Claude SDK user message without retaining its content.
 
-    ``claude-agent-acp@0.81.0`` reports a list of per-model accounting rows.
-    The adapter documents the top-level ``usage`` as main-agent-loop usage,
-    while ``model_usage`` may also include Task subagents, sidechains, and
-    internal calls.  These are different accounting scopes, so their token
-    counters cannot identify the primary model.  A single valid row provides
-    one unambiguous model identity for this response; multiple rows do not
-    expose a primary marker and therefore fail closed.
-
-    A missing, malformed, duplicate, or unresolved row returns ``None`` so the
-    caller can fail closed.  This function never uses self-report metadata or
-    session/config selector state.
+    Claude Agent SDK 0.3.280 emits user-role tool-result messages between
+    root assistant messages. They have their own ``uuid`` and a null
+    ``parent_tool_use_id``, so UUID alone is not a prompt-turn discriminator.
+    The provider-owned ``message.content`` block type distinguishes the
+    submitted prompt from those tool-result messages.
     """
-    field_meta = getattr(response, "field_meta", None)
-    if not isinstance(field_meta, Mapping):
-        return None
-    quota = field_meta.get("quota")
-    if not isinstance(quota, Mapping):
-        return None
-    raw_model_usage = quota.get("model_usage")
-    entries: list[tuple[str, tuple[int, int, int, int]]] = []
-    if isinstance(raw_model_usage, Mapping):
-        raw_entries: Iterable[tuple[Any, Any]] = raw_model_usage.items()
-        for raw_model, raw_usage in raw_entries:
-            if not isinstance(raw_model, str) or not raw_model:
-                return None
-            counters = _usage_counter_tuple(raw_usage)
-            if counters is None:
-                return None
-            entries.append((raw_model, counters))
-    elif isinstance(raw_model_usage, list):
-        for raw_entry in raw_model_usage:
-            if not isinstance(raw_entry, Mapping):
-                return None
-            raw_model = raw_entry.get("model")
-            if not isinstance(raw_model, str) or not raw_model:
-                return None
-            counters = _usage_counter_tuple(raw_entry.get("token_count"))
-            if counters is None:
-                return None
-            entries.append((raw_model, counters))
-    else:
-        return None
+    inner = message.get("message")
+    if not isinstance(inner, Mapping) or inner.get("role") != "user":
+        return "unknown"
+    content = inner.get("content")
+    if isinstance(content, str):
+        return "prompt" if content.strip() else "unknown"
+    if not isinstance(content, list) or not content:
+        return "unknown"
+    block_types: list[str] = []
+    for block in content:
+        if not isinstance(block, Mapping):
+            return "unknown"
+        block_type = block.get("type")
+        if not isinstance(block_type, str) or not block_type:
+            return "unknown"
+        block_types.append(block_type)
 
-    if not entries or len({model for model, _ in entries}) != len(entries):
-        return None
-    if len(entries) != 1:
-        return None
-    return entries[0][0]
+    def is_tool_result(block_type: str) -> bool:
+        return block_type == "tool_result" or block_type.endswith("_tool_result")
+
+    if all(is_tool_result(block_type) for block_type in block_types):
+        return "tool_result"
+    if any(is_tool_result(block_type) for block_type in block_types):
+        return "unknown"
+    return "prompt"
 
 
 def _estimate_cost_from_tokens(
@@ -1964,6 +1985,18 @@ class _OpenHandsACPBridge:
         self._fork_lock = threading.Lock()
         self._fork_session_id: str | None = None
         self._fork_accumulated_text: list[str] = []
+        # Exact-model provenance is deliberately separate from usage/cost
+        # accounting. Only the active prompt attempt may populate it, and only
+        # the minimal provider-owned model fields are retained.
+        self._model_evidence_session_id: str | None = None
+        self._model_evidence_root_models: list[str] = []
+        self._model_evidence_delegated_models: list[str] = []
+        self._model_evidence_message_start_models: list[str] = []
+        self._model_evidence_invalid_root = False
+        self._model_evidence_user_message_uuid: str | None = None
+        self._model_evidence_invalid_turn_binding = False
+        self._completed_model_evidence: _TurnModelEvidence | None = None
+        self._model_evidence_lock = threading.Lock()
 
     def reset(self) -> None:
         self.accumulated_text.clear()
@@ -1975,9 +2008,161 @@ class _OpenHandsACPBridge:
         self._turn_usage_updates.clear()
         self._usage_received.clear()
         self._masking_error = None
+        self.discard_turn_model_evidence()
         # Note: telemetry state (_last_cost, _context_window, _last_activity_signal,
         # etc.) is intentionally NOT cleared — it accumulates across turns.
         # Session config option state is likewise session-scoped, not per-turn.
+
+    def begin_turn_model_evidence(self, session_id: str) -> None:
+        """Start a fresh provenance scope for one prompt attempt."""
+        self.discard_turn_model_evidence()
+        with self._model_evidence_lock:
+            self._model_evidence_session_id = session_id
+
+    def finish_turn_model_evidence(self, session_id: str) -> None:
+        """Close the active scope before usage waiters or late events run."""
+        with self._model_evidence_lock:
+            if self._model_evidence_session_id != session_id:
+                return
+            self._completed_model_evidence = _TurnModelEvidence(
+                root_models=tuple(self._model_evidence_root_models),
+                delegated_models=tuple(self._model_evidence_delegated_models),
+                message_start_models=tuple(self._model_evidence_message_start_models),
+                invalid_root_evidence=self._model_evidence_invalid_root,
+                invalid_turn_binding=self._model_evidence_invalid_turn_binding,
+            )
+            self._model_evidence_session_id = None
+
+    def pop_turn_model_evidence(self) -> _TurnModelEvidence | None:
+        """Consume the completed evidence for exactly one prompt attempt."""
+        with self._model_evidence_lock:
+            evidence = self._completed_model_evidence
+            self._completed_model_evidence = None
+            return evidence
+
+    def discard_turn_model_evidence(self) -> None:
+        """Invalidate active and completed evidence, including on cancellation."""
+        with self._model_evidence_lock:
+            self._model_evidence_session_id = None
+            self._model_evidence_root_models.clear()
+            self._model_evidence_delegated_models.clear()
+            self._model_evidence_message_start_models.clear()
+            self._model_evidence_invalid_root = False
+            self._model_evidence_user_message_uuid = None
+            self._model_evidence_invalid_turn_binding = False
+            self._completed_model_evidence = None
+
+    def _record_raw_sdk_message(self, params: Mapping[str, Any]) -> None:
+        with self._model_evidence_lock:
+            self._record_raw_sdk_message_unlocked(params)
+
+    def _root_message_belongs_to_turn(self, message: Mapping[str, Any]) -> bool:
+        """Require the provider's current prompt UUID before accepting root data.
+
+        Claude omits ``user_message_uuid`` on later root messages in a tool
+        loop.  That omission is safe only after a prior root assistant or
+        ``message_start`` frame has explicitly matched the current prompt.
+        The first root frame must always carry the matching UUID.
+        """
+        prompt_uuid = self._model_evidence_user_message_uuid
+        if prompt_uuid is None:
+            self._model_evidence_invalid_turn_binding = True
+            return False
+        message_uuid = message.get("user_message_uuid")
+        if message_uuid is None:
+            if not (
+                self._model_evidence_root_models
+                or self._model_evidence_message_start_models
+            ):
+                self._model_evidence_invalid_turn_binding = True
+                return False
+            return True
+        if message_uuid != prompt_uuid:
+            self._model_evidence_invalid_turn_binding = True
+            return False
+        return True
+
+    def _record_raw_sdk_message_unlocked(self, params: Mapping[str, Any]) -> None:
+        """Extract provenance from one raw Claude SDK message without retaining it."""
+        active_session_id = self._model_evidence_session_id
+        if active_session_id is None or params.get("sessionId") != active_session_id:
+            return
+        sdk_message = params.get("message")
+        if not isinstance(sdk_message, Mapping):
+            return
+
+        message_type = sdk_message.get("type")
+        if message_type == "user":
+            user_scope = _raw_user_message_scope(sdk_message)
+            if user_scope == "tool_result":
+                return
+            if user_scope != "prompt":
+                self._model_evidence_invalid_turn_binding = True
+                return
+            user_uuid = sdk_message.get("uuid")
+            if not isinstance(user_uuid, str) or not user_uuid.strip():
+                self._model_evidence_invalid_turn_binding = True
+            elif self._model_evidence_user_message_uuid is None:
+                self._model_evidence_user_message_uuid = user_uuid
+            elif user_uuid != self._model_evidence_user_message_uuid:
+                self._model_evidence_invalid_turn_binding = True
+            return
+        if message_type == "assistant":
+            scope = _raw_message_scope(sdk_message)
+            if scope == "delegated":
+                inner = sdk_message.get("message")
+                if isinstance(inner, Mapping):
+                    model = _concrete_provider_model(inner.get("model"))
+                    if model is not None:
+                        self._model_evidence_delegated_models.append(model)
+                return
+            if scope != "root":
+                self._model_evidence_invalid_root = True
+                return
+            if not self._root_message_belongs_to_turn(sdk_message):
+                return
+            inner = sdk_message.get("message")
+            model = (
+                _concrete_provider_model(inner.get("model"))
+                if isinstance(inner, Mapping)
+                else None
+            )
+            if model is None:
+                self._model_evidence_invalid_root = True
+            else:
+                self._model_evidence_root_models.append(model)
+            return
+
+        if message_type != "stream_event":
+            return
+        event = sdk_message.get("event")
+        if not isinstance(event, Mapping) or event.get("type") != "message_start":
+            return
+        scope = _raw_message_scope(sdk_message)
+        if scope == "delegated":
+            message_start = event.get("message")
+            if isinstance(message_start, Mapping):
+                model = _concrete_provider_model(message_start.get("model"))
+                if model is not None:
+                    self._model_evidence_delegated_models.append(model)
+            return
+        if scope != "root":
+            # The consolidated assistant message remains the required
+            # authority. A stream frame without a root discriminator is not
+            # allowed to become authority and is ignored as a cross-check.
+            return
+        if not self._root_message_belongs_to_turn(sdk_message):
+            return
+        message_start = event.get("message")
+        model = (
+            _concrete_provider_model(message_start.get("model"))
+            if isinstance(message_start, Mapping)
+            else None
+        )
+        if model is None:
+            self._model_evidence_invalid_root = True
+        else:
+            self._model_evidence_message_start_models.append(model)
 
     def arm_activity_clock(self) -> None:
         """Mark "now" as the last activity for the idle-timeout watchdog."""
@@ -2275,10 +2460,16 @@ class _OpenHandsACPBridge:
 
     async def ext_notification(
         self,
-        method: str,  # noqa: ARG002
-        params: dict[str, Any],  # noqa: ARG002
+        method: str,
+        params: dict[str, Any],
     ) -> None:
-        pass
+        # The Python ACP client removes one leading underscore from extension
+        # method names, so 0.81.0 arrives here as ``claude/sdkMessage``. Keep
+        # the underscored spelling for direct/provider-shaped clients too.
+        if method not in ("claude/sdkMessage", "_claude/sdkMessage"):
+            return
+        if isinstance(params, Mapping):
+            self._record_raw_sdk_message(params)
 
     def on_connect(self, conn: Any) -> None:  # noqa: ARG002
         pass
@@ -2637,8 +2828,9 @@ class ACPAgent(AgentBase):
         """The ACP session's routing/model selector.
 
         For the qualified Claude exact-model path this is deliberately not the
-        execution authority: only the completed turn's ``model_usage`` can
-        populate the served identity used by the success gate.
+        execution authority: only the completed turn's provider-owned root
+        assistant SDK messages can populate the served identity used by the
+        success gate.
         """
         return self._current_model_id
 
@@ -3681,6 +3873,11 @@ class ACPAgent(AgentBase):
                             agent_name,
                             acp_model=requested_model,
                             structured_output=self.structured_output,
+                            emit_raw_sdk_messages=_should_emit_claude_raw_sdk_messages(
+                                agent_name,
+                                self._startup_adapter_version,
+                                self.acp_permission_policy,
+                            ),
                         )
                         load_response = await conn.load_session(
                             cwd=working_dir,
@@ -3723,6 +3920,11 @@ class ACPAgent(AgentBase):
                         agent_name,
                         acp_model=requested_model,
                         structured_output=self.structured_output,
+                        emit_raw_sdk_messages=_should_emit_claude_raw_sdk_messages(
+                            agent_name,
+                            self._startup_adapter_version,
+                            self.acp_permission_policy,
+                        ),
                     )
                     response = await conn.new_session(
                         cwd=working_dir,
@@ -3971,41 +4173,63 @@ class ACPAgent(AgentBase):
         self._client.on_activity = self._on_activity
         self._client.arm_activity_clock()
 
-    def _verify_served_model_for_turn(self, response: PromptResponse | None) -> None:
+    def _verify_served_model_for_turn(self) -> None:
         """Gate a qualified Claude turn on its own served-model evidence.
 
         The selector kept in ``_current_model_id`` is diagnostic/routing state;
         it is never accepted as exact identity.  The response is checked before
         structured result consumption or FinishAction emission so provider
         output cannot become an SDK-successful turn first. Token/cost
-        accounting remains independent telemetry.
+        accounting remains independent telemetry. ``model_usage`` is likewise
+        telemetry only: it has no root-agent or same-turn authority contract.
         """
         if not self._post_turn_model_verification_required:
             return
         requested_model = self._requested_model_for_turn()
         selector_model = self._current_model_id
-        served_model = _extract_served_model(response)
-        self._served_model_id = served_model
-        if served_model is None:
+        evidence = (
+            self._client.pop_turn_model_evidence() if self._client is not None else None
+        )
+        root_models = evidence.root_models if evidence is not None else ()
+        message_start_models = (
+            evidence.message_start_models if evidence is not None else ()
+        )
+        observed_models = (*root_models, *message_start_models)
+        if (
+            evidence is None
+            or evidence.invalid_root_evidence
+            or evidence.invalid_turn_binding
+            or not root_models
+            or not observed_models
+        ):
+            self._served_model_id = None
             self._restart_session_on_next_turn = True
             raise ACPSessionModelError(
-                "Claude ACP turn did not provide unique same-turn served-model "
+                "Claude ACP turn did not provide qualified same-turn root "
                 f"evidence (requested={requested_model!r}, "
                 f"selector={selector_model!r}, served='UNKNOWN')."
             )
-        if requested_model is None or served_model != requested_model:
+        mismatched = next(
+            (model for model in observed_models if model != requested_model), None
+        )
+        if requested_model is None or mismatched is not None:
+            self._served_model_id = None
             self._restart_session_on_next_turn = True
             raise ACPSessionModelError(
                 "Claude ACP turn served a model different from the request "
                 f"(requested={requested_model!r}, selector={selector_model!r}, "
-                f"served={served_model!r})."
+                f"served={mismatched or root_models[0]!r}, "
+                f"root_models={list(root_models)!r})."
             )
+        served_model = root_models[0]
+        self._served_model_id = served_model
         logger.info(
-            "Claude ACP same-turn model verification passed: requested=%s "
-            "selector=%s served=%s",
+            "Claude ACP same-turn root model verification passed: requested=%s "
+            "selector=%s root_models=%s delegated_models=%s",
             requested_model,
             selector_model,
-            served_model,
+            list(root_models),
+            list(evidence.delegated_models),
         )
 
     def _clear_turn_callbacks(self) -> None:
@@ -4094,7 +4318,13 @@ class ACPAgent(AgentBase):
             raise RuntimeError(msg)
         session_id = self._session_id
         usage_sync = self._client.prepare_usage_sync(session_id)
-        response = await self._conn.prompt(prompt_blocks, session_id)
+        self._client.begin_turn_model_evidence(session_id)
+        try:
+            response = await self._conn.prompt(prompt_blocks, session_id)
+        except BaseException:
+            self._client.discard_turn_model_evidence()
+            raise
+        self._client.finish_turn_model_evidence(session_id)
         if self._client.get_turn_usage_update(session_id) is None:
             try:
                 await asyncio.wait_for(usage_sync.wait(), timeout=_USAGE_UPDATE_TIMEOUT)
@@ -4169,7 +4399,7 @@ class ACPAgent(AgentBase):
         # rejected for model provenance does not silently lose its token/cost
         # accounting. No successful turn event is emitted until this gate
         # passes.
-        self._verify_served_model_for_turn(response)
+        self._verify_served_model_for_turn()
         self._client._raise_masking_error()
         self._commit_suffix_installation(state)
 
@@ -4576,10 +4806,14 @@ class ACPAgent(AgentBase):
             with state:
                 self._finalize_successful_turn(response, elapsed, state, on_event)
         except asyncio.CancelledError:
+            # Cancellation wins the authority race. Prevent a provider event
+            # arriving during cancel/drain from becoming this turn's proof.
+            self._client.discard_turn_model_evidence()
             try:
                 await self._arequest_session_cancel()
                 drain_result = await self._drain_cancelled_prompt(prompt_future)
             except asyncio.CancelledError:
+                self._client.discard_turn_model_evidence()
                 with state:
                     elapsed = time.monotonic() - t0
                     self._handle_cancelled_cleanup_interruption(
@@ -4591,7 +4825,7 @@ class ACPAgent(AgentBase):
                 if drain_result.completed and drain_result.error is None:
                     if self._post_turn_model_verification_required:
                         # Qualified exact Claude cancellation is authoritative
-                        # even if a valid model_usage row arrived late. Keep
+                        # even if valid root model evidence arrived late. Keep
                         # the historical completion behavior for other ACP
                         # providers and non-qualified sessions.
                         self._record_discarded_turn_usage(
@@ -4620,6 +4854,7 @@ class ACPAgent(AgentBase):
                 await self._arequest_session_cancel()
                 drain_result = await self._drain_cancelled_prompt(prompt_future)
             except asyncio.CancelledError:
+                self._client.discard_turn_model_evidence()
                 with state:
                     elapsed = time.monotonic() - t0
                     self._handle_cancelled_cleanup_interruption(
@@ -4630,6 +4865,7 @@ class ACPAgent(AgentBase):
                 elapsed = time.monotonic() - t0
                 if drain_result.completed and drain_result.error is None:
                     if self._prompt_response_was_cancelled(drain_result.response):
+                        self._client.discard_turn_model_evidence()
                         if self._post_turn_model_verification_required:
                             self._record_discarded_turn_usage(
                                 drain_result.response, elapsed
@@ -4650,9 +4886,11 @@ class ACPAgent(AgentBase):
                             self._restart_session_on_next_turn = True
                             raise
                 elif drain_result.completed and drain_result.error is not None:
+                    self._client.discard_turn_model_evidence()
                     self._emit_turn_error(drain_result.error, state, on_event)
                     self._restart_session_on_next_turn = True
                 else:
+                    self._client.discard_turn_model_evidence()
                     self._emit_turn_timeout(elapsed, state, on_event)
                     self._restart_session_on_next_turn = True
         except Exception as e:
@@ -4699,10 +4937,14 @@ class ACPAgent(AgentBase):
 
             async def _prompt() -> PromptResponse:
                 usage_sync = self._client.prepare_usage_sync(self._session_id or "")
-                response = await self._conn.prompt(
-                    prompt_blocks,
-                    self._session_id,
-                )
+                session_id = self._session_id or ""
+                self._client.begin_turn_model_evidence(session_id)
+                try:
+                    response = await self._conn.prompt(prompt_blocks, session_id)
+                except BaseException:
+                    self._client.discard_turn_model_evidence()
+                    raise
+                self._client.finish_turn_model_evidence(session_id)
                 if self._client.get_turn_usage_update(self._session_id or "") is None:
                     try:
                         await asyncio.wait_for(
@@ -4795,7 +5037,7 @@ class ACPAgent(AgentBase):
                 elapsed=elapsed,
                 usage_update=usage_update,
             )
-            self._verify_served_model_for_turn(response)
+            self._verify_served_model_for_turn()
 
             # ACPToolCallEvents were already emitted live from
             # _OpenHandsACPBridge.session_update as each ToolCallStart /
@@ -4842,6 +5084,7 @@ class ACPAgent(AgentBase):
             state.execution_status = ConversationExecutionStatus.FINISHED
 
         except TimeoutError:
+            self._client.discard_turn_model_evidence()
             elapsed = time.monotonic() - t0
             logger.error(
                 "ACP prompt timed out after %.1fs (limit=%.0fs). "
@@ -4870,6 +5113,7 @@ class ACPAgent(AgentBase):
             on_event(MessageEvent(source="agent", llm_message=error_message))
             state.execution_status = ConversationExecutionStatus.ERROR
         except Exception as e:
+            self._client.discard_turn_model_evidence()
             logger.error("ACP prompt failed: %s", e, exc_info=True)
             error_str = str(e)
 
@@ -4931,10 +5175,16 @@ class ACPAgent(AgentBase):
             try:
                 fork_t0 = time.monotonic()
                 usage_sync = client.prepare_usage_sync(fork_session_id)
-                response = await self._conn.prompt(
-                    [text_block(question)],
-                    fork_session_id,
-                )
+                client.begin_turn_model_evidence(fork_session_id)
+                try:
+                    response = await self._conn.prompt(
+                        [text_block(question)],
+                        fork_session_id,
+                    )
+                except BaseException:
+                    client.discard_turn_model_evidence()
+                    raise
+                client.finish_turn_model_evidence(fork_session_id)
                 if client.get_turn_usage_update(fork_session_id) is None:
                     try:
                         await asyncio.wait_for(
@@ -4956,9 +5206,10 @@ class ACPAgent(AgentBase):
                     elapsed=fork_elapsed,
                     usage_update=usage_update,
                 )
-                self._verify_served_model_for_turn(response)
+                self._verify_served_model_for_turn()
                 return result
             finally:
+                client.discard_turn_model_evidence()
                 client._fork_session_id = None
                 client._fork_accumulated_text.clear()
 
