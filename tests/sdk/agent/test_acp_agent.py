@@ -4414,7 +4414,7 @@ class TestExtractServedModel:
         )
         assert _extract_served_model(response) == "claude-opus-5-5"
 
-    def test_multiple_rows_use_unique_main_usage_match(self):
+    def test_multiple_rows_are_ambiguous_even_when_usage_matches(self):
         response = TestExtractServedModel._response(
             [
                 {
@@ -4436,6 +4436,23 @@ class TestExtractServedModel:
                     },
                 },
             ]
+        )
+        assert _extract_served_model(response) is None
+
+    def test_single_model_row_does_not_require_main_loop_usage_match(self):
+        response = TestExtractServedModel._response(
+            [
+                {
+                    "model": "claude-opus-5-5",
+                    "token_count": {
+                        "inputTokens": 1,
+                        "outputTokens": 2,
+                        "cachedInputTokens": 3,
+                        "cachedWriteTokens": 4,
+                    },
+                }
+            ],
+            usage=(10, 20, 30, 40),
         )
         assert _extract_served_model(response) == "claude-opus-5-5"
 

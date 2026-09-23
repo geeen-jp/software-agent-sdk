@@ -1504,30 +1504,16 @@ def _usage_counter_tuple(usage: Any) -> tuple[int, int, int, int] | None:
     return (input_tokens, output_tokens, cached_read, cached_write)
 
 
-def _prompt_response_usage_tuple(response: Any) -> tuple[int, int, int, int] | None:
-    usage = getattr(response, "usage", None)
-    if usage is None:
-        return None
-    return _usage_counter_tuple(
-        {
-            "input_tokens": getattr(usage, "input_tokens", None),
-            "output_tokens": getattr(usage, "output_tokens", None),
-            "cached_read_tokens": getattr(usage, "cached_read_tokens", 0) or 0,
-            "cached_write_tokens": getattr(usage, "cached_write_tokens", 0) or 0,
-        }
-    )
-
-
 def _extract_served_model(response: Any) -> str | None:
     """Extract one same-turn served model from Claude's quota metadata.
 
     ``claude-agent-acp@0.81.0`` reports a list of per-model accounting rows.
-    The adapter documents the top-level ``usage`` as the main-agent-loop
-    usage, while ``model_usage`` may also include Task subagents, sidechains,
-    and internal calls.  When there is more than one row, the main model is
-    therefore accepted only when exactly one row has the complete same counter
-    tuple as the response's own usage.  No first-row or largest-row heuristic
-    is permitted.
+    The adapter documents the top-level ``usage`` as main-agent-loop usage,
+    while ``model_usage`` may also include Task subagents, sidechains, and
+    internal calls.  These are different accounting scopes, so their token
+    counters cannot identify the primary model.  A single valid row provides
+    one unambiguous model identity for this response; multiple rows do not
+    expose a primary marker and therefore fail closed.
 
     A missing, malformed, duplicate, or unresolved row returns ``None`` so the
     caller can fail closed.  This function never uses self-report metadata or
@@ -1566,14 +1552,9 @@ def _extract_served_model(response: Any) -> str | None:
 
     if not entries or len({model for model, _ in entries}) != len(entries):
         return None
-    if len(entries) == 1:
-        return entries[0][0]
-
-    turn_usage = _prompt_response_usage_tuple(response)
-    if turn_usage is None:
+    if len(entries) != 1:
         return None
-    matching = [model for model, counters in entries if counters == turn_usage]
-    return matching[0] if len(matching) == 1 else None
+    return entries[0][0]
 
 
 def _estimate_cost_from_tokens(
