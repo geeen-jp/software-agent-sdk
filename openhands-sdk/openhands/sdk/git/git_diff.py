@@ -26,8 +26,34 @@ logger = logging.getLogger(__name__)
 MAX_FILE_SIZE_FOR_GIT_DIFF = 1024 * 1024  # 1 Mb
 
 
+def _is_git_dir(git_dir: Path) -> bool:
+    """Return whether ``git_dir`` has the layout git treats as a repository.
+
+    Git skips a ``.git`` directory that is missing ``HEAD``, ``objects``, or
+    ``refs`` and keeps walking. An empty directory must not count as a root.
+    """
+    return (
+        (git_dir / "HEAD").is_file()
+        and (git_dir / "objects").is_dir()
+        and (git_dir / "refs").is_dir()
+    )
+
+
+def _git_ceiling_directories() -> tuple[Path, ...]:
+    """Resolve ``GIT_CEILING_DIRECTORIES`` the way git stops its upward walk."""
+    raw = os.environ.get("GIT_CEILING_DIRECTORIES")
+    if not raw:
+        return ()
+    return tuple(Path(entry).resolve() for entry in raw.split(os.pathsep) if entry)
+
+
 def get_closest_git_repo(path: Path) -> Path | None:
     """Find the closest git repository by walking up the directory tree.
+
+    Discovery matches git: a ``.git`` file is a worktree or submodule pointer,
+    a ``.git`` directory counts only when it has ``HEAD``, ``objects``, and
+    ``refs``, and ``GIT_CEILING_DIRECTORIES`` stops the walk before entering
+    those directories.
 
     Args:
         path: Starting path to search from
@@ -36,15 +62,20 @@ def get_closest_git_repo(path: Path) -> Path | None:
         Path to the git repository root, or None if not found
     """
     current_path = path.resolve()
+    ceilings = _git_ceiling_directories()
 
     while True:
         git_path = current_path / ".git"
-        if git_path.exists():  # Could be file (worktree) or directory
+        if git_path.is_dir():
+            if _is_git_dir(git_path):
+                logger.debug(f"Found git repository at: {current_path}")
+                return current_path
+        elif git_path.is_file():
             logger.debug(f"Found git repository at: {current_path}")
             return current_path
 
         parent = current_path.parent
-        if parent == current_path:  # Reached filesystem root
+        if parent == current_path or parent in ceilings:  # Root or git ceiling
             logger.debug(f"No git repository found for path: {path}")
             return None
         current_path = parent
