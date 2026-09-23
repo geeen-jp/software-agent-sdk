@@ -162,13 +162,14 @@ def test_get_git_diff_nonexistent_file():
             run_in_directory(temp_dir, get_git_diff, "nonexistent.txt")
 
 
-def test_get_closest_git_repo():
+def test_get_closest_git_repo(monkeypatch: pytest.MonkeyPatch):
     """Test the get_closest_git_repo helper function."""
     with tempfile.TemporaryDirectory() as temp_dir:
         setup_git_repo(temp_dir)
+        repo_root = Path(temp_dir).resolve()
 
         # Create nested directory structure
-        nested_dir = Path(temp_dir) / "src" / "utils"
+        nested_dir = repo_root / "src" / "utils"
         nested_dir.mkdir(parents=True)
 
         # Test finding git repo from nested directory
@@ -176,12 +177,30 @@ def test_get_closest_git_repo():
         # Compare resolved paths to avoid symlink differences on macOS
         # Example: /var is a symlink to /private/var
         assert git_repo is not None
-        assert git_repo.resolve() == Path(temp_dir).resolve()
+        assert git_repo.resolve() == repo_root
 
-        # Test with non-git directory
+        # Test with a non-git directory. This must remain independent of any
+        # repository that happens to contain the system temporary directory.
         with tempfile.TemporaryDirectory() as non_git_dir:
-            git_repo = get_closest_git_repo(Path(non_git_dir))
-            assert git_repo is None
+            assert get_closest_git_repo(Path(non_git_dir)) is None
+
+        # An incomplete .git directory is not a repository. Git skips it and
+        # keeps walking, so it must not hide the real parent repository.
+        incomplete = repo_root / "scratch"
+        incomplete.mkdir()
+        (incomplete / ".git").mkdir()
+        git_repo = get_closest_git_repo(incomplete)
+        assert git_repo is not None
+        assert git_repo.resolve() == repo_root
+
+        # A path below a ceiling is not in a repository, even when an empty
+        # .git entry or a real repository sits above that ceiling.
+        bounded = repo_root / "bounded"
+        probe = bounded / "probe"
+        probe.mkdir(parents=True)
+        (probe / ".git").mkdir()
+        monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(bounded))
+        assert get_closest_git_repo(probe) is None
 
 
 def test_git_diff_model_properties():
