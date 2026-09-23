@@ -119,7 +119,7 @@ RUN set -eux; \
     WRAPPER_BINS=""; \
     for provider in $(echo "$INSTALL_ACP_PROVIDERS" | tr ',' ' '); do \
       case "$provider" in \
-        claude-code) PACKAGES="$PACKAGES @agentclientprotocol/claude-agent-acp@0.63.0"; \
+        claude-code) PACKAGES="$PACKAGES @agentclientprotocol/claude-agent-acp@0.81.0"; \
           WRAPPER_BINS="$WRAPPER_BINS claude-agent-acp";; \
         codex) PACKAGES="$PACKAGES @agentclientprotocol/codex-acp@1.1.7 @openai/codex@0.145.0"; \
           WRAPPER_BINS="$WRAPPER_BINS codex-acp";; \

@@ -222,6 +222,7 @@ def test_switch_acp_model_before_session_defers_and_persists(tmp_path):
     switched = conv.agent
     assert isinstance(switched, ACPAgent)
     assert switched.acp_model == "model-b"
+    assert switched._requested_model_for_turn() == "model-b"
     assert not switched.has_live_acp_session
     assert isinstance(conv.state.agent, ACPAgent)
     assert conv.state.agent.acp_model == "model-b"
@@ -237,6 +238,21 @@ def test_switch_acp_model_before_session_defers_and_persists(tmp_path):
     assert reloaded.agent.acp_model == "model-b"
     assert reloaded.agent.llm.model == "model-b"
     assert "acp_current_model_id" not in reloaded.agent_state
+
+
+def test_pre_session_switch_discards_stale_runtime_model_binding(tmp_path):
+    """A torn-down live binding cannot shadow a new persisted pre-session model."""
+    conv, agent = _make_pre_session_acp_conversation(tmp_path)
+    agent._requested_model_id = "model-b"
+    agent._runtime_model_override_active = True
+
+    conv.switch_acp_model("model-c")
+
+    switched = conv.agent
+    assert isinstance(switched, ACPAgent)
+    assert switched.acp_model == "model-c"
+    assert switched._requested_model_for_turn() == "model-c"
+    assert switched._runtime_model_override_active is False
 
 
 def test_switch_acp_model_persists_authoritative_model(tmp_path):

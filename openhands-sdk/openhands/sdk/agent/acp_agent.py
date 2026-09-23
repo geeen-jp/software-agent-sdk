@@ -27,7 +27,7 @@ import threading
 import time
 import uuid
 import weakref
-from collections.abc import Callable, Collection, Generator, Iterable
+from collections.abc import Callable, Collection, Generator, Iterable, Mapping
 from concurrent.futures import Future
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final, Literal, NamedTuple
@@ -119,7 +119,6 @@ from openhands.sdk.settings.acp_providers import (
     CLAUDE_AGENT_ACP_VERSION,
     ACPFileSecretSpec,
     _build_session_meta,
-    _build_session_structured_output_meta,
     default_acp_file_secrets,
     detect_acp_provider_by_agent_name,
     detect_acp_provider_by_command,
@@ -602,6 +601,36 @@ def _requested_model_matches_observed(
     )
 
 
+def _is_claude_exact_model_request(
+    agent_name: str | None,
+    requested_model: str | None,
+) -> bool:
+    provider = detect_acp_provider_by_agent_name(agent_name or "")
+    return bool(
+        provider is not None
+        and provider.key == "claude-code"
+        and requested_model
+        and requested_model.startswith("claude-")
+    )
+
+
+def _is_qualified_claude_exact_model(
+    agent_name: str | None,
+    adapter_version: str | None,
+    requested_model: str | None,
+) -> bool:
+    """Identify the pinned Claude path that needs same-turn model proof.
+
+    Claude model-picker values such as ``opus`` and ``sonnet`` are selectors,
+    not exact identities. Explicit Claude model IDs are intentionally detected
+    by their concrete ``claude-`` spelling; no alias table is introduced.
+    """
+    return bool(
+        _is_claude_exact_model_request(agent_name, requested_model)
+        and adapter_version == CLAUDE_AGENT_ACP_VERSION
+    )
+
+
 def _resolve_effective_model(
     *,
     requested: str,
@@ -611,8 +640,16 @@ def _resolve_effective_model(
     response: Any | None = None,
     config_options: list[SessionConfigOption] | None = None,
     client: _OpenHandsACPBridge | None = None,
+    accept_routing_selector: bool = False,
 ) -> str:
-    """Return the authoritative effective model id or fail closed."""
+    """Return the reported model/selector or fail closed.
+
+    ``accept_routing_selector`` is used only by the qualified Claude exact
+    runtime-switch path.  Claude 0.81.0 can accept a concrete model request
+    while returning its picker alias (for example ``opus``); that selector is
+    diagnostic state only and the next turn must still pass the same-turn
+    served-model gate.
+    """
     effective: str | None = None
 
     if response is not None:
@@ -650,7 +687,7 @@ def _resolve_effective_model(
             f"authoritative model after requesting {requested!r}; the requested "
             "model cannot be verified."
         )
-    if not _requested_model_matches_observed(
+    if not accept_routing_selector and not _requested_model_matches_observed(
         requested,
         effective,
         agent_name=agent_name,
@@ -671,8 +708,14 @@ async def _apply_acp_model(
     agent_name: str | None = None,
     via_config_option: bool,
     client: _OpenHandsACPBridge | None = None,
+    accept_routing_selector: bool = False,
 ) -> str:
-    """Apply ``model`` to a live ACP session and return the verified effective id."""
+    """Apply ``model`` and return its reported selector/effective model id.
+
+    The qualified Claude exact runtime-switch path may return a selector alias;
+    that path passes ``accept_routing_selector=True`` and relies on the next
+    completed turn for exact execution authority.
+    """
     if via_config_option:
         last_options: list[SessionConfigOption] | None = None
         for config_id, value in _model_config_options(agent_name, model):
@@ -694,6 +737,7 @@ async def _apply_acp_model(
             via_config_option=True,
             config_options=last_options,
             client=client,
+            accept_routing_selector=accept_routing_selector,
         )
 
     response = await conn.set_session_model(model_id=model, session_id=session_id)
@@ -704,6 +748,7 @@ async def _apply_acp_model(
         via_config_option=False,
         response=response,
         client=client,
+        accept_routing_selector=accept_routing_selector,
     )
 
 
@@ -837,7 +882,8 @@ def _verify_read_only_mode_after_config(
     keeps the confirmed ``ask`` mode effective while updating model-dependent
     options without emitting a second mode notification. Those providers may
     prove ``read_only`` from their provider-specific effective state instead of
-    requiring a fresh mode notification. Claude ACP 0.63.0 returns a complete
+    requiring a fresh mode notification. The qualified Claude ACP 0.81.0
+    returns a complete
     ``configOptions`` snapshot from ``session/set_config_option``; its ``mode``
     option mirrors the effective session mode, so that provider-specific
     snapshot is the qualified proof when no fresh mode notification is emitted.
@@ -959,6 +1005,7 @@ async def _maybe_set_session_model(
     model_state: SessionModelState | None = None,
     apply_requested: bool = False,
     client: _OpenHandsACPBridge | None = None,
+    defer_exact_model_verification: bool = False,
 ) -> str | None:
     """Apply the *initial* session model right after session creation.
 
@@ -972,9 +1019,27 @@ async def _maybe_set_session_model(
 
     Returns the verified effective model id, or ``None`` when no override was
     applied.  Raises when *apply_requested* is set and the model cannot be
-    applied or verified.
+    applied or verified.  The qualified Claude exact-model path deliberately
+    defers the final identity check until its PromptResponse: Claude's
+    session/config selector is only routing evidence, while the session
+    metadata request is the caller intent.
     """
     if not acp_model:
+        return None
+    if defer_exact_model_verification:
+        selector_model = (
+            _effective_model_from_config_options(
+                client.get_config_options(session_id), agent_name
+            )
+            if client is not None
+            else None
+        )
+        logger.info(
+            "Deferring exact Claude model verification until the completed turn: "
+            "requested=%s selector=%s",
+            acp_model,
+            selector_model,
+        )
         return None
     provider = detect_acp_provider_by_agent_name(agent_name)
     if provider is not None:
@@ -1405,6 +1470,110 @@ def _extract_token_usage(
         tc = quota.get("token_count", {})
         return (tc.get("input_tokens", 0), tc.get("output_tokens", 0), 0, 0, 0)
     return (0, 0, 0, 0, 0)
+
+
+def _usage_counter_tuple(usage: Any) -> tuple[int, int, int, int] | None:
+    """Return the four billing counters from a Claude usage object.
+
+    The Claude ACP adapter uses camelCase counters inside ``model_usage``;
+    accepting the snake_case spellings as well keeps protocol-shaped fixtures
+    explicit without making the extraction depend on a Pydantic model class.
+    Missing or malformed counters are not evidence.
+    """
+    if not isinstance(usage, Mapping):
+        return None
+
+    def counter(*names: str) -> int | None:
+        for name in names:
+            value = usage.get(name)
+            if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                return value
+        return None
+
+    input_tokens = counter("inputTokens", "input_tokens")
+    output_tokens = counter("outputTokens", "output_tokens")
+    cached_read = counter("cachedInputTokens", "cachedReadTokens", "cached_read_tokens")
+    cached_write = counter("cachedWriteTokens", "cached_write_tokens")
+    if (
+        input_tokens is None
+        or output_tokens is None
+        or cached_read is None
+        or cached_write is None
+    ):
+        return None
+    return (input_tokens, output_tokens, cached_read, cached_write)
+
+
+def _prompt_response_usage_tuple(response: Any) -> tuple[int, int, int, int] | None:
+    usage = getattr(response, "usage", None)
+    if usage is None:
+        return None
+    return _usage_counter_tuple(
+        {
+            "input_tokens": getattr(usage, "input_tokens", None),
+            "output_tokens": getattr(usage, "output_tokens", None),
+            "cached_read_tokens": getattr(usage, "cached_read_tokens", 0) or 0,
+            "cached_write_tokens": getattr(usage, "cached_write_tokens", 0) or 0,
+        }
+    )
+
+
+def _extract_served_model(response: Any) -> str | None:
+    """Extract one same-turn served model from Claude's quota metadata.
+
+    ``claude-agent-acp@0.81.0`` reports a list of per-model accounting rows.
+    The adapter documents the top-level ``usage`` as the main-agent-loop
+    usage, while ``model_usage`` may also include Task subagents, sidechains,
+    and internal calls.  When there is more than one row, the main model is
+    therefore accepted only when exactly one row has the complete same counter
+    tuple as the response's own usage.  No first-row or largest-row heuristic
+    is permitted.
+
+    A missing, malformed, duplicate, or unresolved row returns ``None`` so the
+    caller can fail closed.  This function never uses self-report metadata or
+    session/config selector state.
+    """
+    field_meta = getattr(response, "field_meta", None)
+    if not isinstance(field_meta, Mapping):
+        return None
+    quota = field_meta.get("quota")
+    if not isinstance(quota, Mapping):
+        return None
+    raw_model_usage = quota.get("model_usage")
+    entries: list[tuple[str, tuple[int, int, int, int]]] = []
+    if isinstance(raw_model_usage, Mapping):
+        raw_entries: Iterable[tuple[Any, Any]] = raw_model_usage.items()
+        for raw_model, raw_usage in raw_entries:
+            if not isinstance(raw_model, str) or not raw_model:
+                return None
+            counters = _usage_counter_tuple(raw_usage)
+            if counters is None:
+                return None
+            entries.append((raw_model, counters))
+    elif isinstance(raw_model_usage, list):
+        for raw_entry in raw_model_usage:
+            if not isinstance(raw_entry, Mapping):
+                return None
+            raw_model = raw_entry.get("model")
+            if not isinstance(raw_model, str) or not raw_model:
+                return None
+            counters = _usage_counter_tuple(raw_entry.get("token_count"))
+            if counters is None:
+                return None
+            entries.append((raw_model, counters))
+    else:
+        return None
+
+    if not entries or len({model for model, _ in entries}) != len(entries):
+        return None
+    if len(entries) == 1:
+        return entries[0][0]
+
+    turn_usage = _prompt_response_usage_tuple(response)
+    if turn_usage is None:
+        return None
+    matching = [model for model, counters in entries if counters == turn_usage]
+    return matching[0] if len(matching) == 1 else None
 
 
 def _estimate_cost_from_tokens(
@@ -2281,6 +2450,8 @@ class ACPAgent(AgentBase):
 
     def model_post_init(self, __context: object) -> None:
         super().model_post_init(__context)
+        self._requested_model_id = self.acp_model
+        self._runtime_model_override_active = False
         if self.structured_output is not None:
             configured_provider = resolve_effective_acp_provider_key(
                 acp_server=self.acp_server,
@@ -2321,7 +2492,12 @@ class ACPAgent(AgentBase):
         default=""
     )  # ACP server version from InitializeResponse
     _model_via_config_option: bool = PrivateAttr(default=False)
+    _requested_model_id: str | None = PrivateAttr(default=None)
+    _runtime_model_override_active: bool = PrivateAttr(default=False)
     _current_model_id: str | None = PrivateAttr(default=None)
+    _session_mode_id: str | None = PrivateAttr(default=None)
+    _served_model_id: str | None = PrivateAttr(default=None)
+    _post_turn_model_verification_required: bool = PrivateAttr(default=False)
     _available_models: list[ACPModelInfo] | None = PrivateAttr(default=None)
     _model_override_applied: bool = PrivateAttr(default=False)
     _resumed_existing_session: bool = PrivateAttr(default=False)
@@ -2411,9 +2587,10 @@ class ACPAgent(AgentBase):
         # gemini-cli: no UsageUpdate cost, so derive from token counts using
         # LiteLLM's model pricing database (same source the proxy uses).
         # claude-agent-acp, codex-acp: skipped since cost_recorded is True.
-        if not cost_recorded and (input_tokens or output_tokens) and self.acp_model:
+        requested_model = self._requested_model_for_turn()
+        if not cost_recorded and (input_tokens or output_tokens) and requested_model:
             cost = _estimate_cost_from_tokens(
-                self.acp_model, input_tokens, output_tokens
+                requested_model, input_tokens, output_tokens
             )
             if cost > 0:
                 self.llm.metrics.add_cost(cost)
@@ -2476,8 +2653,19 @@ class ACPAgent(AgentBase):
 
     @property
     def current_model_id(self) -> str | None:
-        """The model the ACP server is currently using for this session."""
+        """The ACP session's routing/model selector.
+
+        For the qualified Claude exact-model path this is deliberately not the
+        execution authority: only the completed turn's ``model_usage`` can
+        populate the served identity used by the success gate.
+        """
         return self._current_model_id
+
+    def _requested_model_for_turn(self) -> str | None:
+        """Return the caller's model intent for the current runtime binding."""
+        if not self._runtime_model_override_active and not self.has_live_acp_session:
+            return self.acp_model
+        return self._requested_model_id or self.acp_model
 
     @property
     def available_models(self) -> list[ACPModelInfo]:
@@ -2930,6 +3118,26 @@ class ACPAgent(AgentBase):
         if self.agent_context:
             self.agent_context.validate_acp_compatibility()
 
+        # A writable Claude session cannot safely use the post-turn exact-model
+        # contract: the first prompt would run before the served identity is
+        # known. Reject the request before spawning/configuring a subprocess;
+        # the qualified path is intentionally read_only-only.
+        configured_provider_key = resolve_effective_acp_provider_key(
+            acp_server=self.acp_server,
+            command=self.acp_command,
+        )
+        if (
+            configured_provider_key == "claude-code"
+            and self.acp_model
+            and self.acp_model.startswith("claude-")
+            and self.acp_permission_policy != "read_only"
+        ):
+            raise ACPSessionModelError(
+                "Qualified Claude exact-model execution requires a proven "
+                "read_only session before prompting; writable/default sessions "
+                f"cannot request {self.acp_model!r}."
+            )
+
         from openhands.sdk.utils.async_executor import AsyncExecutor
 
         if self._executor is not None:
@@ -3046,7 +3254,7 @@ class ACPAgent(AgentBase):
         }
         if not self._resumed_existing_session:
             new_agent_state.pop("acp_suffix_installed", None)
-        override_attempted_not_applied = bool(self.acp_model) and (
+        override_attempted_not_applied = bool(self._requested_model_for_turn()) and (
             not self._model_override_applied
         )
         if self._current_model_id is not None:
@@ -3129,6 +3337,17 @@ class ACPAgent(AgentBase):
 
     def _start_acp_server(self, state: ConversationState) -> None:
         """Start the ACP subprocess and initialize the session."""
+        # ``LocalConversation.switch_acp_model`` replaces a pre-session agent
+        # with ``model_copy(update={"acp_model": ...})``. Pydantic does not
+        # rerun ``model_post_init`` for that copy, so a private requested-model
+        # value copied from the construction-time agent must not shadow the new
+        # persisted field. A live runtime switch explicitly activates the
+        # private binding and is retained across a restart of that session.
+        if not self._runtime_model_override_active:
+            self._requested_model_id = self.acp_model
+        self._post_turn_model_verification_required = False
+        self._session_mode_id = None
+        self._served_model_id = None
         self._mark_startup("preflight", rpc=None, stage="preflight")
         self._startup_stderr_tail = ""
         self._startup_exit_code = None
@@ -3264,6 +3483,7 @@ class ACPAgent(AgentBase):
             _has_usable_env_value(env, name)
             for name in ("CODEX_API_KEY", "OPENAI_API_KEY")
         )
+        requested_model = self._requested_model_for_turn()
 
         async def _init() -> tuple[
             Any,
@@ -3469,13 +3689,17 @@ class ACPAgent(AgentBase):
                         self._mark_startup(
                             "load_session", rpc="session/load", stage="load_session"
                         )
-                        # claude-agent-acp 0.63.0 fingerprints session/load by
-                        # cwd and mcpServers, not _meta. Each normal SDK startup
-                        # uses a new ACP subprocess, so load carries only the
-                        # structured-output metadata; acp_model is reapplied
-                        # through the existing resume path below.
-                        load_meta = _build_session_structured_output_meta(
-                            agent_name, self.structured_output
+                        # claude-agent-acp 0.81.0 fingerprints session/load by
+                        # cwd and mcpServers, not _meta, but its query options
+                        # still need the caller's concrete model request after
+                        # a resume. This carries intent/configuration only; a
+                        # qualified Claude exact request is intentionally not
+                        # treated as proven by load_session, and the resumed
+                        # session's next turn must provide fresh evidence.
+                        load_meta = _build_session_meta(
+                            agent_name,
+                            acp_model=requested_model,
+                            structured_output=self.structured_output,
                         )
                         load_response = await conn.load_session(
                             cwd=working_dir,
@@ -3516,7 +3740,7 @@ class ACPAgent(AgentBase):
                     )
                     session_meta = _build_session_meta(
                         agent_name,
-                        acp_model=self.acp_model,
+                        acp_model=requested_model,
                         structured_output=self.structured_output,
                     )
                     response = await conn.new_session(
@@ -3538,15 +3762,22 @@ class ACPAgent(AgentBase):
                         else "session/set_model"
                     )
                     self._mark_startup("model", rpc=model_rpc, stage="apply_model")
+                    defer_exact_model = _is_qualified_claude_exact_model(
+                        agent_name,
+                        self._startup_adapter_version,
+                        requested_model,
+                    )
+                    self._post_turn_model_verification_required = defer_exact_model
                     effective_model_id = await _maybe_set_session_model(
                         conn,
                         agent_name,
                         session_id,
-                        self.acp_model,
+                        requested_model,
                         via_config_option=self._model_via_config_option,
                         model_state=getattr(response, "models", None),
-                        apply_requested=bool(self.acp_model),
+                        apply_requested=bool(requested_model),
                         client=client,
+                        defer_exact_model_verification=defer_exact_model,
                     )
                 else:
                     model_rpc = (
@@ -3556,14 +3787,24 @@ class ACPAgent(AgentBase):
                     )
                     self._mark_startup("model", rpc=model_rpc, stage="apply_model")
                     session_response = load_response
-                    effective_model_id = await _reapply_session_model_on_resume(
-                        conn,
+                    defer_exact_model = _is_qualified_claude_exact_model(
                         agent_name,
-                        session_id,
-                        self.acp_model,
-                        via_config_option=self._model_via_config_option,
-                        config_options=config_options,
-                        client=client,
+                        self._startup_adapter_version,
+                        requested_model,
+                    )
+                    self._post_turn_model_verification_required = defer_exact_model
+                    effective_model_id = (
+                        None
+                        if defer_exact_model
+                        else await _reapply_session_model_on_resume(
+                            conn,
+                            agent_name,
+                            session_id,
+                            requested_model,
+                            via_config_option=self._model_via_config_option,
+                            config_options=config_options,
+                            client=client,
+                        )
                     )
 
                 override_applied = effective_model_id is not None
@@ -3618,6 +3859,7 @@ class ACPAgent(AgentBase):
                     session_id=session_id,
                     session_response=session_response,
                 )
+                self._session_mode_id = mode_id
 
                 # Requested session configuration is applied and verified here —
                 # part of initialization, so step() never prompts a session whose
@@ -3638,6 +3880,25 @@ class ACPAgent(AgentBase):
                     provider_key=runtime_key,
                     adapter_version=self._startup_adapter_version,
                 )
+                claude_exact_model = _is_claude_exact_model_request(
+                    agent_name,
+                    requested_model,
+                )
+                if claude_exact_model and not defer_exact_model:
+                    raise ACPSessionModelError(
+                        "Claude exact-model execution is not qualified for this "
+                        "adapter version; refusing to prompt "
+                        f"(requested={requested_model!r}, "
+                        f"adapter_version={self._startup_adapter_version!r}, "
+                        f"selector={current_model_id!r})."
+                    )
+                if defer_exact_model and self.acp_permission_policy != "read_only":
+                    raise ACPSessionModelError(
+                        "Qualified Claude exact-model execution requires a proven "
+                        "read_only session before prompting "
+                        f"(requested={requested_model!r}, "
+                        f"selector={current_model_id!r})."
+                    )
                 current_model_id = _surfaced_current_model_id(
                     current_model_id, agent_name, final_options
                 )
@@ -3715,6 +3976,7 @@ class ACPAgent(AgentBase):
         mask: Callable[[str], str] | None = None,
     ) -> None:
         """Reset per-turn client state and (re)wire live callbacks."""
+        self._served_model_id = None
         self._client.trace.abandon()
         self._client.reset()
         self._client.trace = ACPTurnTrace(
@@ -3727,6 +3989,43 @@ class ACPAgent(AgentBase):
         self._client.on_event = on_event
         self._client.on_activity = self._on_activity
         self._client.arm_activity_clock()
+
+    def _verify_served_model_for_turn(self, response: PromptResponse | None) -> None:
+        """Gate a qualified Claude turn on its own served-model evidence.
+
+        The selector kept in ``_current_model_id`` is diagnostic/routing state;
+        it is never accepted as exact identity.  The response is checked before
+        structured result consumption or FinishAction emission so provider
+        output cannot become an SDK-successful turn first. Token/cost
+        accounting remains independent telemetry.
+        """
+        if not self._post_turn_model_verification_required:
+            return
+        requested_model = self._requested_model_for_turn()
+        selector_model = self._current_model_id
+        served_model = _extract_served_model(response)
+        self._served_model_id = served_model
+        if served_model is None:
+            self._restart_session_on_next_turn = True
+            raise ACPSessionModelError(
+                "Claude ACP turn did not provide unique same-turn served-model "
+                f"evidence (requested={requested_model!r}, "
+                f"selector={selector_model!r}, served='UNKNOWN')."
+            )
+        if requested_model is None or served_model != requested_model:
+            self._restart_session_on_next_turn = True
+            raise ACPSessionModelError(
+                "Claude ACP turn served a model different from the request "
+                f"(requested={requested_model!r}, selector={selector_model!r}, "
+                f"served={served_model!r})."
+            )
+        logger.info(
+            "Claude ACP same-turn model verification passed: requested=%s "
+            "selector=%s served=%s",
+            requested_model,
+            selector_model,
+            served_model,
+        )
 
     def _clear_turn_callbacks(self) -> None:
         """Unwire per-turn bridge callbacks so trailing updates are no-ops."""
@@ -3875,9 +4174,6 @@ class ACPAgent(AgentBase):
         on_event: ConversationCallbackType,
     ) -> None:
         """Post-prompt bookkeeping + FinishAction/Observation emission."""
-        self._client._raise_masking_error()
-        self._commit_suffix_installation(state)
-
         session_id = self._session_id or ""
         usage_update = self._client.pop_turn_usage_update(session_id)
         self._record_usage(
@@ -3886,6 +4182,15 @@ class ACPAgent(AgentBase):
             elapsed=elapsed,
             usage_update=usage_update,
         )
+
+        # Usage accounting is telemetry, not acceptance. Keep it independent
+        # of the exact-model success gate so a provider response that is later
+        # rejected for model provenance does not silently lose its token/cost
+        # accounting. No successful turn event is emitted until this gate
+        # passes.
+        self._verify_served_model_for_turn(response)
+        self._client._raise_masking_error()
+        self._commit_suffix_installation(state)
 
         self._flush_inflight_tool_calls_as_completed()
 
@@ -3927,6 +4232,26 @@ class ACPAgent(AgentBase):
             )
         )
         state.execution_status = ConversationExecutionStatus.FINISHED
+
+    def _record_discarded_turn_usage(
+        self,
+        response: PromptResponse | None,
+        elapsed: float,
+    ) -> None:
+        """Account a completed provider response that cancellation discarded.
+
+        Cancellation remains the acceptance authority. Token/cost telemetry is
+        independent, however, so a late response must not disappear from usage
+        accounting merely because it cannot become a successful SDK turn.
+        """
+        session_id = self._session_id or ""
+        usage_update = self._client.pop_turn_usage_update(session_id)
+        self._record_usage(
+            response,
+            session_id,
+            elapsed=elapsed,
+            usage_update=usage_update,
+        )
 
     def _emit_turn_timeout(
         self,
@@ -4007,9 +4332,9 @@ class ACPAgent(AgentBase):
     def _handle_cancelled_cleanup_interruption(
         self,
         prompt_future: Future[PromptResponse | None] | None,
-        elapsed: float,
-        state: ConversationState,
-        on_event: ConversationCallbackType,
+        _elapsed: float,
+        _state: ConversationState,
+        _on_event: ConversationCallbackType,
     ) -> None:
         if prompt_future is not None and prompt_future.done():
             try:
@@ -4018,15 +4343,22 @@ class ACPAgent(AgentBase):
                 self._cancel_inflight_tool_calls()
                 self._restart_session_on_next_turn = True
             else:
-                if self._prompt_response_was_cancelled(response):
+                if (
+                    self._post_turn_model_verification_required
+                    or self._prompt_response_was_cancelled(response)
+                ):
+                    # Qualified exact Claude cancellation is authoritative
+                    # even when a valid-looking response raced with cancel.
+                    if self._post_turn_model_verification_required:
+                        self._record_discarded_turn_usage(response, _elapsed)
                     self._cancel_inflight_tool_calls()
                     self._restart_session_on_next_turn = True
                 else:
                     self._finalize_successful_turn_guarded(
                         response,
-                        elapsed,
-                        state,
-                        on_event,
+                        _elapsed,
+                        _state,
+                        _on_event,
                     )
             return
 
@@ -4276,7 +4608,17 @@ class ACPAgent(AgentBase):
             with state:
                 elapsed = time.monotonic() - t0
                 if drain_result.completed and drain_result.error is None:
-                    if self._prompt_response_was_cancelled(drain_result.response):
+                    if self._post_turn_model_verification_required:
+                        # Qualified exact Claude cancellation is authoritative
+                        # even if a valid model_usage row arrived late. Keep
+                        # the historical completion behavior for other ACP
+                        # providers and non-qualified sessions.
+                        self._record_discarded_turn_usage(
+                            drain_result.response, elapsed
+                        )
+                        self._cancel_inflight_tool_calls()
+                        self._restart_session_on_next_turn = True
+                    elif self._prompt_response_was_cancelled(drain_result.response):
                         self._cancel_inflight_tool_calls()
                         self._restart_session_on_next_turn = True
                     else:
@@ -4307,12 +4649,25 @@ class ACPAgent(AgentBase):
                 elapsed = time.monotonic() - t0
                 if drain_result.completed and drain_result.error is None:
                     if self._prompt_response_was_cancelled(drain_result.response):
+                        if self._post_turn_model_verification_required:
+                            self._record_discarded_turn_usage(
+                                drain_result.response, elapsed
+                            )
                         self._emit_turn_timeout(elapsed, state, on_event)
                         self._restart_session_on_next_turn = True
                     else:
-                        self._finalize_successful_turn_guarded(
-                            drain_result.response, elapsed, state, on_event
-                        )
+                        try:
+                            self._finalize_successful_turn_guarded(
+                                drain_result.response, elapsed, state, on_event
+                            )
+                        except ACPSessionModelError as exc:
+                            # The normal prompt path reaches the outer
+                            # exception handler, but this is an exception
+                            # handler's drain path. Surface the exact-model
+                            # failure to the conversation before re-raising.
+                            self._emit_turn_error(exc, state, on_event)
+                            self._restart_session_on_next_turn = True
+                            raise
                 elif drain_result.completed and drain_result.error is not None:
                     self._emit_turn_error(drain_result.error, state, on_event)
                     self._restart_session_on_next_turn = True
@@ -4336,6 +4691,9 @@ class ACPAgent(AgentBase):
     ) -> None:
         """Send the latest user message to the ACP server and emit the response."""
         state = conversation.state
+
+        if self._restart_session_on_next_turn:
+            self._restart_session_after_drain_timeout(state, on_event)
 
         # Find the latest user message. Conversation implementations already
         # attach per-turn AgentContext extensions to MessageEvent.extended_content;
@@ -4456,6 +4814,7 @@ class ACPAgent(AgentBase):
                 elapsed=elapsed,
                 usage_update=usage_update,
             )
+            self._verify_served_model_for_turn(response)
 
             # ACPToolCallEvents were already emitted live from
             # _OpenHandsACPBridge.session_update as each ToolCallStart /
@@ -4616,6 +4975,7 @@ class ACPAgent(AgentBase):
                     elapsed=fork_elapsed,
                     usage_update=usage_update,
                 )
+                self._verify_served_model_for_turn(response)
                 return result
             finally:
                 client._fork_session_id = None
@@ -4664,10 +5024,47 @@ class ACPAgent(AgentBase):
                 f"ACP provider '{provider.key}' does not support runtime model "
                 "switching."
             )
+        qualified_exact_model = _is_qualified_claude_exact_model(
+            self._agent_name,
+            self._startup_adapter_version,
+            model,
+        )
+        if _is_claude_exact_model_request(self._agent_name, model) and not (
+            qualified_exact_model
+        ):
+            raise ValueError(
+                "Claude exact-model switching is not qualified for this adapter "
+                f"version (requested={model!r}, "
+                f"adapter_version={self._startup_adapter_version!r})."
+            )
+        if qualified_exact_model and self.acp_permission_policy != "read_only":
+            raise ValueError(
+                "Qualified Claude exact-model execution requires a proven "
+                "read_only session before prompting."
+            )
         assert self._conn is not None
         assert self._session_id is not None
         conn = self._conn
         session_id = self._session_id
+        claude_read_only_config_boundary = (
+            provider is not None
+            and provider.key == "claude-code"
+            and self._startup_adapter_version == CLAUDE_AGENT_ACP_VERSION
+            and self.acp_permission_policy == "read_only"
+        )
+        claude_client = self._client if claude_read_only_config_boundary else None
+        mode_generation_before = 0
+        if claude_read_only_config_boundary:
+            assert provider is not None
+            if claude_client is None:
+                raise RuntimeError(
+                    "ACPAgent has no live client for Claude mode re-proof"
+                )
+            # Capture the generation before the model write so a fresh mode
+            # notification cannot be mistaken for an old confirmation.
+            mode_generation_before = claude_client.get_current_mode_generation(
+                session_id
+            )
         try:
             effective_model = self._executor.run_async(
                 _apply_acp_model,
@@ -4677,9 +5074,16 @@ class ACPAgent(AgentBase):
                 agent_name=self._agent_name,
                 via_config_option=self._model_via_config_option,
                 client=self._client,
+                accept_routing_selector=qualified_exact_model,
                 timeout=self.acp_prompt_timeout,
             )
+        except TimeoutError:
+            if claude_read_only_config_boundary:
+                self._restart_session_on_next_turn = True
+            raise
         except ACPSessionModelError as e:
+            if claude_read_only_config_boundary:
+                self._restart_session_on_next_turn = True
             method = (
                 "set_config_option(model)"
                 if self._model_via_config_option
@@ -4689,6 +5093,8 @@ class ACPAgent(AgentBase):
                 f"ACP server could not verify {method}(model={model!r}): {e}"
             ) from e
         except ACPRequestError as e:
+            if claude_read_only_config_boundary:
+                self._restart_session_on_next_turn = True
             if e.code in _RETRIABLE_SERVER_ERROR_CODES:
                 raise
             method = (
@@ -4699,10 +5105,52 @@ class ACPAgent(AgentBase):
             raise ValueError(
                 f"ACP server rejected {method}(model={model!r}): {e}"
             ) from e
-        self.llm.model = effective_model
-        self.llm.metrics.model_name = effective_model
+        except Exception:
+            if claude_read_only_config_boundary:
+                self._restart_session_on_next_turn = True
+            raise
+
+        # A model config write is a post-mode configuration boundary.  On the
+        # qualified Claude adapter, re-prove the independently enforced
+        # read_only mode from the same complete response state before binding a
+        # new requested model to the next turn.
+        if claude_read_only_config_boundary:
+            assert claude_client is not None
+            config_options = claude_client.get_config_options(session_id)
+            try:
+                _verify_read_only_mode_after_config(
+                    claude_client,
+                    policy=self.acp_permission_policy,
+                    required_mode_id=self._session_mode_id,
+                    agent_name=self._agent_name,
+                    session_id=session_id,
+                    config_options=config_options,
+                    provider_key="claude-code",
+                    adapter_version=self._startup_adapter_version,
+                    mode_generation_before=mode_generation_before,
+                    require_fresh_mode=True,
+                    config_options_authoritative=config_options is not None,
+                )
+            except ACPSessionModeError:
+                # The provider has already received the model write, so do not
+                # let a caller ignore a failed re-proof and prompt the now
+                # unqualified session. Restarting before the next turn also
+                # prevents the old model binding from being reused silently.
+                self._restart_session_on_next_turn = True
+                raise
+
+        # A runtime switch starts a new provenance binding. The protocol
+        # response may update the selector, but it is not a substitute for the
+        # next turn's served-model evidence on the qualified Claude path.
+        self._requested_model_id = model
+        self._runtime_model_override_active = True
+        self._post_turn_model_verification_required = qualified_exact_model
+        self._served_model_id = None
+        published_model = model if qualified_exact_model else effective_model
+        self.llm.model = published_model
+        self.llm.metrics.model_name = published_model
         if self.llm.metrics.accumulated_token_usage is not None:
-            self.llm.metrics.accumulated_token_usage.model = effective_model
+            self.llm.metrics.accumulated_token_usage.model = published_model
         self._current_model_id = effective_model
         logger.info(
             "Switched ACP session model to %s (provider=%s, session=%s)",

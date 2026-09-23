@@ -1781,6 +1781,14 @@ class LocalConversation(BaseConversation):
             new_agent = old_agent.model_copy(update={"acp_model": model})
             if live:
                 new_agent.assume_runtime_ownership_from(old_agent)
+            else:
+                # A copied agent may retain private runtime provenance from a
+                # previously live binding whose session was later torn down.
+                # This is now a new pre-session request: the persisted
+                # ``acp_model`` is the only requested-model intent that may be
+                # carried into the next startup.
+                new_agent._requested_model_id = model
+                new_agent._runtime_model_override_active = False
             # ``self.agent`` is the live reference used by subsequent ``step()``
             # calls; ``self._state.agent`` is what the autosave path serializes
             # to base_state.json. Update both so the running conversation and the
