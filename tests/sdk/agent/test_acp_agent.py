@@ -4456,7 +4456,61 @@ class TestExtractServedModel:
         )
         assert _extract_served_model(response) == "claude-opus-5-5"
 
-    def test_multiple_rows_without_main_usage_are_ambiguous(self):
+    def test_single_model_mapping_is_supported(self):
+        response = self._response(
+            {
+                "claude-opus-5-5": {
+                    "inputTokens": 1,
+                    "outputTokens": 2,
+                    "cachedInputTokens": 3,
+                    "cachedWriteTokens": 4,
+                }
+            },
+            usage=(10, 20, 30, 40),
+        )
+        assert _extract_served_model(response) == "claude-opus-5-5"
+
+    def test_empty_model_usage_is_missing(self):
+        response = self._response([])
+        assert _extract_served_model(response) is None
+
+    def test_multiple_rows_with_duplicate_model_are_ambiguous(self):
+        response = self._response(
+            [
+                {
+                    "model": "claude-opus-5-5",
+                    "token_count": {
+                        "inputTokens": 1,
+                        "outputTokens": 2,
+                        "cachedInputTokens": 0,
+                        "cachedWriteTokens": 0,
+                    },
+                },
+                {
+                    "model": "claude-opus-5-5",
+                    "token_count": {
+                        "inputTokens": 3,
+                        "outputTokens": 4,
+                        "cachedInputTokens": 0,
+                        "cachedWriteTokens": 0,
+                    },
+                },
+            ]
+        )
+        assert _extract_served_model(response) is None
+
+    def test_malformed_model_usage_is_missing(self):
+        response = self._response(
+            [
+                {
+                    "model": "claude-opus-5-5",
+                    "token_count": {"inputTokens": 1},
+                }
+            ]
+        )
+        assert _extract_served_model(response) is None
+
+    def test_multiple_rows_without_usage_are_ambiguous(self):
         response = self._response(
             [
                 {
@@ -4483,7 +4537,7 @@ class TestExtractServedModel:
         response.usage = None
         assert _extract_served_model(response) is None
 
-    def test_multiple_rows_with_duplicate_usage_match_are_ambiguous(self):
+    def test_multiple_rows_with_duplicate_counters_are_ambiguous(self):
         response = self._response(
             [
                 {
