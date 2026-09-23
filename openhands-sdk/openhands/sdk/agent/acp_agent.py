@@ -1508,6 +1508,27 @@ class _TurnModelEvidence(NamedTuple):
     invalid_turn_binding: bool
 
 
+class _TurnModelEvidenceAccumulator:
+    """Mutable evidence collected for one ACP session/turn scope."""
+
+    def __init__(self) -> None:
+        self.root_models: list[str] = []
+        self.delegated_models: list[str] = []
+        self.message_start_models: list[str] = []
+        self.invalid_root_evidence = False
+        self.user_message_uuid: str | None = None
+        self.invalid_turn_binding = False
+
+    def snapshot(self) -> _TurnModelEvidence:
+        return _TurnModelEvidence(
+            root_models=tuple(self.root_models),
+            delegated_models=tuple(self.delegated_models),
+            message_start_models=tuple(self.message_start_models),
+            invalid_root_evidence=self.invalid_root_evidence,
+            invalid_turn_binding=self.invalid_turn_binding,
+        )
+
+
 def _concrete_provider_model(value: Any) -> str | None:
     """Return a provider model id, rejecting empty and synthetic placeholders."""
     if not isinstance(value, str):
@@ -1989,14 +2010,8 @@ class _OpenHandsACPBridge:
         # Exact-model provenance is deliberately separate from usage/cost
         # accounting. Only the active prompt attempt may populate it, and only
         # the minimal provider-owned model fields are retained.
-        self._model_evidence_session_id: str | None = None
-        self._model_evidence_root_models: list[str] = []
-        self._model_evidence_delegated_models: list[str] = []
-        self._model_evidence_message_start_models: list[str] = []
-        self._model_evidence_invalid_root = False
-        self._model_evidence_user_message_uuid: str | None = None
-        self._model_evidence_invalid_turn_binding = False
-        self._completed_model_evidence: _TurnModelEvidence | None = None
+        self._model_evidence_by_session: dict[str, _TurnModelEvidenceAccumulator] = {}
+        self._completed_model_evidence_by_session: dict[str, _TurnModelEvidence] = {}
         self._model_evidence_lock = threading.Lock()
         # ``Connection`` observers run synchronously, before an incoming
         # message is dispatched to the async notification handler.  The
@@ -2004,7 +2019,7 @@ class _OpenHandsACPBridge:
         # that invoke it directly, but must not double-record live messages.
         self._raw_sdk_observer_attached = False
 
-    def reset(self) -> None:
+    def reset(self, session_id: str | None = None) -> None:
         self.accumulated_text.clear()
         self.accumulated_thoughts.clear()
         self.accumulated_tool_calls.clear()
@@ -2014,49 +2029,54 @@ class _OpenHandsACPBridge:
         self._turn_usage_updates.clear()
         self._usage_received.clear()
         self._masking_error = None
-        self.discard_turn_model_evidence()
+        self.discard_turn_model_evidence(session_id)
         # Note: telemetry state (_last_cost, _context_window, _last_activity_signal,
         # etc.) is intentionally NOT cleared — it accumulates across turns.
         # Session config option state is likewise session-scoped, not per-turn.
 
     def begin_turn_model_evidence(self, session_id: str) -> None:
         """Start a fresh provenance scope for one prompt attempt."""
-        self.discard_turn_model_evidence()
         with self._model_evidence_lock:
-            self._model_evidence_session_id = session_id
+            self._model_evidence_by_session[session_id] = (
+                _TurnModelEvidenceAccumulator()
+            )
+            self._completed_model_evidence_by_session.pop(session_id, None)
 
     def finish_turn_model_evidence(self, session_id: str) -> None:
         """Close the active scope before usage waiters or late events run."""
         with self._model_evidence_lock:
-            if self._model_evidence_session_id != session_id:
+            accumulator = self._model_evidence_by_session.pop(session_id, None)
+            if accumulator is None:
                 return
-            self._completed_model_evidence = _TurnModelEvidence(
-                root_models=tuple(self._model_evidence_root_models),
-                delegated_models=tuple(self._model_evidence_delegated_models),
-                message_start_models=tuple(self._model_evidence_message_start_models),
-                invalid_root_evidence=self._model_evidence_invalid_root,
-                invalid_turn_binding=self._model_evidence_invalid_turn_binding,
+            self._completed_model_evidence_by_session[session_id] = (
+                accumulator.snapshot()
             )
-            self._model_evidence_session_id = None
 
-    def pop_turn_model_evidence(self) -> _TurnModelEvidence | None:
-        """Consume the completed evidence for exactly one prompt attempt."""
-        with self._model_evidence_lock:
-            evidence = self._completed_model_evidence
-            self._completed_model_evidence = None
-            return evidence
+    def pop_turn_model_evidence(
+        self, session_id: str | None = None
+    ) -> _TurnModelEvidence | None:
+        """Consume completed evidence for exactly one prompt attempt.
 
-    def discard_turn_model_evidence(self) -> None:
-        """Invalidate active and completed evidence, including on cancellation."""
+        Production callers pass the ACP session id. The no-argument form is
+        retained for small standalone bridge consumers/tests when exactly one
+        completed scope exists.
+        """
         with self._model_evidence_lock:
-            self._model_evidence_session_id = None
-            self._model_evidence_root_models.clear()
-            self._model_evidence_delegated_models.clear()
-            self._model_evidence_message_start_models.clear()
-            self._model_evidence_invalid_root = False
-            self._model_evidence_user_message_uuid = None
-            self._model_evidence_invalid_turn_binding = False
-            self._completed_model_evidence = None
+            if session_id is None:
+                if len(self._completed_model_evidence_by_session) != 1:
+                    return None
+                session_id = next(iter(self._completed_model_evidence_by_session))
+            return self._completed_model_evidence_by_session.pop(session_id, None)
+
+    def discard_turn_model_evidence(self, session_id: str | None = None) -> None:
+        """Invalidate active/completed evidence, including on cancellation."""
+        with self._model_evidence_lock:
+            if session_id is None:
+                self._model_evidence_by_session.clear()
+                self._completed_model_evidence_by_session.clear()
+            else:
+                self._model_evidence_by_session.pop(session_id, None)
+                self._completed_model_evidence_by_session.pop(session_id, None)
 
     def _record_raw_sdk_message(self, params: Mapping[str, Any]) -> None:
         with self._model_evidence_lock:
@@ -2085,7 +2105,11 @@ class _OpenHandsACPBridge:
         if isinstance(params, Mapping):
             self._record_raw_sdk_message(params)
 
-    def _root_message_belongs_to_turn(self, message: Mapping[str, Any]) -> bool:
+    def _root_message_belongs_to_turn(
+        self,
+        evidence: _TurnModelEvidenceAccumulator,
+        message: Mapping[str, Any],
+    ) -> bool:
         """Require the provider's current prompt UUID before accepting root data.
 
         Claude omits ``user_message_uuid`` on later root messages in a tool
@@ -2093,28 +2117,28 @@ class _OpenHandsACPBridge:
         ``message_start`` frame has explicitly matched the current prompt.
         The first root frame must always carry the matching UUID.
         """
-        prompt_uuid = self._model_evidence_user_message_uuid
+        prompt_uuid = evidence.user_message_uuid
         if prompt_uuid is None:
-            self._model_evidence_invalid_turn_binding = True
+            evidence.invalid_turn_binding = True
             return False
         message_uuid = message.get("user_message_uuid")
         if message_uuid is None:
-            if not (
-                self._model_evidence_root_models
-                or self._model_evidence_message_start_models
-            ):
-                self._model_evidence_invalid_turn_binding = True
+            if not (evidence.root_models or evidence.message_start_models):
+                evidence.invalid_turn_binding = True
                 return False
             return True
         if message_uuid != prompt_uuid:
-            self._model_evidence_invalid_turn_binding = True
+            evidence.invalid_turn_binding = True
             return False
         return True
 
     def _record_raw_sdk_message_unlocked(self, params: Mapping[str, Any]) -> None:
         """Extract provenance from one raw Claude SDK message without retaining it."""
-        active_session_id = self._model_evidence_session_id
-        if active_session_id is None or params.get("sessionId") != active_session_id:
+        active_session_id = params.get("sessionId")
+        if not isinstance(active_session_id, str):
+            return
+        evidence = self._model_evidence_by_session.get(active_session_id)
+        if evidence is None:
             return
         sdk_message = params.get("message")
         if not isinstance(sdk_message, Mapping):
@@ -2126,15 +2150,15 @@ class _OpenHandsACPBridge:
             if user_scope == "tool_result":
                 return
             if user_scope != "prompt":
-                self._model_evidence_invalid_turn_binding = True
+                evidence.invalid_turn_binding = True
                 return
             user_uuid = sdk_message.get("uuid")
             if not isinstance(user_uuid, str) or not user_uuid.strip():
-                self._model_evidence_invalid_turn_binding = True
-            elif self._model_evidence_user_message_uuid is None:
-                self._model_evidence_user_message_uuid = user_uuid
-            elif user_uuid != self._model_evidence_user_message_uuid:
-                self._model_evidence_invalid_turn_binding = True
+                evidence.invalid_turn_binding = True
+            elif evidence.user_message_uuid is None:
+                evidence.user_message_uuid = user_uuid
+            elif user_uuid != evidence.user_message_uuid:
+                evidence.invalid_turn_binding = True
             return
         if message_type == "assistant":
             scope = _raw_message_scope(sdk_message)
@@ -2143,12 +2167,12 @@ class _OpenHandsACPBridge:
                 if isinstance(inner, Mapping):
                     model = _concrete_provider_model(inner.get("model"))
                     if model is not None:
-                        self._model_evidence_delegated_models.append(model)
+                        evidence.delegated_models.append(model)
                 return
             if scope != "root":
-                self._model_evidence_invalid_root = True
+                evidence.invalid_root_evidence = True
                 return
-            if not self._root_message_belongs_to_turn(sdk_message):
+            if not self._root_message_belongs_to_turn(evidence, sdk_message):
                 return
             inner = sdk_message.get("message")
             model = (
@@ -2157,9 +2181,9 @@ class _OpenHandsACPBridge:
                 else None
             )
             if model is None:
-                self._model_evidence_invalid_root = True
+                evidence.invalid_root_evidence = True
             else:
-                self._model_evidence_root_models.append(model)
+                evidence.root_models.append(model)
             return
 
         if message_type != "stream_event":
@@ -2173,14 +2197,14 @@ class _OpenHandsACPBridge:
             if isinstance(message_start, Mapping):
                 model = _concrete_provider_model(message_start.get("model"))
                 if model is not None:
-                    self._model_evidence_delegated_models.append(model)
+                    evidence.delegated_models.append(model)
             return
         if scope != "root":
             # The consolidated assistant message remains the required
             # authority. A stream frame without a root discriminator is not
             # allowed to become authority and is ignored as a cross-check.
             return
-        if not self._root_message_belongs_to_turn(sdk_message):
+        if not self._root_message_belongs_to_turn(evidence, sdk_message):
             return
         message_start = event.get("message")
         model = (
@@ -2189,9 +2213,9 @@ class _OpenHandsACPBridge:
             else None
         )
         if model is None:
-            self._model_evidence_invalid_root = True
+            evidence.invalid_root_evidence = True
         else:
-            self._model_evidence_message_start_models.append(model)
+            evidence.message_start_models.append(model)
 
     def arm_activity_clock(self) -> None:
         """Mark "now" as the last activity for the idle-timeout watchdog."""
@@ -2701,6 +2725,7 @@ class ACPAgent(AgentBase):
     _requested_model_id: str | None = PrivateAttr(default=None)
     _runtime_model_override_active: bool = PrivateAttr(default=False)
     _current_model_id: str | None = PrivateAttr(default=None)
+    _selector_model_id: str | None = PrivateAttr(default=None)
     _session_mode_id: str | None = PrivateAttr(default=None)
     _served_model_id: str | None = PrivateAttr(default=None)
     _post_turn_model_verification_required: bool = PrivateAttr(default=False)
@@ -2859,12 +2884,14 @@ class ACPAgent(AgentBase):
 
     @property
     def current_model_id(self) -> str | None:
-        """The ACP session's routing/model selector.
+        """The ACP session's published model identity.
 
-        For the qualified Claude exact-model path this is deliberately not the
-        execution authority: only the completed turn's provider-owned root
-        assistant SDK messages can populate the served identity used by the
-        success gate.
+        Before a qualified Claude turn passes, this is the provider's routing
+        selector. After the same-turn root-model gate passes, it is updated to
+        the verified root model so Agent Server consumers see the identity that
+        was actually proven. It is never the execution authority: only the
+        completed turn's provider-owned root assistant SDK messages can pass
+        the success gate.
         """
         return self._current_model_id
 
@@ -3353,6 +3380,7 @@ class ACPAgent(AgentBase):
 
         self._installed_suffix = self._render_suffix(state)
         prior_session_id = state.agent_state.get("acp_session_id")
+        prior_published_model = state.agent_state.get("acp_current_model_id")
         suffix_already_installed = bool(state.agent_state.get("acp_suffix_installed"))
         self._resumed_existing_session = bool(prior_session_id)
 
@@ -3464,10 +3492,27 @@ class ACPAgent(AgentBase):
         override_attempted_not_applied = bool(self._requested_model_for_turn()) and (
             not self._model_override_applied
         )
-        if self._current_model_id is not None:
+        resumed_verified_model = (
+            prior_published_model
+            if (
+                truly_resumed
+                and self._post_turn_model_verification_required
+                and prior_published_model == self._requested_model_for_turn()
+            )
+            else None
+        )
+        if resumed_verified_model is not None:
+            # Keep the last completed turn's published identity as historical
+            # state on resume. It is not authority for the next prompt: the
+            # first _reset_client_for_turn restores _selector_model_id before
+            # collecting fresh same-turn evidence.
+            self._current_model_id = resumed_verified_model
+            new_agent_state["acp_current_model_id"] = resumed_verified_model
+        elif self._current_model_id is not None:
             new_agent_state["acp_current_model_id"] = self._current_model_id
         elif (
-            not truly_resumed
+            self._post_turn_model_verification_required
+            or not truly_resumed
             or self._available_models is not None
             or override_attempted_not_applied
         ):
@@ -4182,6 +4227,7 @@ class ACPAgent(AgentBase):
             ) = self._executor.run_async(_init, timeout=self.acp_startup_timeout)
         except TimeoutError:
             raise TimeoutError(self._startup_timeout_message()) from None
+        self._selector_model_id = self._current_model_id
         self._working_dir = working_dir
         if self._model_override_applied and self._current_model_id is not None:
             self.llm.model = self._current_model_id
@@ -4190,17 +4236,51 @@ class ACPAgent(AgentBase):
                 self.llm.metrics.accumulated_token_usage.model = self._current_model_id
         self._flush_file_credentials_blocking()
 
+    def _restore_selector_model_surface(
+        self, state: ConversationState | None = None
+    ) -> None:
+        """Restore the provider selector before a new or rejected turn.
+
+        A prior successful exact-model turn may have published its verified
+        root model through ``current_model_id``. That publication is useful to
+        downstream consumers, but it must not survive as the surface for a
+        later retry, cancellation, or failed turn. The selector is retained
+        separately because the public field is replaced by the verified model
+        after a successful qualified turn.
+        """
+        self._current_model_id = self._selector_model_id
+        if state is None:
+            return
+        agent_state = {**state.agent_state}
+        if self._selector_model_id is None:
+            agent_state.pop("acp_current_model_id", None)
+        else:
+            agent_state["acp_current_model_id"] = self._selector_model_id
+        state.agent_state = agent_state
+
+    def _publish_verified_model_surface(self, state: ConversationState) -> None:
+        """Publish a model only after the same-turn root-model gate passes."""
+        if self._served_model_id is None:
+            return
+        self._current_model_id = self._served_model_id
+        state.agent_state = {
+            **state.agent_state,
+            "acp_current_model_id": self._served_model_id,
+        }
+
     def _reset_client_for_turn(
         self,
         on_token: ConversationTokenCallbackType | None,
         on_event: ConversationCallbackType,
         prompt: Any = None,
         mask: Callable[[str], str] | None = None,
+        state: ConversationState | None = None,
     ) -> None:
         """Reset per-turn client state and (re)wire live callbacks."""
+        self._restore_selector_model_surface(state)
         self._served_model_id = None
         self._client.trace.abandon()
-        self._client.reset()
+        self._client.reset(self._session_id)
         self._client.trace = ACPTurnTrace(
             acp_server=self.acp_server,
             model_id=self._current_model_id,
@@ -4212,22 +4292,36 @@ class ACPAgent(AgentBase):
         self._client.on_activity = self._on_activity
         self._client.arm_activity_clock()
 
-    def _verify_served_model_for_turn(self) -> None:
+    def _verify_served_model_for_turn(
+        self,
+        state: ConversationState | None = None,
+        *,
+        preserve_published_surface: bool = False,
+        session_id: str | None = None,
+    ) -> None:
         """Gate a qualified Claude turn on its own served-model evidence.
 
-        The selector kept in ``_current_model_id`` is diagnostic/routing state;
-        it is never accepted as exact identity.  The response is checked before
-        structured result consumption or FinishAction emission so provider
-        output cannot become an SDK-successful turn first. Token/cost
-        accounting remains independent telemetry. ``model_usage`` is likewise
-        telemetry only: it has no root-agent or same-turn authority contract.
+        The provider selector retained in ``_selector_model_id`` is
+        diagnostic/routing state; it is never accepted as exact identity.  The
+        response is checked before structured result consumption or FinishAction
+        emission so provider output cannot become an SDK-successful turn first.
+        Token/cost accounting remains independent telemetry. ``model_usage`` is
+        likewise telemetry only: it has no root-agent or same-turn authority
+        contract.
         """
         if not self._post_turn_model_verification_required:
             return
         requested_model = self._requested_model_for_turn()
-        selector_model = self._current_model_id
+        selector_model = self._selector_model_id
+        evidence_session_id = session_id or self._session_id
         evidence = (
-            self._client.pop_turn_model_evidence() if self._client is not None else None
+            (
+                self._client.pop_turn_model_evidence(evidence_session_id)
+                if evidence_session_id is not None
+                else self._client.pop_turn_model_evidence()
+            )
+            if self._client is not None
+            else None
         )
         root_models = evidence.root_models if evidence is not None else ()
         message_start_models = (
@@ -4241,8 +4335,10 @@ class ACPAgent(AgentBase):
             or not root_models
             or not observed_models
         ):
-            self._served_model_id = None
-            self._restart_session_on_next_turn = True
+            if not preserve_published_surface:
+                self._served_model_id = None
+                self._restore_selector_model_surface(state)
+                self._restart_session_on_next_turn = True
             raise ACPSessionModelError(
                 "Claude ACP turn did not provide qualified same-turn root "
                 f"evidence (requested={requested_model!r}, "
@@ -4252,8 +4348,10 @@ class ACPAgent(AgentBase):
             (model for model in observed_models if model != requested_model), None
         )
         if requested_model is None or mismatched is not None:
-            self._served_model_id = None
-            self._restart_session_on_next_turn = True
+            if not preserve_published_surface:
+                self._served_model_id = None
+                self._restore_selector_model_surface(state)
+                self._restart_session_on_next_turn = True
             raise ACPSessionModelError(
                 "Claude ACP turn served a model different from the request "
                 f"(requested={requested_model!r}, selector={selector_model!r}, "
@@ -4261,7 +4359,10 @@ class ACPAgent(AgentBase):
                 f"root_models={list(root_models)!r})."
             )
         served_model = root_models[0]
-        self._served_model_id = served_model
+        if not preserve_published_surface:
+            self._served_model_id = served_model
+            if state is not None:
+                self._publish_verified_model_surface(state)
         logger.info(
             "Claude ACP same-turn root model verification passed: requested=%s "
             "selector=%s root_models=%s delegated_models=%s",
@@ -4361,7 +4462,7 @@ class ACPAgent(AgentBase):
         try:
             response = await self._conn.prompt(prompt_blocks, session_id)
         except BaseException:
-            self._client.discard_turn_model_evidence()
+            self._client.discard_turn_model_evidence(session_id)
             raise
         self._client.finish_turn_model_evidence(session_id)
         if self._client.get_turn_usage_update(session_id) is None:
@@ -4438,7 +4539,7 @@ class ACPAgent(AgentBase):
         # rejected for model provenance does not silently lose its token/cost
         # accounting. No successful turn event is emitted until this gate
         # passes.
-        self._verify_served_model_for_turn()
+        self._verify_served_model_for_turn(state)
         self._client._raise_masking_error()
         self._commit_suffix_installation(state)
 
@@ -4766,7 +4867,9 @@ class ACPAgent(AgentBase):
             return
 
         mask = state.secret_registry.mask_secrets_in_output
-        self._reset_client_for_turn(on_token, on_event, prompt_blocks, mask)
+        self._reset_client_for_turn(
+            on_token, on_event, prompt_blocks, mask, state=state
+        )
 
         t0 = time.monotonic()
         prompt_future: Future[PromptResponse | None] | None = None
@@ -4811,7 +4914,7 @@ class ACPAgent(AgentBase):
                         await asyncio.sleep(delay)
                         self._cancel_inflight_tool_calls()
                         self._reset_client_for_turn(
-                            on_token, on_event, prompt_blocks, mask
+                            on_token, on_event, prompt_blocks, mask, state=state
                         )
                     else:
                         raise
@@ -4835,7 +4938,7 @@ class ACPAgent(AgentBase):
                         await asyncio.sleep(delay)
                         self._cancel_inflight_tool_calls()
                         self._reset_client_for_turn(
-                            on_token, on_event, prompt_blocks, mask
+                            on_token, on_event, prompt_blocks, mask, state=state
                         )
                     else:
                         raise
@@ -4847,12 +4950,12 @@ class ACPAgent(AgentBase):
         except asyncio.CancelledError:
             # Cancellation wins the authority race. Prevent a provider event
             # arriving during cancel/drain from becoming this turn's proof.
-            self._client.discard_turn_model_evidence()
+            self._client.discard_turn_model_evidence(self._session_id)
             try:
                 await self._arequest_session_cancel()
                 drain_result = await self._drain_cancelled_prompt(prompt_future)
             except asyncio.CancelledError:
-                self._client.discard_turn_model_evidence()
+                self._client.discard_turn_model_evidence(self._session_id)
                 with state:
                     elapsed = time.monotonic() - t0
                     self._handle_cancelled_cleanup_interruption(
@@ -4893,7 +4996,7 @@ class ACPAgent(AgentBase):
                 await self._arequest_session_cancel()
                 drain_result = await self._drain_cancelled_prompt(prompt_future)
             except asyncio.CancelledError:
-                self._client.discard_turn_model_evidence()
+                self._client.discard_turn_model_evidence(self._session_id)
                 with state:
                     elapsed = time.monotonic() - t0
                     self._handle_cancelled_cleanup_interruption(
@@ -4904,7 +5007,7 @@ class ACPAgent(AgentBase):
                 elapsed = time.monotonic() - t0
                 if drain_result.completed and drain_result.error is None:
                     if self._prompt_response_was_cancelled(drain_result.response):
-                        self._client.discard_turn_model_evidence()
+                        self._client.discard_turn_model_evidence(self._session_id)
                         if self._post_turn_model_verification_required:
                             self._record_discarded_turn_usage(
                                 drain_result.response, elapsed
@@ -4925,11 +5028,11 @@ class ACPAgent(AgentBase):
                             self._restart_session_on_next_turn = True
                             raise
                 elif drain_result.completed and drain_result.error is not None:
-                    self._client.discard_turn_model_evidence()
+                    self._client.discard_turn_model_evidence(self._session_id)
                     self._emit_turn_error(drain_result.error, state, on_event)
                     self._restart_session_on_next_turn = True
                 else:
-                    self._client.discard_turn_model_evidence()
+                    self._client.discard_turn_model_evidence(self._session_id)
                     self._emit_turn_timeout(elapsed, state, on_event)
                     self._restart_session_on_next_turn = True
         except Exception as e:
@@ -4969,7 +5072,9 @@ class ACPAgent(AgentBase):
             return
 
         mask = state.secret_registry.mask_secrets_in_output
-        self._reset_client_for_turn(on_token, on_event, prompt_blocks, mask)
+        self._reset_client_for_turn(
+            on_token, on_event, prompt_blocks, mask, state=state
+        )
 
         t0 = time.monotonic()
         try:
@@ -4981,7 +5086,7 @@ class ACPAgent(AgentBase):
                 try:
                     response = await self._conn.prompt(prompt_blocks, session_id)
                 except BaseException:
-                    self._client.discard_turn_model_evidence()
+                    self._client.discard_turn_model_evidence(session_id)
                     raise
                 self._client.finish_turn_model_evidence(session_id)
                 if self._client.get_turn_usage_update(self._session_id or "") is None:
@@ -5033,7 +5138,7 @@ class ACPAgent(AgentBase):
                         time.sleep(delay)
                         self._cancel_inflight_tool_calls()
                         self._reset_client_for_turn(
-                            on_token, on_event, prompt_blocks, mask
+                            on_token, on_event, prompt_blocks, mask, state=state
                         )
                     else:
                         raise
@@ -5060,7 +5165,7 @@ class ACPAgent(AgentBase):
                         time.sleep(delay)
                         self._cancel_inflight_tool_calls()
                         self._reset_client_for_turn(
-                            on_token, on_event, prompt_blocks, mask
+                            on_token, on_event, prompt_blocks, mask, state=state
                         )
                     else:
                         raise
@@ -5076,7 +5181,7 @@ class ACPAgent(AgentBase):
                 elapsed=elapsed,
                 usage_update=usage_update,
             )
-            self._verify_served_model_for_turn()
+            self._verify_served_model_for_turn(state)
 
             # ACPToolCallEvents were already emitted live from
             # _OpenHandsACPBridge.session_update as each ToolCallStart /
@@ -5123,7 +5228,7 @@ class ACPAgent(AgentBase):
             state.execution_status = ConversationExecutionStatus.FINISHED
 
         except TimeoutError:
-            self._client.discard_turn_model_evidence()
+            self._client.discard_turn_model_evidence(self._session_id)
             elapsed = time.monotonic() - t0
             logger.error(
                 "ACP prompt timed out after %.1fs (limit=%.0fs). "
@@ -5152,7 +5257,7 @@ class ACPAgent(AgentBase):
             on_event(MessageEvent(source="agent", llm_message=error_message))
             state.execution_status = ConversationExecutionStatus.ERROR
         except Exception as e:
-            self._client.discard_turn_model_evidence()
+            self._client.discard_turn_model_evidence(self._session_id)
             logger.error("ACP prompt failed: %s", e, exc_info=True)
             error_str = str(e)
 
@@ -5221,7 +5326,7 @@ class ACPAgent(AgentBase):
                         fork_session_id,
                     )
                 except BaseException:
-                    client.discard_turn_model_evidence()
+                    client.discard_turn_model_evidence(fork_session_id)
                     raise
                 client.finish_turn_model_evidence(fork_session_id)
                 if client.get_turn_usage_update(fork_session_id) is None:
@@ -5245,10 +5350,13 @@ class ACPAgent(AgentBase):
                     elapsed=fork_elapsed,
                     usage_update=usage_update,
                 )
-                self._verify_served_model_for_turn()
+                self._verify_served_model_for_turn(
+                    preserve_published_surface=True,
+                    session_id=fork_session_id,
+                )
                 return result
             finally:
-                client.discard_turn_model_evidence()
+                client.discard_turn_model_evidence(fork_session_id)
                 client._fork_session_id = None
                 client._fork_accumulated_text.clear()
 
@@ -5422,6 +5530,7 @@ class ACPAgent(AgentBase):
         self.llm.metrics.model_name = published_model
         if self.llm.metrics.accumulated_token_usage is not None:
             self.llm.metrics.accumulated_token_usage.model = published_model
+        self._selector_model_id = effective_model
         self._current_model_id = effective_model
         logger.info(
             "Switched ACP session model to %s (provider=%s, session=%s)",
