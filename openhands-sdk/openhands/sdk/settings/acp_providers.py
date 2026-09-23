@@ -218,11 +218,11 @@ class ACPProviderInfo:
     ``set_session_model`` protocol call (rather than session ``_meta``).
 
     This governs the **session-creation** path only. ``True`` for all three
-    built-in providers, which get a one-shot ``set_session_model`` call right
-    after the session is created. claude-agent-acp was ``False`` until 0.30.0
-    was found to silently ignore the session-``_meta`` selection it relied on
-    (#3654); its ``_meta`` payload is still sent alongside (see
-    :attr:`session_meta_key`).
+    built-in providers, which support an initial model-selection mechanism
+    after the session is created. The qualified Claude exact-model path is an
+    explicit exception: its concrete request is carried in session ``_meta``
+    and final execution identity is deferred to the completed turn's
+    same-turn evidence; its config selector is never exact proof.
 
     This is **independent of** runtime switching capability — see
     :attr:`supports_runtime_model_switch`. The original meaning of this flag
@@ -236,9 +236,11 @@ class ACPProviderInfo:
     When non-``None``, the model is additionally advertised via ACP session
     ``_meta`` using the structure
     ``{session_meta_key: {"options": {"model": <model>}}}`` passed to
-    ``new_session()``. This is best-effort only: claude-agent-acp ignores it
-    (#3654), so the authoritative initial selection is the protocol call gated
-    on :attr:`supports_set_session_model`.
+    ``new_session()``. This is best-effort routing/request context. For the
+    qualified Claude exact-model path it is intentionally not treated as
+    execution authority; the selector returned by ``session/new`` or
+    ``set_config_option`` is diagnostic until a completed turn proves the
+    concrete served model.
 
     Runtime switches use the mechanism the session advertised
     (``set_config_option`` or ``set_session_model``), gated on
@@ -452,7 +454,11 @@ _GEMINI_FILE_SECRETS: tuple[ACPFileSecretSpec, ...] = (
 # is not a Codex runtime pin; Docker installs the exact runtime package and
 # points ``CODEX_PATH`` at that binary. Do not treat ``agentInfo.version`` as
 # ``CODEX_RUNTIME_VERSION``.
-CLAUDE_AGENT_ACP_VERSION = "0.63.0"
+# 0.81.0 is the first adapter version in the selected compatibility window
+# whose Claude Agent SDK dependency supports the exact Claude Opus 5.5 model
+# used by this profile. It also carries per-model turn usage in
+# PromptResponse._meta.quota.model_usage.
+CLAUDE_AGENT_ACP_VERSION = "0.81.0"
 CODEX_ACP_VERSION = "1.1.7"
 CODEX_RUNTIME_PACKAGE = "@openai/codex"
 CODEX_RUNTIME_VERSION = "0.145.0"
@@ -493,14 +499,14 @@ ACP_PROVIDERS: Mapping[str, ACPProviderInfo] = MappingProxyType(
             base_url_env_var="ANTHROPIC_BASE_URL",
             default_session_mode="bypassPermissions",
             agent_name_patterns=("claude-agent",),
-            # claude-agent-acp ignores the session-_meta model selection (the
-            # requested model only becomes a picker option; the session keeps
-            # running its default), so the init path must push the model via a
-            # protocol call (#3654). On 0.44.0+ that call is
-            # ``set_config_option(configId="model")`` rather than
-            # ``set_session_model`` (auto-detected from session/new); the _meta
-            # payload (session_meta_key below) is still sent — harmless, and
-            # picks up the same model if a future CLI honours it.
+            # claude-agent-acp versions in the legacy path select the model
+            # through the advertised ``model`` config option (or the legacy
+            # ``set_session_model`` extension). The qualified 0.81.0 exact
+            # Claude path sends the caller's concrete model in session _meta
+            # and deliberately treats the returned config selector as routing
+            # evidence until the turn's model_usage proves what was served.
+            # The capability is still auto-detected from session/new, so this
+            # registry flag remains true for non-qualified model requests.
             supports_set_session_model=True,
             supports_runtime_model_switch=True,
             session_meta_key="claudeCode",
@@ -761,8 +767,8 @@ def _build_session_structured_output_meta(
 ) -> dict[str, Any]:
     """Build the qualified provider metadata for structured output.
 
-    Claude ACP 0.63.0 forwards ``claudeCode.options`` to the pinned Claude
-    Agent SDK 0.3.220, whose ``Options.outputFormat`` accepts the JSON Schema
+    Claude ACP 0.81.0 forwards ``claudeCode.options`` to the pinned Claude
+    Agent SDK 0.3.280, whose ``Options.outputFormat`` accepts the JSON Schema
     shape.
     No other provider mapping is inferred here; unsupported providers fail
     closed before ``session/new`` or ``session/load`` is called.

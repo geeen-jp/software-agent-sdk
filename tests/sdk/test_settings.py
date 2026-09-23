@@ -37,6 +37,7 @@ from openhands.sdk.settings import (
     NoOpCondenserSettings,
     VerificationSettings,
 )
+from openhands.sdk.settings.acp_providers import CLAUDE_AGENT_ACP_VERSION
 from openhands.sdk.settings.model import ACPServerKind
 from openhands.sdk.workspace import LocalWorkspace
 
@@ -1451,7 +1452,7 @@ def test_acp_create_agent_uses_server_default_command(
     assert agent.acp_command == [
         "npx",
         "-y",
-        "@agentclientprotocol/claude-agent-acp@0.63.0",
+        f"@agentclientprotocol/claude-agent-acp@{CLAUDE_AGENT_ACP_VERSION}",
     ]
     assert agent.acp_model == "claude-opus-4-6"
     # The authoritative provider key is carried onto the agent.

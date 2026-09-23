@@ -959,17 +959,13 @@ def test_read_only_claude_model_and_effort_keep_mode_proof_independent(
         ],
     )
 
+    conn.set_session_model.assert_not_awaited()
     assert [call.kwargs for call in conn.set_config_option.await_args_list] == [
-        {
-            "config_id": "model",
-            "session_id": "sess-1",
-            "value": "claude-opus-5-5",
-        },
         {
             "config_id": "effort",
             "session_id": "sess-1",
             "value": "medium",
-        },
+        }
     ]
 
 

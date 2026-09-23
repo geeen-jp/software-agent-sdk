@@ -47,6 +47,7 @@ from openhands.sdk.agent.acp_agent import (
     _config_option_current_value,
     _config_option_values,
     _estimate_cost_from_tokens,
+    _extract_served_model,
     _extract_session_models,
     _extract_token_usage,
     _image_url_to_acp_block,
@@ -76,6 +77,7 @@ from openhands.sdk.event import (
 from openhands.sdk.event.conversation_error import ConversationErrorEvent
 from openhands.sdk.llm import ImageContent, Message, TextContent
 from openhands.sdk.mcp.config import coerce_mcp_config
+from openhands.sdk.settings.acp_providers import CLAUDE_AGENT_ACP_VERSION
 from openhands.sdk.skills import KeywordTrigger, Skill
 from openhands.sdk.tool.builtins.finish import FinishAction
 from openhands.sdk.utils.pydantic_secrets import REDACTED_SECRET_VALUE
@@ -92,7 +94,8 @@ def _make_agent(**kwargs) -> ACPAgent:
         mcp_config = kwargs["mcp_config"]
         servers = mcp_config.get("mcpServers", mcp_config)
         kwargs["mcp_config"] = coerce_mcp_config(servers)
-    return ACPAgent(acp_command=["echo", "test"], **kwargs)
+    acp_command = kwargs.pop("acp_command", ["echo", "test"])
+    return ACPAgent(acp_command=acp_command, **kwargs)
 
 
 def _structured_output_config() -> StructuredOutputConfig:
@@ -200,7 +203,7 @@ class TestACPAgentInstantiation:
                 acp_command=[
                     "npx",
                     "-y",
-                    "@agentclientprotocol/claude-agent-acp@0.63.0",
+                    f"@agentclientprotocol/claude-agent-acp@{CLAUDE_AGENT_ACP_VERSION}",
                 ],
                 acp_server="claude-code",
                 structured_output=config,
@@ -3799,6 +3802,86 @@ class TestACPPromptRetry:
         assert isinstance(events[0].action, FinishAction)
         assert "Success after server error retry" in events[0].action.message
 
+    def test_qualified_retry_accepts_only_second_turn_attempt_evidence(self, tmp_path):
+        agent = TestServedModelGate._agent()
+        conversation = self._make_conversation_with_message(tmp_path)
+        events: list = []
+        client = _OpenHandsACPBridge(permission_policy="read_only")
+        agent._client = client
+        agent._conn = MagicMock()
+        agent._session_id = "test-session"
+        response = TestExtractServedModel._response(
+            [
+                {
+                    "model": "claude-opus-5-5",
+                    "token_count": {
+                        "inputTokens": 10,
+                        "outputTokens": 20,
+                        "cachedInputTokens": 30,
+                        "cachedWriteTokens": 40,
+                    },
+                }
+            ]
+        )
+        call_count = 0
+
+        def _run_async(_operation, **_kwargs):  # noqa: ANN001
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                agent._served_model_id = "claude-opus-5-4"
+                raise ConnectionError("transient transport failure")
+            client.accumulated_text.append("retry success")
+            return response
+
+        executor = MagicMock()
+        executor.run_async.side_effect = _run_async
+        agent._executor = executor
+
+        with patch("openhands.sdk.agent.acp_agent.time.sleep"):
+            agent.step(conversation, on_event=events.append)
+
+        assert call_count == 2
+        assert agent._served_model_id == "claude-opus-5-5"
+        assert (
+            conversation.state.execution_status == ConversationExecutionStatus.FINISHED
+        )
+
+    def test_qualified_repeated_turn_requires_fresh_evidence(self, tmp_path):
+        agent = TestServedModelGate._agent()
+        conversation = self._make_conversation_with_message(tmp_path)
+        client = _OpenHandsACPBridge(permission_policy="read_only")
+        agent._client = client
+        agent._conn = MagicMock()
+        agent._session_id = "test-session"
+        valid = TestExtractServedModel._response(
+            [
+                {
+                    "model": "claude-opus-5-5",
+                    "token_count": {
+                        "inputTokens": 10,
+                        "outputTokens": 20,
+                        "cachedInputTokens": 30,
+                        "cachedWriteTokens": 40,
+                    },
+                }
+            ]
+        )
+        missing = MagicMock()
+        missing.field_meta = None
+        missing.usage = None
+        responses = iter([valid, missing])
+        executor = MagicMock()
+        executor.run_async.side_effect = lambda _operation, **_kwargs: next(responses)
+        agent._executor = executor
+
+        agent.step(conversation, on_event=lambda _: None)
+        with pytest.raises(ACPSessionModelError, match="served='UNKNOWN'"):
+            agent.step(conversation, on_event=lambda _: None)
+
+        assert agent._served_model_id is None
+        assert conversation.state.execution_status == ConversationExecutionStatus.ERROR
+
     def test_no_retry_on_non_retriable_acp_error(self, tmp_path):
         """Non-retriable ACP error codes fail immediately."""
         from acp.exceptions import RequestError as ACPRequestError
@@ -4000,6 +4083,154 @@ class TestSetACPModel:
         assert agent.llm.model == "gpt-5.5"
         assert agent.current_model_id == "gpt-5.5"
 
+    def test_qualified_claude_switch_rebinds_next_turn_provenance(self):
+        from acp.schema import SetSessionConfigOptionResponse
+
+        agent = self._wire(
+            _make_agent(acp_permission_policy="read_only"),
+            "claude-agent-acp",
+            via_config_option=True,
+        )
+        agent._startup_adapter_version = CLAUDE_AGENT_ACP_VERSION
+        _agent_conn(agent).set_config_option = AsyncMock(
+            return_value=SetSessionConfigOptionResponse(
+                config_options=[
+                    _config_option("model", "opus", ["opus", "sonnet"]),
+                    _config_option(
+                        "reasoning_effort",
+                        "medium",
+                        ["none", "low", "medium", "high", "xhigh", "max"],
+                    ),
+                ]
+            )
+        )
+        effective = agent.set_acp_model("claude-opus-5-5")
+
+        assert effective == "opus"
+        assert agent.current_model_id == "opus"
+        assert agent.llm.model == "claude-opus-5-5"
+        assert agent._requested_model_id == "claude-opus-5-5"
+        assert agent._post_turn_model_verification_required is True
+        assert agent._served_model_id is None
+
+        wrong = TestExtractServedModel._response(
+            [
+                {
+                    "model": "claude-opus-5-4",
+                    "token_count": {
+                        "inputTokens": 10,
+                        "outputTokens": 20,
+                        "cachedInputTokens": 30,
+                        "cachedWriteTokens": 40,
+                    },
+                }
+            ]
+        )
+        with pytest.raises(ACPSessionModelError, match="served=.*claude-opus-5-4"):
+            agent._verify_served_model_for_turn(wrong)
+
+        correct = TestExtractServedModel._response(
+            [
+                {
+                    "model": "claude-opus-5-5",
+                    "token_count": {
+                        "inputTokens": 10,
+                        "outputTokens": 20,
+                        "cachedInputTokens": 30,
+                        "cachedWriteTokens": 40,
+                    },
+                }
+            ]
+        )
+        agent._verify_served_model_for_turn(correct)
+        assert agent._served_model_id == "claude-opus-5-5"
+
+    def test_qualified_claude_switch_rejects_writable_session(self):
+        agent = self._wire(
+            _make_agent(acp_permission_policy="writable"),
+            "claude-agent-acp",
+            via_config_option=True,
+        )
+        agent._startup_adapter_version = CLAUDE_AGENT_ACP_VERSION
+
+        with pytest.raises(ValueError, match="read_only"):
+            agent.set_acp_model("claude-opus-5-5")
+
+        _agent_conn(agent).set_config_option.assert_not_called()
+
+    def test_qualified_claude_switch_restarts_after_read_only_reproof_failure(self):
+        from acp.schema import SetSessionConfigOptionResponse
+
+        agent = self._wire(
+            _make_agent(acp_permission_policy="read_only"),
+            "claude-agent-acp",
+            via_config_option=True,
+        )
+        agent._startup_adapter_version = CLAUDE_AGENT_ACP_VERSION
+        agent._session_mode_id = "default"
+        _agent_conn(agent).set_config_option = AsyncMock(
+            return_value=SetSessionConfigOptionResponse(
+                config_options=[
+                    _config_option("model", "opus", ["opus", "sonnet"]),
+                    _config_option("mode", "plan", ["default", "plan"]),
+                ]
+            )
+        )
+
+        with pytest.raises(ACPSessionModeError, match="replaced read_only"):
+            agent.set_acp_model("claude-opus-5-5")
+
+        assert agent._restart_session_on_next_turn is True
+        assert agent._requested_model_id is None
+        assert agent._post_turn_model_verification_required is False
+        assert agent.llm.model == "acp-managed"
+
+    def test_claude_switch_reproof_failure_restarts_old_exact_binding_too(self):
+        from acp.schema import SetSessionConfigOptionResponse
+
+        agent = self._wire(
+            _make_agent(acp_permission_policy="read_only"),
+            "claude-agent-acp",
+            via_config_option=True,
+        )
+        agent._startup_adapter_version = CLAUDE_AGENT_ACP_VERSION
+        agent._session_mode_id = "default"
+        agent._requested_model_id = "claude-opus-5-5"
+        agent._post_turn_model_verification_required = True
+        _agent_conn(agent).set_config_option = AsyncMock(
+            return_value=SetSessionConfigOptionResponse(
+                config_options=[
+                    _config_option("model", "opus", ["opus", "sonnet"]),
+                    _config_option("mode", "plan", ["default", "plan"]),
+                ]
+            )
+        )
+
+        with pytest.raises(ACPSessionModeError, match="replaced read_only"):
+            agent.set_acp_model("opus")
+
+        assert agent._restart_session_on_next_turn is True
+        assert agent._requested_model_id == "claude-opus-5-5"
+        assert agent._post_turn_model_verification_required is True
+
+    def test_claude_switch_write_verification_failure_forces_restart(self):
+        from acp.schema import SetSessionConfigOptionResponse
+
+        agent = self._wire(
+            _make_agent(acp_permission_policy="read_only"),
+            "claude-agent-acp",
+            via_config_option=True,
+        )
+        agent._startup_adapter_version = CLAUDE_AGENT_ACP_VERSION
+        _agent_conn(agent).set_config_option = AsyncMock(
+            return_value=SetSessionConfigOptionResponse(config_options=[])
+        )
+
+        with pytest.raises(ValueError, match="could not verify"):
+            agent.set_acp_model("claude-opus-5-5")
+
+        assert agent._restart_session_on_next_turn is True
+
     def test_switches_codex_via_config_option_single_call(self):
         agent = self._wire(_make_agent(), "codex-acp", via_config_option=True)
         effective = agent.set_acp_model("gpt-5.5")
@@ -4151,6 +4382,314 @@ class TestExtractTokenUsage:
         response.usage = None
         response.field_meta = {"quota": {}}
         assert _extract_token_usage(response) == (0, 0, 0, 0, 0)
+
+
+class TestExtractServedModel:
+    @staticmethod
+    def _response(model_usage, usage=(10, 20, 30, 40)):
+        response = MagicMock()
+        response.field_meta = {"quota": {"model_usage": model_usage}}
+        if usage is None:
+            response.usage = None
+        else:
+            response.usage.input_tokens = usage[0]
+            response.usage.output_tokens = usage[1]
+            response.usage.cached_read_tokens = usage[2]
+            response.usage.cached_write_tokens = usage[3]
+        return response
+
+    def test_exact_single_model_row(self):
+        response = TestExtractServedModel._response(
+            [
+                {
+                    "model": "claude-opus-5-5",
+                    "token_count": {
+                        "inputTokens": 10,
+                        "outputTokens": 20,
+                        "cachedInputTokens": 30,
+                        "cachedWriteTokens": 40,
+                    },
+                }
+            ]
+        )
+        assert _extract_served_model(response) == "claude-opus-5-5"
+
+    def test_multiple_rows_use_unique_main_usage_match(self):
+        response = TestExtractServedModel._response(
+            [
+                {
+                    "model": "claude-haiku-4-5-20251001",
+                    "token_count": {
+                        "inputTokens": 2,
+                        "outputTokens": 13,
+                        "cachedInputTokens": 0,
+                        "cachedWriteTokens": 0,
+                    },
+                },
+                {
+                    "model": "claude-opus-5-5",
+                    "token_count": {
+                        "inputTokens": 10,
+                        "outputTokens": 20,
+                        "cachedInputTokens": 30,
+                        "cachedWriteTokens": 40,
+                    },
+                },
+            ]
+        )
+        assert _extract_served_model(response) == "claude-opus-5-5"
+
+    def test_multiple_rows_without_main_usage_are_ambiguous(self):
+        response = self._response(
+            [
+                {
+                    "model": "claude-opus-5-5",
+                    "token_count": {
+                        "inputTokens": 1,
+                        "outputTokens": 2,
+                        "cachedInputTokens": 0,
+                        "cachedWriteTokens": 0,
+                    },
+                },
+                {
+                    "model": "claude-sonnet-5",
+                    "token_count": {
+                        "inputTokens": 3,
+                        "outputTokens": 4,
+                        "cachedInputTokens": 0,
+                        "cachedWriteTokens": 0,
+                    },
+                },
+            ],
+            usage=None,
+        )
+        response.usage = None
+        assert _extract_served_model(response) is None
+
+    def test_multiple_rows_with_duplicate_usage_match_are_ambiguous(self):
+        response = self._response(
+            [
+                {
+                    "model": "claude-opus-5-5",
+                    "token_count": {
+                        "inputTokens": 10,
+                        "outputTokens": 20,
+                        "cachedInputTokens": 30,
+                        "cachedWriteTokens": 40,
+                    },
+                },
+                {
+                    "model": "claude-sonnet-5",
+                    "token_count": {
+                        "inputTokens": 10,
+                        "outputTokens": 20,
+                        "cachedInputTokens": 30,
+                        "cachedWriteTokens": 40,
+                    },
+                },
+            ]
+        )
+        assert _extract_served_model(response) is None
+
+
+class TestServedModelGate:
+    @staticmethod
+    def _agent(**kwargs) -> ACPAgent:
+        agent = _make_agent(
+            acp_command=[
+                "npx",
+                "-y",
+                f"@agentclientprotocol/claude-agent-acp@{CLAUDE_AGENT_ACP_VERSION}",
+            ],
+            acp_server="claude-code",
+            acp_model="claude-opus-5-5",
+            acp_permission_policy="read_only",
+            **kwargs,
+        )
+        agent._post_turn_model_verification_required = True
+        agent._current_model_id = "opus"
+        return agent
+
+    def test_exact_match_passes_after_alias_selector(self):
+        agent = self._agent()
+        response = TestExtractServedModel._response(
+            [
+                {
+                    "model": "claude-opus-5-5",
+                    "token_count": {
+                        "inputTokens": 10,
+                        "outputTokens": 20,
+                        "cachedInputTokens": 30,
+                        "cachedWriteTokens": 40,
+                    },
+                }
+            ]
+        )
+        agent._verify_served_model_for_turn(response)
+        assert agent._served_model_id == "claude-opus-5-5"
+
+    def test_mismatch_fails_closed(self):
+        agent = self._agent()
+        response = TestExtractServedModel._response(
+            [
+                {
+                    "model": "claude-opus-5-4",
+                    "token_count": {
+                        "inputTokens": 10,
+                        "outputTokens": 20,
+                        "cachedInputTokens": 30,
+                        "cachedWriteTokens": 40,
+                    },
+                }
+            ]
+        )
+        with pytest.raises(ACPSessionModelError, match="served=.*claude-opus-5-4"):
+            agent._verify_served_model_for_turn(response)
+
+    def test_missing_or_ambiguous_evidence_fails_closed(self):
+        agent = self._agent()
+        missing = MagicMock()
+        missing.field_meta = None
+        missing.usage = None
+        with pytest.raises(ACPSessionModelError, match="served='UNKNOWN'"):
+            agent._verify_served_model_for_turn(missing)
+
+        ambiguous = TestExtractServedModel._response(
+            [
+                {
+                    "model": "claude-opus-5-5",
+                    "token_count": {
+                        "inputTokens": 1,
+                        "outputTokens": 2,
+                        "cachedInputTokens": 0,
+                        "cachedWriteTokens": 0,
+                    },
+                },
+                {
+                    "model": "claude-sonnet-5",
+                    "token_count": {
+                        "inputTokens": 3,
+                        "outputTokens": 4,
+                        "cachedInputTokens": 0,
+                        "cachedWriteTokens": 0,
+                    },
+                },
+            ],
+            usage=None,
+        )
+        with pytest.raises(ACPSessionModelError, match="served='UNKNOWN'"):
+            agent._verify_served_model_for_turn(ambiguous)
+
+    def test_stale_served_evidence_is_not_reused(self):
+        agent = self._agent()
+        agent._served_model_id = "claude-opus-5-5"
+        response = MagicMock()
+        response.field_meta = None
+        response.usage = None
+        with pytest.raises(ACPSessionModelError, match="served='UNKNOWN'"):
+            agent._verify_served_model_for_turn(response)
+        assert agent._served_model_id is None
+
+    def test_step_accepts_provider_shaped_turn_only_after_model_gate(self, tmp_path):
+        agent = self._agent()
+        state = _make_state(tmp_path)
+        state.events.append(
+            MessageEvent(
+                source="user",
+                llm_message=Message(role="user", content=[TextContent(text="hi")]),
+            )
+        )
+        conversation = MagicMock()
+        conversation.state = state
+        client = _OpenHandsACPBridge(permission_policy="read_only")
+        client.accumulated_text.append("PROBE_OK")
+        agent._client = client
+        agent._conn = MagicMock()
+        agent._session_id = "session-1"
+        response = TestExtractServedModel._response(
+            [
+                {
+                    "model": "claude-opus-5-5",
+                    "token_count": {
+                        "inputTokens": 10,
+                        "outputTokens": 20,
+                        "cachedInputTokens": 30,
+                        "cachedWriteTokens": 40,
+                    },
+                }
+            ]
+        )
+        executor = MagicMock()
+
+        def run_async(_operation, **_kwargs):  # noqa: ANN001
+            return response
+
+        executor.run_async.side_effect = run_async
+        agent._executor = executor
+        events = []
+
+        agent.step(conversation, on_event=events.append)
+
+        assert state.execution_status == ConversationExecutionStatus.FINISHED
+        assert any(isinstance(event, ActionEvent) for event in events)
+
+    def test_step_restarts_flagged_session_before_prompt(self, tmp_path):
+        agent = self._agent()
+        state = _make_state(tmp_path)
+        state.events.append(
+            MessageEvent(
+                source="user",
+                llm_message=Message(role="user", content=[TextContent(text="hi")]),
+            )
+        )
+        conversation = MagicMock()
+        conversation.state = state
+        client = _OpenHandsACPBridge(permission_policy="read_only")
+        client.accumulated_text.append("restarted")
+        agent._client = client
+        old_conn = MagicMock()
+        new_conn = MagicMock()
+        agent._conn = old_conn
+        agent._session_id = "session-1"
+        response = TestExtractServedModel._response(
+            [
+                {
+                    "model": "claude-opus-5-5",
+                    "token_count": {
+                        "inputTokens": 10,
+                        "outputTokens": 20,
+                        "cachedInputTokens": 30,
+                        "cachedWriteTokens": 40,
+                    },
+                }
+            ]
+        )
+        new_conn.prompt = AsyncMock(return_value=response)
+        executor = MagicMock()
+
+        def run_async(_operation, **_kwargs):  # noqa: ANN001
+            assert agent._conn is new_conn
+            return response
+
+        executor.run_async.side_effect = run_async
+        agent._executor = executor
+        agent._restart_session_on_next_turn = True
+        restart = MagicMock(
+            side_effect=lambda _state, _on_event: setattr(agent, "_conn", new_conn)
+        )
+        agent._restart_session_after_drain_timeout = restart
+
+        events: list = []
+        agent.step(conversation, on_event=events.append)
+
+        restart.assert_called_once_with(state, events.append)
+        assert state.execution_status == ConversationExecutionStatus.FINISHED
+
+    def test_self_report_is_not_authority(self):
+        response = MagicMock()
+        response.field_meta = {"model": "claude-opus-5-5", "quota": {}}
+        response.usage = None
+        assert _extract_served_model(response) is None
 
 
 # ---------------------------------------------------------------------------
@@ -4379,6 +4918,142 @@ class TestACPSessionIdPersistence:
         conn.new_session.assert_awaited_once()
         conn.load_session.assert_not_awaited()
         assert agent._session_id == "fresh-sess"
+
+    @staticmethod
+    def _qualified_claude_modes() -> SessionModeState:
+        return SessionModeState(
+            current_mode_id="default",
+            available_modes=[SessionMode(id="default", name="Default")],
+        )
+
+    @staticmethod
+    def _qualified_claude_options() -> list[SessionConfigOption]:
+        return [
+            _config_option("model", "opus", ["default", "opus", "sonnet"]),
+            _config_option("mode", "default", ["default", "plan", "bypassPermissions"]),
+            _config_option("effort", "low", ["low", "medium", "high"]),
+        ]
+
+    def test_qualified_claude_exact_model_defers_to_same_turn_evidence(self, tmp_path):
+        agent = _make_agent(
+            acp_command=[
+                "npx",
+                "-y",
+                f"@agentclientprotocol/claude-agent-acp@{CLAUDE_AGENT_ACP_VERSION}",
+            ],
+            acp_server="claude-code",
+            acp_model="claude-opus-5-5",
+            acp_config_options={"effort": "medium"},
+            acp_permission_policy="read_only",
+        )
+        state = _make_state(tmp_path)
+        options = self._qualified_claude_options()
+        conn = _make_config_conn(
+            agent_name="claude-agent-acp",
+            agent_version=CLAUDE_AGENT_ACP_VERSION,
+            options=options,
+            modes=self._qualified_claude_modes(),
+        )
+
+        with self._mocked_acp_runtime(agent, conn):
+            agent.init_state(state, on_event=lambda _: None)
+
+        _, kwargs = conn.new_session.await_args
+        assert kwargs["claudeCode"] == {"options": {"model": "claude-opus-5-5"}}
+        conn.set_session_model.assert_not_awaited()
+        assert agent._post_turn_model_verification_required is True
+        assert agent.current_model_id == "opus"
+        assert state.agent_state["acp_current_model_id"] == "opus"
+
+    def test_qualified_claude_exact_model_requires_read_only_before_prompt(
+        self, tmp_path
+    ):
+        agent = _make_agent(
+            acp_server="claude-code",
+            acp_model="claude-opus-5-5",
+            acp_permission_policy="writable",
+        )
+        state = _make_state(tmp_path)
+        conn = _make_config_conn(
+            agent_name="claude-agent-acp",
+            agent_version=CLAUDE_AGENT_ACP_VERSION,
+            options=self._qualified_claude_options(),
+            modes=self._qualified_claude_modes(),
+        )
+
+        with self._mocked_acp_runtime(agent, conn):
+            with pytest.raises(ACPSessionModelError, match="read_only"):
+                agent.init_state(state, on_event=lambda _: None)
+
+        conn.initialize.assert_not_awaited()
+        conn.new_session.assert_not_awaited()
+        conn.prompt.assert_not_called()
+        assert agent._initialized is False
+
+    def test_unqualified_claude_exact_adapter_fails_closed_before_prompt(
+        self, tmp_path
+    ):
+        agent = _make_agent(
+            acp_command=[
+                "npx",
+                "-y",
+                f"@agentclientprotocol/claude-agent-acp@{CLAUDE_AGENT_ACP_VERSION}",
+            ],
+            acp_server="claude-code",
+            acp_model="claude-opus-5-5",
+            acp_permission_policy="read_only",
+        )
+        state = _make_state(tmp_path)
+        conn = _make_config_conn(
+            agent_name="claude-agent-acp",
+            agent_version="0.80.0",
+            options=self._qualified_claude_options(),
+            modes=self._qualified_claude_modes(),
+        )
+
+        with self._mocked_acp_runtime(agent, conn):
+            with pytest.raises(ACPSessionModelError, match="not qualified"):
+                agent.init_state(state, on_event=lambda _: None)
+
+        conn.prompt.assert_not_called()
+        assert agent._initialized is False
+
+    def test_qualified_claude_exact_model_resumes_without_reusing_selector_as_proof(
+        self, tmp_path
+    ):
+        agent = _make_agent(
+            acp_command=[
+                "npx",
+                "-y",
+                f"@agentclientprotocol/claude-agent-acp@{CLAUDE_AGENT_ACP_VERSION}",
+            ],
+            acp_server="claude-code",
+            acp_model="claude-opus-5-5",
+            acp_permission_policy="read_only",
+        )
+        state = _make_state(tmp_path)
+        state.agent_state = {
+            **state.agent_state,
+            "acp_session_id": "stored-sess",
+            "acp_session_cwd": str(tmp_path),
+        }
+        conn = _make_config_conn(
+            agent_name="claude-agent-acp",
+            agent_version=CLAUDE_AGENT_ACP_VERSION,
+            options=self._qualified_claude_options(),
+            modes=self._qualified_claude_modes(),
+        )
+
+        with self._mocked_acp_runtime(agent, conn):
+            agent.init_state(state, on_event=lambda _: None)
+
+        conn.load_session.assert_awaited_once()
+        conn.new_session.assert_not_awaited()
+        conn.set_session_model.assert_not_awaited()
+        _, load_kwargs = conn.load_session.await_args
+        assert load_kwargs["claudeCode"] == {"options": {"model": "claude-opus-5-5"}}
+        assert agent._post_turn_model_verification_required is True
+        assert agent.current_model_id == "opus"
 
     def test_init_state_writes_session_id_into_agent_state(self, tmp_path):
         """init_state lands the session id in state.agent_state so
@@ -5242,9 +5917,11 @@ def _config_update(**options: str) -> ConfigOptionUpdate:
 def _make_config_conn(
     *,
     agent_name: str = "cursor-agent",
+    agent_version: str = "1.0",
     session_id: str = "sess-new",
     options: list[SessionConfigOption] | None = None,
     models: SessionModelState | None = None,
+    modes: SessionModeState | None = None,
     load_exc: Exception | None = None,
 ):
     """MagicMock ACP connection whose session responses carry typed config state.
@@ -5261,21 +5938,28 @@ def _make_config_conn(
     init_response = MagicMock()
     init_response.agent_info = MagicMock()
     init_response.agent_info.name = agent_name
-    init_response.agent_info.version = "1.0"
+    init_response.agent_info.version = agent_version
     init_response.agent_capabilities = None
     init_response.auth_methods = []
     conn.initialize = AsyncMock(return_value=init_response)
 
     conn.new_session = AsyncMock(
         return_value=NewSessionResponse(
-            session_id=session_id, config_options=options, models=models
+            session_id=session_id,
+            config_options=options,
+            models=models,
+            modes=modes,
         )
     )
     if load_exc is not None:
         conn.load_session = AsyncMock(side_effect=load_exc)
     else:
         conn.load_session = AsyncMock(
-            return_value=LoadSessionResponse(config_options=options, models=models)
+            return_value=LoadSessionResponse(
+                config_options=options,
+                models=models,
+                modes=modes,
+            )
         )
 
     current = list(options or [])
@@ -5532,7 +6216,7 @@ class TestACPSessionConfigOptions:
         applies ``acp_model`` via ``set_session_model`` because the provider
         registry marks it as protocol-capable.
         """
-        agent = _make_agent(acp_model="claude-opus-4-6")
+        agent = _make_agent(acp_model="opus")
         state = _make_state(tmp_path)
         conn = _make_config_conn(agent_name="claude-agent-acp")
 
@@ -5541,10 +6225,10 @@ class TestACPSessionConfigOptions:
         conn.new_session.assert_awaited_once_with(
             cwd=str(tmp_path),
             mcp_servers=[],
-            claudeCode={"options": {"model": "claude-opus-4-6"}},
+            claudeCode={"options": {"model": "opus"}},
         )
         conn.set_session_model.assert_awaited_once_with(
-            model_id="claude-opus-4-6",
+            model_id="opus",
             session_id="sess-new",
         )
         conn.set_config_option.assert_not_called()
@@ -5607,11 +6291,11 @@ class TestACPSessionConfigOptions:
     def test_claude_resumed_session_combines_structured_output_and_model(
         self, tmp_path
     ):
-        """Load carries output metadata; the existing resume path reapplies model."""
+        """Load carries output metadata and the requested model intent."""
         config = _structured_output_config()
         agent = _make_agent(
             acp_server="claude-code",
-            acp_model="claude-opus-4-6",
+            acp_model="opus",
             structured_output=config,
         )
         state = _make_state(tmp_path)
@@ -5630,16 +6314,17 @@ class TestACPSessionConfigOptions:
             mcp_servers=[],
             claudeCode={
                 "options": {
+                    "model": "opus",
                     "outputFormat": {
                         "type": "json_schema",
                         "schema": config.schema,
-                    }
+                    },
                 }
             },
         )
         conn.new_session.assert_not_awaited()
         conn.set_session_model.assert_awaited_once_with(
-            model_id="claude-opus-4-6",
+            model_id="opus",
             session_id="stored-sess",
         )
 
@@ -5740,7 +6425,7 @@ class TestApplySessionConfigOptions:
         return conn
 
     async def test_claude_effort_uses_complete_mode_state_without_fresh_update(self):
-        """Claude 0.63.0 returns mode state without a second mode update."""
+        """The qualified Claude adapter returns mode state without a second update."""
         session_id = "claude-sess"
         bridge = _OpenHandsACPBridge(permission_policy="read_only")
         conn = MagicMock()
@@ -5799,7 +6484,7 @@ class TestApplySessionConfigOptions:
             session_options,
             required_session_mode="default",
             provider_key="claude-code",
-            adapter_version="0.63.0",
+            adapter_version=CLAUDE_AGENT_ACP_VERSION,
         )
 
         assert bridge.get_current_mode_generation(session_id) == mode_generation_before
@@ -5839,7 +6524,7 @@ class TestApplySessionConfigOptions:
                 bridge.get_config_options(session_id),
                 required_session_mode="default",
                 provider_key="claude-code",
-                adapter_version="0.63.0",
+                adapter_version=CLAUDE_AGENT_ACP_VERSION,
             )
 
     async def test_claude_different_adapter_version_requires_fresh_mode_update(self):
@@ -6392,6 +7077,94 @@ class TestACPAgentAstep:
             conversation.state.execution_status == ConversationExecutionStatus.FINISHED
         )
 
+    def test_astep_model_gate_runs_before_successful_turn_event(self, tmp_path):
+        from openhands.sdk.utils.async_executor import AsyncExecutor
+
+        agent = TestServedModelGate._agent()
+        conversation = self._make_conversation_with_message(tmp_path)
+        client = _OpenHandsACPBridge(permission_policy="read_only")
+        client.get_turn_usage_update = MagicMock(return_value=object())
+        client.accumulated_text.append("provider output")
+        agent._client = client
+        agent._conn = MagicMock()
+        agent._session_id = "test-session"
+        response = TestExtractServedModel._response(
+            [
+                {
+                    "model": "claude-opus-5-4",
+                    "token_count": {
+                        "inputTokens": 10,
+                        "outputTokens": 20,
+                        "cachedInputTokens": 30,
+                        "cachedWriteTokens": 40,
+                    },
+                }
+            ]
+        )
+
+        async def _fake_prompt(prompt, session_id):  # noqa: ARG001
+            return response
+
+        _agent_conn(agent).prompt = _fake_prompt
+        executor = AsyncExecutor()
+        events: list = []
+        try:
+            agent._executor = executor
+            with pytest.raises(ACPSessionModelError, match="served=.*claude-opus-5-4"):
+                asyncio.run(agent.astep(conversation, on_event=events.append))
+        finally:
+            executor.close()
+
+        assert conversation.state.execution_status == ConversationExecutionStatus.ERROR
+        assert not any(isinstance(event, ActionEvent) for event in events)
+
+    def test_astep_timeout_drain_model_gate_surfaces_provider_failure(self, tmp_path):
+        agent = TestServedModelGate._agent(acp_prompt_timeout=0.01)
+        conversation = self._make_conversation_with_message(tmp_path)
+        client = _OpenHandsACPBridge(permission_policy="read_only")
+        client.get_turn_usage_update = MagicMock(return_value=object())
+        agent._client = client
+        agent._conn = MagicMock()
+        agent._session_id = "test-session"
+        response = TestExtractServedModel._response(
+            [
+                {
+                    "model": "claude-opus-5-4",
+                    "token_count": {
+                        "inputTokens": 10,
+                        "outputTokens": 20,
+                        "cachedInputTokens": 30,
+                        "cachedWriteTokens": 40,
+                    },
+                }
+            ]
+        )
+
+        class _TimeoutDrainPortal:
+            def __init__(self) -> None:
+                self.prompt_future: Future = Future()
+
+            def start_task_soon(self, function, *args):  # noqa: ANN001
+                if args:
+                    return self.prompt_future
+                self.prompt_future.set_result(response)
+                cancel_future: Future = Future()
+                cancel_future.set_result(None)
+                return cancel_future
+
+        portal = _TimeoutDrainPortal()
+        executor = MagicMock()
+        executor.portal = portal
+        agent._executor = executor
+        events: list = []
+
+        with pytest.raises(ACPSessionModelError, match="served=.*claude-opus-5-4"):
+            asyncio.run(agent.astep(conversation, on_event=events.append))
+
+        assert conversation.state.execution_status == ConversationExecutionStatus.ERROR
+        assert agent._restart_session_on_next_turn is True
+        assert any(isinstance(event, ConversationErrorEvent) for event in events)
+
     def test_astep_emits_failed_tool_calls_on_cancellation(self, tmp_path):
         from openhands.sdk.utils.async_executor import AsyncExecutor
 
@@ -6522,7 +7295,9 @@ class TestACPAgentAstep:
             for e in emitted
         )
 
-    def test_cleanup_interruption_finalizes_completed_prompt(self, tmp_path):
+    def test_cleanup_interruption_preserves_historical_completed_prompt_after_cancel(
+        self, tmp_path
+    ):
         agent = _make_agent()
         conversation = self._make_conversation_with_message(tmp_path)
         mock_client = _OpenHandsACPBridge()
@@ -6547,6 +7322,44 @@ class TestACPAgentAstep:
         )
         assert agent._restart_session_on_next_turn is False
         assert any(isinstance(event, ActionEvent) for event in emitted)
+
+    def test_cleanup_interruption_discards_qualified_exact_prompt_after_cancel(
+        self, tmp_path
+    ):
+        agent = TestServedModelGate._agent()
+        conversation = self._make_conversation_with_message(tmp_path)
+        mock_client = _OpenHandsACPBridge(permission_policy="read_only")
+        agent._client = mock_client
+        agent._session_id = "test-session"
+        response = TestExtractServedModel._response(
+            [
+                {
+                    "model": "claude-opus-5-5",
+                    "token_count": {
+                        "inputTokens": 10,
+                        "outputTokens": 20,
+                        "cachedInputTokens": 30,
+                        "cachedWriteTokens": 40,
+                    },
+                }
+            ]
+        )
+
+        prompt_future: Future = Future()
+        prompt_future.set_result(response)
+        emitted = []
+
+        with conversation.state as state:
+            agent._handle_cancelled_cleanup_interruption(
+                prompt_future,
+                0.1,
+                state,
+                emitted.append,
+            )
+
+        assert conversation.state.execution_status == ConversationExecutionStatus.IDLE
+        assert agent._restart_session_on_next_turn is True
+        assert not any(isinstance(event, ActionEvent) for event in emitted)
 
 
 @pytest.mark.asyncio

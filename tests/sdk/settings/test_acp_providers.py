@@ -441,7 +441,7 @@ class TestStructuredOutputSessionMeta:
         before = json.loads(json.dumps(caller_schema))
         config = StructuredOutputConfig(mode="json_schema", schema=caller_schema)
         result = _build_session_structured_output_meta(
-            "claude-agent-acp 0.63.0", config
+            f"claude-agent-acp {CLAUDE_AGENT_ACP_VERSION}", config
         )
         assert result == {
             "claudeCode": {
