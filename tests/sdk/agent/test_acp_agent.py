@@ -24,7 +24,9 @@ from acp.schema import (
     SessionConfigOptionBoolean,
     SessionConfigOptionSelect,
     SessionConfigSelectOption,
+    SessionMode,
     SessionModelState,
+    SessionModeState,
     SetSessionConfigOptionResponse,
 )
 from pydantic import ValidationError
@@ -34,9 +36,11 @@ from openhands.sdk.agent.acp_agent import (
     ACPAgent,
     ACPAuthSelectionError,
     ACPSessionConfigError,
+    ACPSessionModeError,
     ACPSessionModelError,
     SessionConfigOption,
     _apply_acp_model,
+    _apply_acp_session_mode,
     _apply_session_config_options,
     _bound_offered_auth_ids,
     _classify_acp_init_error,
@@ -5734,6 +5738,130 @@ class TestApplySessionConfigOptions:
         conn = MagicMock()
         conn.set_config_option = AsyncMock(side_effect=list(responses))
         return conn
+
+    async def test_claude_effort_uses_complete_mode_state_without_fresh_update(self):
+        """Claude 0.63.0 returns mode state without a second mode update."""
+        session_id = "claude-sess"
+        bridge = _OpenHandsACPBridge(permission_policy="read_only")
+        conn = MagicMock()
+        conn.set_session_mode = AsyncMock()
+
+        session_options = [
+            _config_option(
+                "mode",
+                "default",
+                ["default", "plan", "bypassPermissions"],
+            ),
+            _config_option("effort", "low", ["low", "medium", "high"]),
+        ]
+        session_response = NewSessionResponse(
+            session_id=session_id,
+            modes=SessionModeState(
+                current_mode_id="default",
+                available_modes=[
+                    SessionMode(id="default", name="Manual"),
+                    SessionMode(id="plan", name="Plan Mode"),
+                ],
+            ),
+            config_options=session_options,
+        )
+
+        await _apply_acp_session_mode(
+            conn,
+            bridge,
+            policy="read_only",
+            mode_id="default",
+            agent_name="claude-agent-acp",
+            session_id=session_id,
+            session_response=session_response,
+        )
+        mode_generation_before = bridge.get_current_mode_generation(session_id)
+
+        conn.set_config_option = AsyncMock(
+            return_value=SetSessionConfigOptionResponse(
+                config_options=[
+                    _config_option(
+                        "mode",
+                        "default",
+                        ["default", "plan", "bypassPermissions"],
+                    ),
+                    _config_option("effort", "medium", ["low", "medium", "high"]),
+                ]
+            )
+        )
+
+        final_options = await _apply_session_config_options(
+            conn,
+            bridge,
+            "claude-agent-acp",
+            session_id,
+            {"effort": "medium"},
+            session_options,
+            required_session_mode="default",
+            provider_key="claude-code",
+            adapter_version="0.63.0",
+        )
+
+        assert bridge.get_current_mode_generation(session_id) == mode_generation_before
+        assert final_options is not None
+        assert {
+            option.id: _config_option_current_value(option) for option in final_options
+        } == {"mode": "default", "effort": "medium"}
+        conn.set_config_option.assert_awaited_once_with(
+            config_id="effort",
+            session_id=session_id,
+            value="medium",
+        )
+
+    async def test_claude_does_not_use_stale_mode_config_as_post_config_proof(self):
+        session_id = "claude-sess"
+        bridge = _OpenHandsACPBridge(permission_policy="read_only")
+        bridge.record_config_options(
+            session_id,
+            [
+                _config_option("mode", "default", ["default", "bypassPermissions"]),
+                _config_option("effort", "low", ["low", "medium"]),
+            ],
+        )
+        conn = self._conn(
+            SetSessionConfigOptionResponse(
+                config_options=[_config_option("effort", "medium", ["low", "medium"])]
+            )
+        )
+
+        with pytest.raises(ACPSessionModeError, match="complete configOptions"):
+            await _apply_session_config_options(
+                conn,
+                bridge,
+                "claude-agent-acp",
+                session_id,
+                {"effort": "medium"},
+                bridge.get_config_options(session_id),
+                required_session_mode="default",
+                provider_key="claude-code",
+                adapter_version="0.63.0",
+            )
+
+    async def test_claude_different_adapter_version_requires_fresh_mode_update(self):
+        bridge = _OpenHandsACPBridge(permission_policy="read_only")
+        options = [
+            _config_option("mode", "default", ["default", "bypassPermissions"]),
+            _config_option("effort", "medium", ["low", "medium"]),
+        ]
+        conn = self._conn(SetSessionConfigOptionResponse(config_options=options))
+
+        with pytest.raises(ACPSessionModeError, match="did not prove"):
+            await _apply_session_config_options(
+                conn,
+                bridge,
+                "claude-agent-acp",
+                "claude-sess",
+                {"effort": "medium"},
+                options,
+                required_session_mode="default",
+                provider_key="claude-code",
+                adapter_version="0.64.0",
+            )
 
     async def test_empty_request_is_a_noop(self):
         conn = self._conn()
