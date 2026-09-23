@@ -5,7 +5,7 @@ from functools import cache
 from typing import Any, Literal
 
 from litellm import get_supported_openai_params
-from litellm.utils import supports_vision as litellm_supports_vision
+from litellm.utils import get_model_info, supports_vision as litellm_supports_vision
 
 from openhands.sdk.llm.utils.openhands_provider import OPENHANDS_PROVIDER_PREFIX
 
@@ -95,17 +95,43 @@ def _normalize_model_for_litellm(model: str | None) -> str | None:
 
 
 @cache
-def _normalized_supported_openai_params(model: str | None) -> frozenset[str]:
-    """Return LiteLLM-supported OpenAI params for a normalized model name."""
+def _supported_openai_params(model: str | None) -> tuple[Any, ...] | None:
+    """Return raw LiteLLM params while preserving an unresolved provider."""
     normalized = _normalize_model_for_litellm(model)
     if not normalized:
-        return frozenset()
+        return None
 
     params = get_supported_openai_params(
         model=normalized,
         custom_llm_provider=None,
     )
-    return frozenset(params or ())
+    return None if params is None else tuple(params)
+
+
+@cache
+def _normalized_supported_openai_params(model: str | None) -> frozenset[str]:
+    """Return LiteLLM-supported OpenAI params for a normalized model name."""
+    return frozenset(_supported_openai_params(model) or ())
+
+
+@cache
+def _catalog_supports_reasoning(model: str | None) -> bool:
+    """Whether LiteLLM model info marks reasoning when no param list exists.
+
+    ``get_supported_openai_params`` returns None for ids whose provider cannot
+    be resolved (bare ``gpt-5.2-codex``). ``get_model_info`` still sets
+    ``supports_reasoning`` from capability generalization for those ids.
+    """
+    normalized = _normalize_model_for_litellm(model)
+    if not normalized:
+        return False
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            info = get_model_info(normalized)
+    except Exception:
+        return False
+    return info.get("supports_reasoning") is True
 
 
 REASONING_EFFORT_MODEL_OVERRIDES = {
@@ -361,15 +387,20 @@ def get_features(
     overrides: Mapping[str, Any] | None = None,
 ) -> ModelFeatures:
     """Resolve model features from overrides, metadata, and fallbacks."""
+    raw_supported_params = _supported_openai_params(model)
     supported_params = _normalized_supported_openai_params(model)
+    # ``None`` means provider detection failed; an empty list is a valid
+    # provider response and must not be treated as capability evidence.
+    param_fallback = "reasoning_effort" in supported_params or (
+        raw_supported_params is None and _catalog_supports_reasoning(model)
+    )
     supports_reasoning_effort = _resolved_bool(
         "supports_reasoning_effort",
         overrides=overrides,
         metadata=model_info,
         metadata_key="supports_reasoning",
         fallback=(
-            model_matches(model, REASONING_EFFORT_MODEL_OVERRIDES)
-            or "reasoning_effort" in supported_params
+            model_matches(model, REASONING_EFFORT_MODEL_OVERRIDES) or param_fallback
         ),
     )
     if (
