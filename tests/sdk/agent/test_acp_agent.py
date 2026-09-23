@@ -2926,6 +2926,90 @@ class TestACPAgentAskAgent:
         assert mock_client._fork_session_id is None
         assert mock_client._fork_accumulated_text == []
 
+    def test_qualified_fork_does_not_mutate_parent_model_surface_on_failure(self):
+        agent = TestServedModelGate._agent()
+        agent._current_model_id = "claude-opus-5-5"
+        agent._served_model_id = "claude-opus-5-5"
+        agent._restart_session_on_next_turn = False
+        agent._conn = MagicMock()
+        agent._session_id = "main-session"
+        agent._working_dir = "/workspace"
+
+        mock_fork_response = MagicMock(session_id="fork-session-failure")
+        mock_prompt_response = MagicMock(
+            usage=None, field_meta={"quota": {"model_usage": []}}
+        )
+
+        async def _fake_prompt(*args, **kwargs):
+            return mock_prompt_response
+
+        def _fake_run_async(coro_fn, **_kwargs):
+            loop = asyncio.new_event_loop()
+            try:
+                agent._conn.fork_session = AsyncMock(return_value=mock_fork_response)
+                agent._conn.prompt = _fake_prompt
+                return loop.run_until_complete(coro_fn())
+            finally:
+                loop.close()
+
+        mock_executor = MagicMock()
+        mock_executor.run_async = _fake_run_async
+        agent._executor = mock_executor
+
+        with pytest.raises(ACPSessionModelError, match="served='UNKNOWN'"):
+            agent.ask_agent("probe")
+
+        assert agent.current_model_id == "claude-opus-5-5"
+        assert agent._selector_model_id == "opus"
+        assert agent._served_model_id == "claude-opus-5-5"
+        assert agent._restart_session_on_next_turn is False
+
+    def test_qualified_fork_does_not_mutate_parent_model_surface_on_success(self):
+        agent = TestServedModelGate._agent()
+        mock_client = agent._client
+        agent._current_model_id = "claude-opus-5-5"
+        agent._served_model_id = "claude-opus-5-5"
+        agent._restart_session_on_next_turn = False
+        agent._conn = MagicMock()
+        agent._session_id = "main-session"
+        agent._working_dir = "/workspace"
+
+        mock_fork_response = MagicMock(session_id="fork-session-success")
+        mock_prompt_response = MagicMock(
+            usage=None, field_meta={"quota": {"model_usage": []}}
+        )
+
+        async def _fake_prompt(*args, **kwargs):
+            mock_client._fork_accumulated_text.append("fork response")
+            mock_client._record_raw_sdk_message(
+                TestTurnModelEvidence._user("fork-session-success")
+            )
+            mock_client._record_raw_sdk_message(
+                TestTurnModelEvidence._assistant(
+                    "fork-session-success", "claude-opus-5-5"
+                )
+            )
+            return mock_prompt_response
+
+        def _fake_run_async(coro_fn, **_kwargs):
+            loop = asyncio.new_event_loop()
+            try:
+                agent._conn.fork_session = AsyncMock(return_value=mock_fork_response)
+                agent._conn.prompt = _fake_prompt
+                return loop.run_until_complete(coro_fn())
+            finally:
+                loop.close()
+
+        mock_executor = MagicMock()
+        mock_executor.run_async = _fake_run_async
+        agent._executor = mock_executor
+
+        assert agent.ask_agent("probe") == "fork response"
+        assert agent.current_model_id == "claude-opus-5-5"
+        assert agent._selector_model_id == "opus"
+        assert agent._served_model_id == "claude-opus-5-5"
+        assert agent._restart_session_on_next_turn is False
+
 
 # ---------------------------------------------------------------------------
 # Client fork text routing
@@ -4097,6 +4181,7 @@ class TestSetACPModel:
 
         assert effective == "opus"
         assert agent.current_model_id == "opus"
+        assert agent._selector_model_id == "opus"
         assert agent.llm.model == "claude-opus-5-5"
         assert agent._requested_model_id == "claude-opus-5-5"
         assert agent._post_turn_model_verification_required is True
@@ -4466,6 +4551,29 @@ class TestTurnModelEvidence:
             )
         client.finish_turn_model_evidence(session_id)
 
+    def test_model_evidence_isolated_by_session_id(self):
+        client = _OpenHandsACPBridge(permission_policy="read_only")
+        client.begin_turn_model_evidence("parent-session")
+        client._record_raw_sdk_message(self._user("parent-session"))
+        client._record_raw_sdk_message(
+            self._assistant("parent-session", "claude-opus-5-5")
+        )
+
+        client.begin_turn_model_evidence("fork-session")
+        client._record_raw_sdk_message(self._user("fork-session"))
+        client._record_raw_sdk_message(
+            self._assistant("fork-session", "claude-haiku-4-5-20251001")
+        )
+        client.finish_turn_model_evidence("fork-session")
+        client.finish_turn_model_evidence("parent-session")
+
+        fork_evidence = client.pop_turn_model_evidence("fork-session")
+        parent_evidence = client.pop_turn_model_evidence("parent-session")
+        assert fork_evidence is not None
+        assert parent_evidence is not None
+        assert fork_evidence.root_models == ("claude-haiku-4-5-20251001",)
+        assert parent_evidence.root_models == ("claude-opus-5-5",)
+
     def test_extension_callback_extracts_root_model_without_retaining_content(self):
         client = _OpenHandsACPBridge(permission_policy="read_only")
         client.begin_turn_model_evidence("session-1")
@@ -4740,6 +4848,8 @@ class TestServedModelGate:
         )
         agent._post_turn_model_verification_required = True
         agent._current_model_id = "opus"
+        agent._selector_model_id = "opus"
+        agent._session_id = "session-1"
         agent._client = _OpenHandsACPBridge(permission_policy="read_only")
         return agent
 
@@ -4752,6 +4862,30 @@ class TestServedModelGate:
         )
         agent._verify_served_model_for_turn()
         assert agent._served_model_id == "claude-opus-5-5"
+
+    def test_passing_turn_publishes_model_and_failed_next_turn_restores_selector(
+        self, tmp_path
+    ):
+        agent = self._agent()
+        state = _make_state(tmp_path)
+        state.agent_state = {"acp_current_model_id": "opus"}
+
+        TestTurnModelEvidence._complete(
+            agent._client,
+            "session-1",
+            root_models=("claude-opus-5-5",),
+        )
+        agent._verify_served_model_for_turn(state)
+
+        assert agent.current_model_id == "claude-opus-5-5"
+        assert state.agent_state["acp_current_model_id"] == "claude-opus-5-5"
+        assert agent._selector_model_id == "opus"
+
+        with pytest.raises(ACPSessionModelError, match="served='UNKNOWN'"):
+            agent._verify_served_model_for_turn(state)
+
+        assert agent.current_model_id == "opus"
+        assert state.agent_state["acp_current_model_id"] == "opus"
 
     def test_several_root_messages_pass_when_all_match(self):
         agent = self._agent()
@@ -4871,6 +5005,8 @@ class TestServedModelGate:
 
         assert state.execution_status == ConversationExecutionStatus.FINISHED
         assert any(isinstance(event, ActionEvent) for event in events)
+        assert agent.current_model_id == "claude-opus-5-5"
+        assert state.agent_state["acp_current_model_id"] == "claude-opus-5-5"
 
     def test_step_restarts_flagged_session_before_prompt(self, tmp_path):
         agent = self._agent()
@@ -5199,6 +5335,44 @@ class TestACPSessionIdPersistence:
         }
         conn.set_session_model.assert_not_awaited()
         assert agent._post_turn_model_verification_required is True
+        assert agent.current_model_id == "opus"
+        assert state.agent_state["acp_current_model_id"] == "opus"
+
+    def test_resume_preserves_historical_verified_model_until_fresh_turn(
+        self, tmp_path
+    ):
+        agent = _make_agent(
+            acp_command=[
+                "npx",
+                "-y",
+                f"@agentclientprotocol/claude-agent-acp@{CLAUDE_AGENT_ACP_VERSION}",
+            ],
+            acp_server="claude-code",
+            acp_model="claude-opus-5-5",
+            acp_config_options={"effort": "medium"},
+            acp_permission_policy="read_only",
+        )
+        state = _make_state(tmp_path)
+        state.agent_state = {
+            "acp_session_id": "sess-old",
+            "acp_current_model_id": "claude-opus-5-5",
+        }
+        conn = _make_config_conn(
+            agent_name="claude-agent-acp",
+            agent_version=CLAUDE_AGENT_ACP_VERSION,
+            session_id="sess-old",
+            options=self._qualified_claude_options(),
+            modes=self._qualified_claude_modes(),
+        )
+
+        with self._mocked_acp_runtime(agent, conn):
+            agent.init_state(state, on_event=lambda _: None)
+
+        assert agent.current_model_id == "claude-opus-5-5"
+        assert agent._selector_model_id == "opus"
+        assert state.agent_state["acp_current_model_id"] == "claude-opus-5-5"
+
+        agent._reset_client_for_turn(None, lambda _: None, [], state=state)
         assert agent.current_model_id == "opus"
         assert state.agent_state["acp_current_model_id"] == "opus"
 
