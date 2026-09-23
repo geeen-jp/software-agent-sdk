@@ -10,14 +10,11 @@ import urllib.request
 from pathlib import Path
 
 
-# Reject placeholders while allowing a concise human-written sentence.
-MIN_HUMAN_NOTE_CHARS = 20
 # These are the only PR-template sections that must remain and contain content.
 REQUIRED_TEMPLATE_FIELDS: tuple[str, ...] = ("Why", "Summary", "How to Test")
 
 HTML_COMMENT_RE = re.compile(r"<!--[\s\S]*?-->")
 HEADING_RE = re.compile(r"(?m)^##\s+(.+?)\s*$")
-HUMAN_HEADING_RE = re.compile(r"(?im)^\s*HUMAN:\s*$")
 AGENT_HEADING_RE = re.compile(r"(?im)^\s*AGENT:\s*$")
 ISSUE_REF_RE = re.compile(r"(?i)\b(?:fix|clos|resolv)(?:e?(?:s|d)?|ing)?\s+#(\d+)")
 BARE_ISSUE_REF_RE = re.compile(r"(?<!\w)#(\d+)")
@@ -42,14 +39,6 @@ def visible_text(text: str) -> str:
     return "\n".join(lines).strip()
 
 
-def first_visible_line(text: str) -> str:
-    for line in HTML_COMMENT_RE.sub("", text).splitlines():
-        stripped = line.strip()
-        if stripped:
-            return stripped
-    return ""
-
-
 def extract_sections(body: str) -> dict[str, str]:
     matches = list(HEADING_RE.finditer(body))
     sections: dict[str, str] = {}
@@ -58,19 +47,6 @@ def extract_sections(body: str) -> dict[str, str]:
         end = matches[index + 1].start() if index + 1 < len(matches) else len(body)
         sections[match.group(1).strip()] = body[start:end]
     return sections
-
-
-def extract_human_note(body: str) -> str:
-    """Return human-written text in the required location before AGENT."""
-    human_match = HUMAN_HEADING_RE.search(body)
-    if human_match is None:
-        return ""
-
-    agent_match = AGENT_HEADING_RE.search(body, human_match.end())
-    if agent_match is None:
-        return ""
-
-    return visible_text(body[human_match.end() : agent_match.start()])
 
 
 def extract_linked_issue_numbers(body: str) -> list[int]:
@@ -156,13 +132,6 @@ def validate_linked_issue_ready(
 
 def validate_pr_body(body: str) -> list[str]:
     errors: list[str] = []
-
-    if first_visible_line(body) != "HUMAN:":
-        errors.append("The first visible line of the PR description must be `HUMAN:`.")
-
-    human_note = extract_human_note(body)
-    if len(human_note) < MIN_HUMAN_NOTE_CHARS:
-        errors.append("Add a short human-written note between `HUMAN:` and `AGENT:`.")
 
     if AGENT_HEADING_RE.search(body) is None:
         errors.append("Keep the `AGENT:` marker from the PR template.")

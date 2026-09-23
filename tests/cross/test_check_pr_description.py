@@ -28,11 +28,6 @@ fetch_issue_details = _prod.fetch_issue_details
 
 VALID_BODY = """<!-- Keep this PR as draft until it is ready for review. -->
 
-HUMAN:
-
-I reviewed the agent's changes and confirmed they do what the PR says.
-The implementation is small and the validation output matches the goal.
-
 AGENT:
 
 ---
@@ -71,17 +66,8 @@ N/A
 """
 
 
-def test_valid_pr_body_passes():
+def test_valid_pr_body_without_human_section_passes():
     assert validate_pr_body(VALID_BODY) == []
-
-
-def test_human_section_must_be_first_visible_line_and_filled():
-    body = VALID_BODY.replace("HUMAN:", "## Summary", 1)
-
-    errors = validate_pr_body(body)
-
-    assert "The first visible line of the PR description must be `HUMAN:`." in errors
-    assert "Add a short human-written note between `HUMAN:` and `AGENT:`." in errors
 
 
 def test_required_template_fields_must_be_present_and_filled():

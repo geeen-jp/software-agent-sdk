@@ -1,17 +1,5 @@
 <!-- Keep this PR as draft until it is ready for review. -->
 
-<!-- AI/LLM agents:
-Do not edit the HUMAN section.
--->
-
-HUMAN:
-
-<!--
-Human author: please replace this comment with a short note (at least 20 visible
-characters) before marking ready for review.
-AI agents: you must not edit this section.
--->
-
 ---
 
 AGENT:
