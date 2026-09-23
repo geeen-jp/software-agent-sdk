@@ -1564,15 +1564,27 @@ def _raw_message_scope(
 
 def _raw_user_message_scope(
     message: Mapping[str, Any],
-) -> Literal["prompt", "tool_result", "unknown"]:
+) -> Literal["prompt", "tool_result", "provider_meta", "unknown"]:
     """Classify a Claude SDK user message without retaining its content.
 
     Claude Agent SDK 0.3.280 emits user-role tool-result messages between
     root assistant messages. They have their own ``uuid`` and a null
     ``parent_tool_use_id``, so UUID alone is not a prompt-turn discriminator.
     The provider-owned ``message.content`` block type distinguishes the
-    submitted prompt from those tool-result messages.
+    submitted prompt from those tool-result messages. Claude Code 2.1.280
+    also emits provider-internal user frames while a turn is still active:
+    the transcript calls the marker ``isMeta``; the SDK live-message contract
+    exposes the same provenance as ``isSynthetic``. Context-compaction
+    summaries have their own ``isCompactSummary`` marker. These frames are
+    lifecycle metadata, not a new ACP prompt, and must not rebind the active
+    prompt UUID.
     """
+    if any(
+        message.get(marker) is True
+        for marker in ("isSynthetic", "isMeta", "isCompactSummary")
+    ):
+        return "provider_meta"
+
     inner = message.get("message")
     if not isinstance(inner, Mapping) or inner.get("role") != "user":
         return "unknown"
@@ -2147,7 +2159,7 @@ class _OpenHandsACPBridge:
         message_type = sdk_message.get("type")
         if message_type == "user":
             user_scope = _raw_user_message_scope(sdk_message)
-            if user_scope == "tool_result":
+            if user_scope in ("tool_result", "provider_meta"):
                 return
             if user_scope != "prompt":
                 evidence.invalid_turn_binding = True

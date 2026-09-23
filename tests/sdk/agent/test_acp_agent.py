@@ -4524,6 +4524,25 @@ class TestTurnModelEvidence:
         }
 
     @staticmethod
+    def _provider_meta_user(
+        session_id: str,
+        marker: str,
+        uuid_value: str = "provider-meta",
+    ) -> dict[str, Any]:
+        return {
+            "sessionId": session_id,
+            "message": {
+                "type": "user",
+                "uuid": uuid_value,
+                marker: True,
+                "message": {
+                    "role": "user",
+                    "content": "provider-internal continuation",
+                },
+            },
+        }
+
+    @staticmethod
     def _complete(
         client: _OpenHandsACPBridge,
         session_id: str,
@@ -4767,6 +4786,48 @@ class TestTurnModelEvidence:
         assert evidence is not None
         assert evidence.root_models == ("claude-opus-5-5", "claude-opus-5-5")
         assert evidence.invalid_turn_binding is False
+
+    def test_provider_meta_user_frames_do_not_rebind_the_current_prompt(self):
+        for marker in ("isSynthetic", "isMeta", "isCompactSummary"):
+            client = _OpenHandsACPBridge(permission_policy="read_only")
+            client.begin_turn_model_evidence("session-1")
+            client._record_raw_sdk_message(self._user("session-1"))
+            client._record_raw_sdk_message(
+                self._assistant("session-1", "claude-opus-5-5")
+            )
+            client._record_raw_sdk_message(
+                self._provider_meta_user("session-1", marker)
+            )
+            client._record_raw_sdk_message(
+                self._assistant(
+                    "session-1",
+                    "claude-opus-5-5",
+                    user_message_uuid=None,
+                )
+            )
+            client.finish_turn_model_evidence("session-1")
+
+            evidence = client.pop_turn_model_evidence()
+            assert evidence is not None
+            assert evidence.root_models == (
+                "claude-opus-5-5",
+                "claude-opus-5-5",
+            )
+            assert evidence.invalid_turn_binding is False
+
+    def test_provider_meta_cannot_establish_first_prompt_binding(self):
+        client = _OpenHandsACPBridge(permission_policy="read_only")
+        client.begin_turn_model_evidence("session-1")
+        client._record_raw_sdk_message(
+            self._provider_meta_user("session-1", "isSynthetic")
+        )
+        client._record_raw_sdk_message(self._assistant("session-1", "claude-opus-5-5"))
+        client.finish_turn_model_evidence("session-1")
+
+        evidence = client.pop_turn_model_evidence()
+        assert evidence is not None
+        assert evidence.root_models == ()
+        assert evidence.invalid_turn_binding is True
 
     def test_invalid_root_evidence_is_retained_as_failure(self):
         cases = [
