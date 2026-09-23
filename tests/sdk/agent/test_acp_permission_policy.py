@@ -38,6 +38,9 @@ from openhands.sdk.agent.acp_permission_policy import (
     resolve_session_mode_for_policy,
 )
 from openhands.sdk.conversation.state import ConversationState
+from openhands.sdk.event import MessageEvent, SystemPromptEvent
+from openhands.sdk.llm import Message, TextContent
+from openhands.sdk.settings.acp_providers import CLAUDE_AGENT_ACP_VERSION
 from openhands.sdk.utils.async_executor import AsyncExecutor
 from openhands.sdk.workspace.local import LocalWorkspace
 
@@ -660,16 +663,19 @@ def _start_acp_server_with_session_config(
     tmp_path,
     *,
     agent_name: str = "claude-agent-acp",
+    adapter_version: str | None = CLAUDE_AGENT_ACP_VERSION,
     modes: SessionModeState | None = None,
     config_options: list[SessionConfigOptionSelect] | None = None,
     replace_mode_on_config: str | None = None,
     emit_mode_after_config: str | None = None,
+    resume: bool = False,
+    protocol_trace: list[str] | None = None,
 ) -> MagicMock:
     conn = MagicMock()
     init_response = MagicMock()
     init_response.agent_info = MagicMock()
     init_response.agent_info.name = agent_name
-    init_response.agent_info.version = "1.0"
+    init_response.agent_info.version = adapter_version
     init_response.agent_capabilities = None
     init_response.auth_methods = []
     conn.initialize = AsyncMock(return_value=init_response)
@@ -681,8 +687,23 @@ def _start_acp_server_with_session_config(
             config_options=list(current) or None,
         )
     )
-    conn.load_session = AsyncMock(return_value=MagicMock())
-    conn.set_session_mode = AsyncMock()
+    if resume:
+        conn.load_session = AsyncMock(
+            return_value=NewSessionResponse(
+                session_id="sess-1",
+                modes=modes,
+                config_options=list(current) or None,
+            )
+        )
+    else:
+        conn.load_session = AsyncMock(return_value=MagicMock())
+
+    async def _set_session_mode(*, mode_id: str, session_id: str) -> None:
+        del mode_id, session_id
+        if protocol_trace is not None:
+            protocol_trace.append("set_mode")
+
+    conn.set_session_mode = AsyncMock(side_effect=_set_session_mode)
     conn.set_session_model = AsyncMock()
     conn.authenticate = AsyncMock()
     conn.close = AsyncMock()
@@ -690,6 +711,8 @@ def _start_acp_server_with_session_config(
     async def _set_config_option(
         *, config_id: str, session_id: str, value: str | bool
     ) -> SetSessionConfigOptionResponse:
+        if protocol_trace is not None:
+            protocol_trace.append("set_config_option")
         str_value = str(value)
         for i, option in enumerate(current):
             if option.id != config_id:
@@ -742,6 +765,12 @@ def _start_acp_server_with_session_config(
         return None
 
     state = _make_state(tmp_path, agent)
+    if resume:
+        state.agent_state = {
+            **state.agent_state,
+            "acp_session_id": "sess-1",
+            "acp_session_cwd": str(tmp_path),
+        }
     agent._executor = AsyncExecutor()
     try:
         with ExitStack() as stack:
@@ -868,6 +897,247 @@ def test_read_only_startup_applies_unrelated_config_options(tmp_path) -> None:
         session_id="sess-1",
         value="medium",
     )
+
+
+def test_read_only_claude_uses_complete_mode_config_without_update(tmp_path) -> None:
+    """Claude's config response proves mode when no second mode update arrives."""
+    agent = ACPAgent(
+        acp_command=_CLAUDE_COMMAND,
+        acp_permission_policy="read_only",
+        acp_config_options={"effort": "medium"},
+    )
+    conn = _start_acp_server_with_session_config(
+        agent,
+        tmp_path,
+        modes=_claude_session_modes("default"),
+        config_options=[
+            _select_config_option(
+                "mode",
+                "default",
+                ["default", "plan", "bypassPermissions"],
+            ),
+            _select_config_option("effort", "low", ["low", "medium", "high"]),
+        ],
+    )
+
+    conn.set_session_mode.assert_awaited_once_with(
+        mode_id="default",
+        session_id="sess-1",
+    )
+    conn.set_config_option.assert_awaited_once_with(
+        config_id="effort",
+        session_id="sess-1",
+        value="medium",
+    )
+
+
+def test_read_only_claude_model_and_effort_keep_mode_proof_independent(
+    tmp_path,
+) -> None:
+    agent = ACPAgent(
+        acp_command=_CLAUDE_COMMAND,
+        acp_model="claude-opus-5-5",
+        acp_permission_policy="read_only",
+        acp_config_options={"effort": "medium"},
+    )
+    conn = _start_acp_server_with_session_config(
+        agent,
+        tmp_path,
+        modes=_claude_session_modes("default"),
+        config_options=[
+            _select_config_option(
+                "mode",
+                "default",
+                ["default", "plan", "bypassPermissions"],
+            ),
+            _select_config_option(
+                "model",
+                "default",
+                ["default", "claude-opus-5-5"],
+            ),
+            _select_config_option("effort", "low", ["low", "medium", "high"]),
+        ],
+    )
+
+    assert [call.kwargs for call in conn.set_config_option.await_args_list] == [
+        {
+            "config_id": "model",
+            "session_id": "sess-1",
+            "value": "claude-opus-5-5",
+        },
+        {
+            "config_id": "effort",
+            "session_id": "sess-1",
+            "value": "medium",
+        },
+    ]
+
+
+@pytest.mark.parametrize("adapter_version", [None, "0.64.0"])
+def test_read_only_claude_unqualified_adapter_fails_closed(
+    tmp_path,
+    adapter_version: str | None,
+) -> None:
+    agent = ACPAgent(
+        acp_command=_CLAUDE_COMMAND,
+        acp_permission_policy="read_only",
+        acp_config_options={"effort": "medium"},
+    )
+    with pytest.raises(ACPSessionModeError, match="did not prove"):
+        _start_acp_server_with_session_config(
+            agent,
+            tmp_path,
+            adapter_version=adapter_version,
+            modes=_claude_session_modes("default"),
+            config_options=[
+                _select_config_option(
+                    "mode",
+                    "default",
+                    ["default", "plan", "bypassPermissions"],
+                ),
+                _select_config_option("effort", "low", ["low", "medium", "high"]),
+            ],
+        )
+
+
+def test_read_only_claude_resume_uses_complete_mode_config_without_update(
+    tmp_path,
+) -> None:
+    agent = ACPAgent(
+        acp_command=_CLAUDE_COMMAND,
+        acp_permission_policy="read_only",
+        acp_config_options={"effort": "medium"},
+    )
+    conn = _start_acp_server_with_session_config(
+        agent,
+        tmp_path,
+        modes=_claude_session_modes("default"),
+        config_options=[
+            _select_config_option(
+                "mode",
+                "default",
+                ["default", "plan", "bypassPermissions"],
+            ),
+            _select_config_option("effort", "low", ["low", "medium", "high"]),
+        ],
+        resume=True,
+    )
+
+    conn.load_session.assert_awaited_once()
+    conn.new_session.assert_not_awaited()
+    conn.set_session_mode.assert_awaited_once_with(
+        mode_id="default",
+        session_id="sess-1",
+    )
+    conn.set_config_option.assert_awaited_once_with(
+        config_id="effort",
+        session_id="sess-1",
+        value="medium",
+    )
+
+
+def test_read_only_claude_resume_fails_without_mode_config_evidence(tmp_path) -> None:
+    agent = ACPAgent(
+        acp_command=_CLAUDE_COMMAND,
+        acp_permission_policy="read_only",
+        acp_config_options={"effort": "medium"},
+    )
+    with pytest.raises(ACPSessionModeError, match="did not prove"):
+        _start_acp_server_with_session_config(
+            agent,
+            tmp_path,
+            modes=_claude_session_modes("default"),
+            config_options=[
+                _select_config_option("effort", "low", ["low", "medium", "high"]),
+            ],
+            resume=True,
+        )
+
+
+def test_read_only_claude_resume_fails_on_contradictory_mode_config(tmp_path) -> None:
+    agent = ACPAgent(
+        acp_command=_CLAUDE_COMMAND,
+        acp_permission_policy="read_only",
+        acp_config_options={"effort": "medium"},
+    )
+    with pytest.raises(ACPSessionModeError, match="configuration option"):
+        _start_acp_server_with_session_config(
+            agent,
+            tmp_path,
+            modes=_claude_session_modes("default"),
+            config_options=[
+                _select_config_option(
+                    "mode",
+                    "bypassPermissions",
+                    ["default", "plan", "bypassPermissions"],
+                ),
+                _select_config_option("effort", "low", ["low", "medium", "high"]),
+            ],
+            resume=True,
+        )
+
+
+def test_read_only_claude_config_gate_precedes_prompt(tmp_path) -> None:
+    trace: list[str] = []
+    agent = ACPAgent(
+        acp_command=_CLAUDE_COMMAND,
+        acp_permission_policy="read_only",
+        acp_config_options={"effort": "medium"},
+    )
+    conn = _start_acp_server_with_session_config(
+        agent,
+        tmp_path,
+        modes=_claude_session_modes("default"),
+        config_options=[
+            _select_config_option(
+                "mode",
+                "default",
+                ["default", "plan", "bypassPermissions"],
+            ),
+            _select_config_option("effort", "low", ["low", "medium", "high"]),
+        ],
+        protocol_trace=trace,
+    )
+    assert trace == ["set_mode", "set_config_option"]
+
+    prompt_path = tmp_path / "prompt"
+    prompt_path.mkdir()
+    state = _make_state(prompt_path, agent)
+    state.events.append(
+        SystemPromptEvent(
+            source="agent",
+            system_prompt=TextContent(text="ACP-managed agent"),
+            tools=[],
+        )
+    )
+    state.events.append(
+        MessageEvent(
+            source="user",
+            llm_message=Message(
+                role="user",
+                content=[TextContent(text="Read the repository status.")],
+            ),
+        )
+    )
+    conversation = MagicMock()
+    conversation.state = state
+    assert agent._client is not None
+    agent._client.get_turn_usage_update = MagicMock(return_value=object())
+
+    async def _prompt(*_args, **_kwargs):
+        trace.append("prompt")
+        agent._client.accumulated_text.append("status is clean")
+        return None
+
+    conn.prompt = AsyncMock(side_effect=_prompt)
+    executor = MagicMock()
+    executor.run_async = lambda coroutine, **_kwargs: asyncio.run(coroutine())
+    agent._executor = executor
+
+    agent.step(conversation, on_event=lambda _event: None)
+
+    assert trace == ["set_mode", "set_config_option", "prompt"]
+    conn.prompt.assert_awaited_once()
 
 
 def test_read_only_startup_fails_without_post_config_mode_evidence(tmp_path) -> None:

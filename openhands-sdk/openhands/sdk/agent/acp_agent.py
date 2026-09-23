@@ -116,6 +116,7 @@ from openhands.sdk.mcp.config import MCPServer
 from openhands.sdk.observability.laminar import maybe_init_laminar, observe
 from openhands.sdk.secret import SecretSource
 from openhands.sdk.settings.acp_providers import (
+    CLAUDE_AGENT_ACP_VERSION,
     ACPFileSecretSpec,
     _build_session_meta,
     _build_session_structured_output_meta,
@@ -464,6 +465,7 @@ def _classify_acp_init_error(exc: BaseException) -> str:
 # (codex-acp, claude-agent-acp 0.44+) rather than the UNSTABLE ``models``
 # capability + ``session/set_model`` (gemini-cli, older codex/claude).
 _MODEL_CONFIG_OPTION_ID = "model"
+_CLAUDE_MODE_CONFIG_OPTION_ID = "mode"
 _CODEX_REASONING_EFFORTS: Final[frozenset[str]] = frozenset(
     {"none", "low", "medium", "high", "xhigh", "max"}
 )
@@ -823,8 +825,10 @@ def _verify_read_only_mode_after_config(
     session_id: str,
     config_options: list[SessionConfigOption] | None,
     provider_key: str | None = None,
+    adapter_version: str | None = None,
     mode_generation_before: int = 0,
     require_fresh_mode: bool = False,
+    config_options_authoritative: bool = False,
 ) -> None:
     """Fail closed if session configuration replaced the verified read_only mode.
 
@@ -833,8 +837,13 @@ def _verify_read_only_mode_after_config(
     keeps the confirmed ``ask`` mode effective while updating model-dependent
     options without emitting a second mode notification. Those providers may
     prove ``read_only`` from their provider-specific effective state instead of
-    requiring a fresh mode notification. Other providers still require a
-    fresh ``CurrentModeUpdate`` after config writes.
+    requiring a fresh mode notification. Claude ACP 0.63.0 returns a complete
+    ``configOptions`` snapshot from ``session/set_config_option``; its ``mode``
+    option mirrors the effective session mode, so that provider-specific
+    snapshot is the qualified proof when no fresh mode notification is emitted.
+    This exception is qualified only for the adapter version pinned by the
+    provider registry; unknown or different versions still require a fresh
+    ``CurrentModeUpdate`` after config writes.
     """
     if (
         normalize_acp_permission_policy(policy) != "read_only"
@@ -899,6 +908,37 @@ def _verify_read_only_mode_after_config(
                     f"ACP server {agent_name!r} session {session_id} did not "
                     f"confirm read_only session mode {required_mode_id!r} "
                     f"after applying session configuration (observed={observed!r})."
+                )
+            return
+        if (
+            effective_provider_key == "claude-code"
+            and adapter_version == CLAUDE_AGENT_ACP_VERSION
+        ):
+            if generation > mode_generation_before and observed == required_mode_id:
+                return
+            if not config_options_authoritative:
+                raise ACPSessionModeError(
+                    f"ACP server {agent_name!r} session {session_id} did not "
+                    f"return authoritative Claude config state to prove "
+                    f"read_only session mode {required_mode_id!r} after applying "
+                    "session configuration."
+                )
+            mode_options = [
+                option
+                for option in _iter_session_config_options(config_options)
+                if getattr(option, "id", None) == _CLAUDE_MODE_CONFIG_OPTION_ID
+            ]
+            observed_mode = (
+                _config_option_current_value(mode_options[0])
+                if len(mode_options) == 1
+                else None
+            )
+            if observed_mode != required_mode_id:
+                raise ACPSessionModeError(
+                    f"ACP server {agent_name!r} session {session_id} did not "
+                    f"prove Claude read_only session mode {required_mode_id!r} "
+                    "from the complete configOptions response "
+                    f"(mode={observed_mode!r})."
                 )
             return
         if generation <= mode_generation_before or observed != required_mode_id:
@@ -1164,6 +1204,7 @@ async def _apply_session_config_options(
     *,
     required_session_mode: str | None = None,
     provider_key: str | None = None,
+    adapter_version: str | None = None,
 ) -> list[SessionConfigOption] | None:
     """Apply *requested* session config options and verify the observed state.
 
@@ -1210,6 +1251,7 @@ async def _apply_session_config_options(
             session_id=session_id,
             config_options=initial_options,
             provider_key=provider_key,
+            adapter_version=adapter_version,
         )
         return None
 
@@ -1310,16 +1352,30 @@ async def _apply_session_config_options(
         requested,
         final_state,
     )
+    provider = detect_acp_provider_by_agent_name(agent_name)
+    effective_provider_key = provider.key if provider is not None else provider_key
+    qualified_claude_adapter = (
+        effective_provider_key == "claude-code"
+        and adapter_version == CLAUDE_AGENT_ACP_VERSION
+    )
     _verify_read_only_mode_after_config(
         client,
         policy=client.permission_policy,
         required_mode_id=required_session_mode,
         agent_name=agent_name,
         session_id=session_id,
-        config_options=list(final_state.values()),
+        config_options=(
+            last_response_options
+            if qualified_claude_adapter
+            else list(final_state.values())
+        ),
         provider_key=provider_key,
+        adapter_version=adapter_version,
         mode_generation_before=mode_generation_before,
         require_fresh_mode=require_fresh_mode,
+        config_options_authoritative=(
+            qualified_claude_adapter and last_response_options is not None
+        ),
     )
     return list(final_state.values())
 
@@ -3580,6 +3636,7 @@ class ACPAgent(AgentBase):
                     config_options,
                     required_session_mode=mode_id,
                     provider_key=runtime_key,
+                    adapter_version=self._startup_adapter_version,
                 )
                 current_model_id = _surfaced_current_model_id(
                     current_model_id, agent_name, final_options
