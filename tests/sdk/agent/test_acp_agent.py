@@ -47,7 +47,6 @@ from openhands.sdk.agent.acp_agent import (
     _config_option_current_value,
     _config_option_values,
     _estimate_cost_from_tokens,
-    _extract_served_model,
     _extract_session_models,
     _extract_token_usage,
     _image_url_to_acp_block,
@@ -3810,19 +3809,7 @@ class TestACPPromptRetry:
         agent._client = client
         agent._conn = MagicMock()
         agent._session_id = "test-session"
-        response = TestExtractServedModel._response(
-            [
-                {
-                    "model": "claude-opus-5-5",
-                    "token_count": {
-                        "inputTokens": 10,
-                        "outputTokens": 20,
-                        "cachedInputTokens": 30,
-                        "cachedWriteTokens": 40,
-                    },
-                }
-            ]
-        )
+        response = MagicMock(usage=None, field_meta={"quota": {"model_usage": []}})
         call_count = 0
 
         def _run_async(_operation, **_kwargs):  # noqa: ANN001
@@ -3832,6 +3819,11 @@ class TestACPPromptRetry:
                 agent._served_model_id = "claude-opus-5-4"
                 raise ConnectionError("transient transport failure")
             client.accumulated_text.append("retry success")
+            TestTurnModelEvidence._complete(
+                client,
+                "test-session",
+                root_models=("claude-opus-5-5",),
+            )
             return response
 
         executor = MagicMock()
@@ -3854,25 +3846,21 @@ class TestACPPromptRetry:
         agent._client = client
         agent._conn = MagicMock()
         agent._session_id = "test-session"
-        valid = TestExtractServedModel._response(
-            [
-                {
-                    "model": "claude-opus-5-5",
-                    "token_count": {
-                        "inputTokens": 10,
-                        "outputTokens": 20,
-                        "cachedInputTokens": 30,
-                        "cachedWriteTokens": 40,
-                    },
-                }
-            ]
-        )
-        missing = MagicMock()
-        missing.field_meta = None
-        missing.usage = None
-        responses = iter([valid, missing])
+        response = MagicMock(usage=None, field_meta={"quota": {"model_usage": []}})
+        responses = iter([True, False])
         executor = MagicMock()
-        executor.run_async.side_effect = lambda _operation, **_kwargs: next(responses)
+
+        def _run_async(_operation, **_kwargs):  # noqa: ANN001
+            has_evidence = next(responses)
+            if has_evidence:
+                TestTurnModelEvidence._complete(
+                    client,
+                    "test-session",
+                    root_models=("claude-opus-5-5",),
+                )
+            return response
+
+        executor.run_async.side_effect = _run_async
         agent._executor = executor
 
         agent.step(conversation, on_event=lambda _: None)
@@ -4113,36 +4101,20 @@ class TestSetACPModel:
         assert agent._post_turn_model_verification_required is True
         assert agent._served_model_id is None
 
-        wrong = TestExtractServedModel._response(
-            [
-                {
-                    "model": "claude-opus-5-4",
-                    "token_count": {
-                        "inputTokens": 10,
-                        "outputTokens": 20,
-                        "cachedInputTokens": 30,
-                        "cachedWriteTokens": 40,
-                    },
-                }
-            ]
+        TestTurnModelEvidence._complete(
+            agent._client,
+            "sess-1",
+            root_models=("claude-opus-5-4",),
         )
         with pytest.raises(ACPSessionModelError, match="served=.*claude-opus-5-4"):
-            agent._verify_served_model_for_turn(wrong)
+            agent._verify_served_model_for_turn()
 
-        correct = TestExtractServedModel._response(
-            [
-                {
-                    "model": "claude-opus-5-5",
-                    "token_count": {
-                        "inputTokens": 10,
-                        "outputTokens": 20,
-                        "cachedInputTokens": 30,
-                        "cachedWriteTokens": 40,
-                    },
-                }
-            ]
+        TestTurnModelEvidence._complete(
+            agent._client,
+            "sess-1",
+            root_models=("claude-opus-5-5",),
         )
-        agent._verify_served_model_for_turn(correct)
+        agent._verify_served_model_for_turn()
         assert agent._served_model_id == "claude-opus-5-5"
 
     def test_qualified_claude_switch_rejects_writable_session(self):
@@ -4384,183 +4356,309 @@ class TestExtractTokenUsage:
         assert _extract_token_usage(response) == (0, 0, 0, 0, 0)
 
 
-class TestExtractServedModel:
+class TestTurnModelEvidence:
     @staticmethod
-    def _response(model_usage, usage=(10, 20, 30, 40)):
-        response = MagicMock()
-        response.field_meta = {"quota": {"model_usage": model_usage}}
-        if usage is None:
-            response.usage = None
-        else:
-            response.usage.input_tokens = usage[0]
-            response.usage.output_tokens = usage[1]
-            response.usage.cached_read_tokens = usage[2]
-            response.usage.cached_write_tokens = usage[3]
-        return response
+    def _assistant(
+        session_id: str,
+        model: str | None,
+        *,
+        parent_tool_use_id: str | None = None,
+        parent_agent_id: str | None = None,
+        is_sidechain: bool | None = None,
+        user_message_uuid: str | None = "user-1",
+    ) -> dict[str, Any]:
+        message: dict[str, Any] = {
+            "type": "assistant",
+            "parent_tool_use_id": parent_tool_use_id,
+            "message": {"model": model, "content": [{"text": "secret"}]},
+        }
+        if user_message_uuid is not None:
+            message["user_message_uuid"] = user_message_uuid
+        if parent_agent_id is not None:
+            message["parent_agent_id"] = parent_agent_id
+        if is_sidechain is not None:
+            message["isSidechain"] = is_sidechain
+        return {"sessionId": session_id, "message": message}
 
-    def test_exact_single_model_row(self):
-        response = TestExtractServedModel._response(
-            [
-                {
-                    "model": "claude-opus-5-5",
-                    "token_count": {
-                        "inputTokens": 10,
-                        "outputTokens": 20,
-                        "cachedInputTokens": 30,
-                        "cachedWriteTokens": 40,
-                    },
-                }
-            ]
-        )
-        assert _extract_served_model(response) == "claude-opus-5-5"
-
-    def test_multiple_rows_are_ambiguous_even_when_usage_matches(self):
-        response = TestExtractServedModel._response(
-            [
-                {
-                    "model": "claude-haiku-4-5-20251001",
-                    "token_count": {
-                        "inputTokens": 2,
-                        "outputTokens": 13,
-                        "cachedInputTokens": 0,
-                        "cachedWriteTokens": 0,
-                    },
+    @staticmethod
+    def _message_start(
+        session_id: str,
+        model: str | None,
+        user_message_uuid: str | None = "user-1",
+    ) -> dict[str, Any]:
+        message: dict[str, Any] = {
+            "sessionId": session_id,
+            "message": {
+                "type": "stream_event",
+                "parent_tool_use_id": None,
+                "event": {
+                    "type": "message_start",
+                    "message": {"id": "msg-1", "model": model},
                 },
-                {
-                    "model": "claude-opus-5-5",
-                    "token_count": {
-                        "inputTokens": 10,
-                        "outputTokens": 20,
-                        "cachedInputTokens": 30,
-                        "cachedWriteTokens": 40,
-                    },
-                },
-            ]
-        )
-        assert _extract_served_model(response) is None
-
-    def test_single_model_row_does_not_require_main_loop_usage_match(self):
-        response = TestExtractServedModel._response(
-            [
-                {
-                    "model": "claude-opus-5-5",
-                    "token_count": {
-                        "inputTokens": 1,
-                        "outputTokens": 2,
-                        "cachedInputTokens": 3,
-                        "cachedWriteTokens": 4,
-                    },
-                }
-            ],
-            usage=(10, 20, 30, 40),
-        )
-        assert _extract_served_model(response) == "claude-opus-5-5"
-
-    def test_single_model_mapping_is_supported(self):
-        response = self._response(
-            {
-                "claude-opus-5-5": {
-                    "inputTokens": 1,
-                    "outputTokens": 2,
-                    "cachedInputTokens": 3,
-                    "cachedWriteTokens": 4,
-                }
             },
-            usage=(10, 20, 30, 40),
-        )
-        assert _extract_served_model(response) == "claude-opus-5-5"
+        }
+        if user_message_uuid is not None:
+            message["message"]["user_message_uuid"] = user_message_uuid
+        return message
 
-    def test_empty_model_usage_is_missing(self):
-        response = self._response([])
-        assert _extract_served_model(response) is None
+    @staticmethod
+    def _user(session_id: str) -> dict[str, Any]:
+        return {
+            "sessionId": session_id,
+            "message": {
+                "type": "user",
+                "uuid": "user-1",
+                "message": {
+                    "role": "user",
+                    "content": [{"type": "text", "text": "probe"}],
+                },
+            },
+        }
 
-    def test_multiple_rows_with_duplicate_model_are_ambiguous(self):
-        response = self._response(
-            [
-                {
-                    "model": "claude-opus-5-5",
-                    "token_count": {
-                        "inputTokens": 1,
-                        "outputTokens": 2,
-                        "cachedInputTokens": 0,
-                        "cachedWriteTokens": 0,
-                    },
+    @staticmethod
+    def _tool_result_user(
+        session_id: str, uuid_value: str = "tool-result"
+    ) -> dict[str, Any]:
+        return {
+            "sessionId": session_id,
+            "message": {
+                "type": "user",
+                "uuid": uuid_value,
+                "message": {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "tool-1",
+                            "content": "provider tool output",
+                        }
+                    ],
                 },
-                {
-                    "model": "claude-opus-5-5",
-                    "token_count": {
-                        "inputTokens": 3,
-                        "outputTokens": 4,
-                        "cachedInputTokens": 0,
-                        "cachedWriteTokens": 0,
-                    },
-                },
-            ]
-        )
-        assert _extract_served_model(response) is None
+            },
+        }
 
-    def test_malformed_model_usage_is_missing(self):
-        response = self._response(
-            [
-                {
-                    "model": "claude-opus-5-5",
-                    "token_count": {"inputTokens": 1},
-                }
-            ]
-        )
-        assert _extract_served_model(response) is None
+    @staticmethod
+    def _complete(
+        client: _OpenHandsACPBridge,
+        session_id: str,
+        root_models: tuple[str, ...] = (),
+        delegated_models: tuple[str, ...] = (),
+        message_start_models: tuple[str, ...] = (),
+    ) -> None:
+        client.begin_turn_model_evidence(session_id)
+        client._record_raw_sdk_message(TestTurnModelEvidence._user(session_id))
+        for model in delegated_models:
+            client._record_raw_sdk_message(
+                TestTurnModelEvidence._assistant(
+                    session_id,
+                    model,
+                    parent_tool_use_id="tool-1",
+                )
+            )
+        for model in message_start_models:
+            client._record_raw_sdk_message(
+                TestTurnModelEvidence._message_start(session_id, model)
+            )
+        for model in root_models:
+            client._record_raw_sdk_message(
+                TestTurnModelEvidence._assistant(session_id, model)
+            )
+        client.finish_turn_model_evidence(session_id)
 
-    def test_multiple_rows_without_usage_are_ambiguous(self):
-        response = self._response(
-            [
-                {
-                    "model": "claude-opus-5-5",
-                    "token_count": {
-                        "inputTokens": 1,
-                        "outputTokens": 2,
-                        "cachedInputTokens": 0,
-                        "cachedWriteTokens": 0,
-                    },
-                },
-                {
-                    "model": "claude-sonnet-5",
-                    "token_count": {
-                        "inputTokens": 3,
-                        "outputTokens": 4,
-                        "cachedInputTokens": 0,
-                        "cachedWriteTokens": 0,
-                    },
-                },
-            ],
-            usage=None,
+    def test_extension_callback_extracts_root_model_without_retaining_content(self):
+        client = _OpenHandsACPBridge(permission_policy="read_only")
+        client.begin_turn_model_evidence("session-1")
+        awaitable = client.ext_notification(
+            "claude/sdkMessage",
+            self._user("session-1"),
         )
-        response.usage = None
-        assert _extract_served_model(response) is None
+        asyncio.run(awaitable)
+        asyncio.run(
+            client.ext_notification(
+                "claude/sdkMessage",
+                self._assistant("session-1", "claude-opus-5-5"),
+            )
+        )
+        client.finish_turn_model_evidence("session-1")
 
-    def test_multiple_rows_with_duplicate_counters_are_ambiguous(self):
-        response = self._response(
-            [
-                {
-                    "model": "claude-opus-5-5",
-                    "token_count": {
-                        "inputTokens": 10,
-                        "outputTokens": 20,
-                        "cachedInputTokens": 30,
-                        "cachedWriteTokens": 40,
-                    },
-                },
-                {
-                    "model": "claude-sonnet-5",
-                    "token_count": {
-                        "inputTokens": 10,
-                        "outputTokens": 20,
-                        "cachedInputTokens": 30,
-                        "cachedWriteTokens": 40,
-                    },
-                },
-            ]
+        evidence = client.pop_turn_model_evidence()
+        assert evidence is not None
+        assert evidence.root_models == ("claude-opus-5-5",)
+        assert evidence.invalid_turn_binding is False
+        assert "secret" not in repr(evidence)
+
+    def test_tool_loop_accepts_all_root_messages_and_excludes_delegated_model(self):
+        client = _OpenHandsACPBridge(permission_policy="read_only")
+        self._complete(
+            client,
+            "session-1",
+            root_models=("claude-opus-5-5", "claude-opus-5-5", "claude-opus-5-5"),
+            delegated_models=("claude-haiku-4-5-20251001",),
+            message_start_models=("claude-opus-5-5", "claude-opus-5-5"),
         )
-        assert _extract_served_model(response) is None
+
+        evidence = client.pop_turn_model_evidence()
+        assert evidence is not None
+        assert evidence.root_models == (
+            "claude-opus-5-5",
+            "claude-opus-5-5",
+            "claude-opus-5-5",
+        )
+        assert evidence.delegated_models == ("claude-haiku-4-5-20251001",)
+        assert evidence.message_start_models == (
+            "claude-opus-5-5",
+            "claude-opus-5-5",
+        )
+
+    def test_root_uuid_is_required_before_accepting_uuid_less_continuation(self):
+        for root_message in (
+            self._assistant(
+                "session-1",
+                "claude-opus-5-5",
+                user_message_uuid=None,
+            ),
+            self._message_start(
+                "session-1",
+                "claude-opus-5-5",
+                user_message_uuid=None,
+            ),
+        ):
+            client = _OpenHandsACPBridge(permission_policy="read_only")
+            client.begin_turn_model_evidence("session-1")
+            client._record_raw_sdk_message(self._user("session-1"))
+            client._record_raw_sdk_message(root_message)
+            client.finish_turn_model_evidence("session-1")
+
+            evidence = client.pop_turn_model_evidence()
+            assert evidence is not None
+            assert evidence.root_models == ()
+            assert evidence.message_start_models == ()
+            assert evidence.invalid_turn_binding is True
+
+        client = _OpenHandsACPBridge(permission_policy="read_only")
+        client.begin_turn_model_evidence("session-1")
+        client._record_raw_sdk_message(self._user("session-1"))
+        client._record_raw_sdk_message(self._assistant("session-1", "claude-opus-5-5"))
+        client._record_raw_sdk_message(
+            self._assistant(
+                "session-1",
+                "claude-opus-5-5",
+                user_message_uuid=None,
+            )
+        )
+        client.finish_turn_model_evidence("session-1")
+
+        evidence = client.pop_turn_model_evidence()
+        assert evidence is not None
+        assert evidence.root_models == ("claude-opus-5-5", "claude-opus-5-5")
+        assert evidence.invalid_turn_binding is False
+
+    def test_later_different_user_uuid_invalidates_the_turn(self):
+        client = _OpenHandsACPBridge(permission_policy="read_only")
+        client.begin_turn_model_evidence("session-1")
+        client._record_raw_sdk_message(self._user("session-1"))
+        client._record_raw_sdk_message(
+            {
+                "sessionId": "session-1",
+                "message": {
+                    "type": "user",
+                    "uuid": "user-2",
+                    "message": {
+                        "role": "user",
+                        "content": [{"type": "text", "text": "another prompt"}],
+                    },
+                },
+            }
+        )
+        client._record_raw_sdk_message(self._assistant("session-1", "claude-opus-5-5"))
+        client.finish_turn_model_evidence("session-1")
+
+        evidence = client.pop_turn_model_evidence()
+        assert evidence is not None
+        assert evidence.invalid_turn_binding is True
+
+    def test_tool_result_user_uuid_does_not_rebind_the_current_prompt(self):
+        client = _OpenHandsACPBridge(permission_policy="read_only")
+        client.begin_turn_model_evidence("session-1")
+        client._record_raw_sdk_message(self._user("session-1"))
+        client._record_raw_sdk_message(self._assistant("session-1", "claude-opus-5-5"))
+        client._record_raw_sdk_message(self._tool_result_user("session-1"))
+        client._record_raw_sdk_message(
+            self._assistant(
+                "session-1",
+                "claude-opus-5-5",
+                user_message_uuid=None,
+            )
+        )
+        client.finish_turn_model_evidence("session-1")
+
+        evidence = client.pop_turn_model_evidence()
+        assert evidence is not None
+        assert evidence.root_models == ("claude-opus-5-5", "claude-opus-5-5")
+        assert evidence.invalid_turn_binding is False
+
+    def test_invalid_root_evidence_is_retained_as_failure(self):
+        cases = [
+            ("wrong", ("claude-sonnet-5",)),
+            ("conflicting", ("claude-opus-5-5", "claude-sonnet-5")),
+            ("missing", ()),
+        ]
+        for _name, models in cases:
+            client = _OpenHandsACPBridge(permission_policy="read_only")
+            self._complete(client, "session-1", root_models=models)
+            evidence = client.pop_turn_model_evidence()
+            assert evidence is not None
+            assert evidence.root_models == models
+
+        for model in (None, "", "<synthetic>"):
+            client = _OpenHandsACPBridge(permission_policy="read_only")
+            client.begin_turn_model_evidence("session-1")
+            client._record_raw_sdk_message(self._user("session-1"))
+            client._record_raw_sdk_message(
+                self._assistant("session-1", model)  # type: ignore[arg-type]
+            )
+            client.finish_turn_model_evidence("session-1")
+            evidence = client.pop_turn_model_evidence()
+            assert evidence is not None
+            assert evidence.invalid_root_evidence is True
+
+    def test_wrong_session_and_previous_turn_cannot_supply_current_evidence(self):
+        client = _OpenHandsACPBridge(permission_policy="read_only")
+        self._complete(client, "session-1", root_models=("claude-opus-5-5",))
+        assert client.pop_turn_model_evidence() is not None
+
+        client.begin_turn_model_evidence("session-2")
+        client._record_raw_sdk_message(self._assistant("session-1", "claude-opus-5-5"))
+        client.finish_turn_model_evidence("session-2")
+        evidence = client.pop_turn_model_evidence()
+        assert evidence is not None
+        assert evidence.root_models == ()
+
+    def test_cancel_discard_blocks_late_valid_message(self):
+        client = _OpenHandsACPBridge(permission_policy="read_only")
+        client.begin_turn_model_evidence("session-1")
+        client.discard_turn_model_evidence()
+        client._record_raw_sdk_message(self._assistant("session-1", "claude-opus-5-5"))
+        client.finish_turn_model_evidence("session-1")
+        assert client.pop_turn_model_evidence() is None
+
+    def test_root_message_from_another_prompt_is_not_current_turn_evidence(self):
+        client = _OpenHandsACPBridge(permission_policy="read_only")
+        client.begin_turn_model_evidence("session-1")
+        client._record_raw_sdk_message(self._user("session-1"))
+        client._record_raw_sdk_message(
+            self._assistant(
+                "session-1",
+                "claude-opus-5-5",
+                user_message_uuid="previous-user",
+            )
+        )
+        client.finish_turn_model_evidence("session-1")
+
+        evidence = client.pop_turn_model_evidence()
+        assert evidence is not None
+        assert evidence.root_models == ()
+        assert evidence.invalid_turn_binding is True
 
 
 class TestServedModelGate:
@@ -4579,87 +4677,100 @@ class TestServedModelGate:
         )
         agent._post_turn_model_verification_required = True
         agent._current_model_id = "opus"
+        agent._client = _OpenHandsACPBridge(permission_policy="read_only")
         return agent
 
     def test_exact_match_passes_after_alias_selector(self):
         agent = self._agent()
-        response = TestExtractServedModel._response(
-            [
-                {
-                    "model": "claude-opus-5-5",
-                    "token_count": {
-                        "inputTokens": 10,
-                        "outputTokens": 20,
-                        "cachedInputTokens": 30,
-                        "cachedWriteTokens": 40,
-                    },
-                }
-            ]
+        TestTurnModelEvidence._complete(
+            agent._client,
+            "session-1",
+            root_models=("claude-opus-5-5",),
         )
-        agent._verify_served_model_for_turn(response)
+        agent._verify_served_model_for_turn()
+        assert agent._served_model_id == "claude-opus-5-5"
+
+    def test_several_root_messages_pass_when_all_match(self):
+        agent = self._agent()
+        TestTurnModelEvidence._complete(
+            agent._client,
+            "session-1",
+            root_models=("claude-opus-5-5", "claude-opus-5-5"),
+            message_start_models=("claude-opus-5-5",),
+        )
+        agent._verify_served_model_for_turn()
+        assert agent._served_model_id == "claude-opus-5-5"
+
+    def test_root_match_with_different_delegated_model_passes(self):
+        agent = self._agent()
+        TestTurnModelEvidence._complete(
+            agent._client,
+            "session-1",
+            root_models=("claude-opus-5-5",),
+            delegated_models=("claude-haiku-4-5-20251001",),
+        )
+        agent._verify_served_model_for_turn()
         assert agent._served_model_id == "claude-opus-5-5"
 
     def test_mismatch_fails_closed(self):
         agent = self._agent()
-        response = TestExtractServedModel._response(
-            [
-                {
-                    "model": "claude-opus-5-4",
-                    "token_count": {
-                        "inputTokens": 10,
-                        "outputTokens": 20,
-                        "cachedInputTokens": 30,
-                        "cachedWriteTokens": 40,
-                    },
-                }
-            ]
+        TestTurnModelEvidence._complete(
+            agent._client,
+            "session-1",
+            root_models=("claude-opus-5-4",),
         )
         with pytest.raises(ACPSessionModelError, match="served=.*claude-opus-5-4"):
-            agent._verify_served_model_for_turn(response)
+            agent._verify_served_model_for_turn()
 
-    def test_missing_or_ambiguous_evidence_fails_closed(self):
+    def test_conflicting_root_models_fail_closed(self):
         agent = self._agent()
-        missing = MagicMock()
-        missing.field_meta = None
-        missing.usage = None
-        with pytest.raises(ACPSessionModelError, match="served='UNKNOWN'"):
-            agent._verify_served_model_for_turn(missing)
-
-        ambiguous = TestExtractServedModel._response(
-            [
-                {
-                    "model": "claude-opus-5-5",
-                    "token_count": {
-                        "inputTokens": 1,
-                        "outputTokens": 2,
-                        "cachedInputTokens": 0,
-                        "cachedWriteTokens": 0,
-                    },
-                },
-                {
-                    "model": "claude-sonnet-5",
-                    "token_count": {
-                        "inputTokens": 3,
-                        "outputTokens": 4,
-                        "cachedInputTokens": 0,
-                        "cachedWriteTokens": 0,
-                    },
-                },
-            ],
-            usage=None,
+        TestTurnModelEvidence._complete(
+            agent._client,
+            "session-1",
+            root_models=("claude-opus-5-5", "claude-sonnet-5"),
         )
+        with pytest.raises(ACPSessionModelError, match="root_models"):
+            agent._verify_served_model_for_turn()
+
+    def test_conflicting_stream_message_start_fails_closed(self):
+        agent = self._agent()
+        TestTurnModelEvidence._complete(
+            agent._client,
+            "session-1",
+            root_models=("claude-opus-5-5",),
+            message_start_models=("claude-sonnet-5",),
+        )
+        with pytest.raises(ACPSessionModelError, match="served=.*claude-sonnet-5"):
+            agent._verify_served_model_for_turn()
+
+    def test_missing_evidence_fails_closed(self):
+        agent = self._agent()
         with pytest.raises(ACPSessionModelError, match="served='UNKNOWN'"):
-            agent._verify_served_model_for_turn(ambiguous)
+            agent._verify_served_model_for_turn()
 
     def test_stale_served_evidence_is_not_reused(self):
         agent = self._agent()
         agent._served_model_id = "claude-opus-5-5"
-        response = MagicMock()
-        response.field_meta = None
-        response.usage = None
         with pytest.raises(ACPSessionModelError, match="served='UNKNOWN'"):
-            agent._verify_served_model_for_turn(response)
+            agent._verify_served_model_for_turn()
         assert agent._served_model_id is None
+
+    def test_only_model_usage_or_selector_is_not_authority(self):
+        agent = self._agent()
+        response = MagicMock()
+        response.field_meta = {
+            "quota": {
+                "model_usage": [
+                    {
+                        "model": "claude-opus-5-5",
+                        "token_count": {"inputTokens": 1},
+                    }
+                ]
+            }
+        }
+        with pytest.raises(ACPSessionModelError, match="served='UNKNOWN'"):
+            agent._verify_served_model_for_turn()
+        assert agent.current_model_id == "opus"
 
     def test_step_accepts_provider_shaped_turn_only_after_model_gate(self, tmp_path):
         agent = self._agent()
@@ -4677,22 +4788,16 @@ class TestServedModelGate:
         agent._client = client
         agent._conn = MagicMock()
         agent._session_id = "session-1"
-        response = TestExtractServedModel._response(
-            [
-                {
-                    "model": "claude-opus-5-5",
-                    "token_count": {
-                        "inputTokens": 10,
-                        "outputTokens": 20,
-                        "cachedInputTokens": 30,
-                        "cachedWriteTokens": 40,
-                    },
-                }
-            ]
-        )
+        response = MagicMock(usage=None, field_meta={"quota": {"model_usage": []}})
         executor = MagicMock()
 
         def run_async(_operation, **_kwargs):  # noqa: ANN001
+            client.accumulated_text.append("PROBE_OK")
+            TestTurnModelEvidence._complete(
+                client,
+                "session-1",
+                root_models=("claude-opus-5-5",),
+            )
             return response
 
         executor.run_async.side_effect = run_async
@@ -4722,24 +4827,17 @@ class TestServedModelGate:
         new_conn = MagicMock()
         agent._conn = old_conn
         agent._session_id = "session-1"
-        response = TestExtractServedModel._response(
-            [
-                {
-                    "model": "claude-opus-5-5",
-                    "token_count": {
-                        "inputTokens": 10,
-                        "outputTokens": 20,
-                        "cachedInputTokens": 30,
-                        "cachedWriteTokens": 40,
-                    },
-                }
-            ]
-        )
+        response = MagicMock(usage=None, field_meta={"quota": {"model_usage": []}})
         new_conn.prompt = AsyncMock(return_value=response)
         executor = MagicMock()
 
         def run_async(_operation, **_kwargs):  # noqa: ANN001
             assert agent._conn is new_conn
+            TestTurnModelEvidence._complete(
+                client,
+                "session-1",
+                root_models=("claude-opus-5-5",),
+            )
             return response
 
         executor.run_async.side_effect = run_async
@@ -4757,10 +4855,12 @@ class TestServedModelGate:
         assert state.execution_status == ConversationExecutionStatus.FINISHED
 
     def test_self_report_is_not_authority(self):
+        agent = self._agent()
         response = MagicMock()
         response.field_meta = {"model": "claude-opus-5-5", "quota": {}}
         response.usage = None
-        assert _extract_served_model(response) is None
+        with pytest.raises(ACPSessionModelError, match="served='UNKNOWN'"):
+            agent._verify_served_model_for_turn()
 
 
 # ---------------------------------------------------------------------------
@@ -5030,11 +5130,42 @@ class TestACPSessionIdPersistence:
             agent.init_state(state, on_event=lambda _: None)
 
         _, kwargs = conn.new_session.await_args
-        assert kwargs["claudeCode"] == {"options": {"model": "claude-opus-5-5"}}
+        assert kwargs["claudeCode"] == {
+            "options": {"model": "claude-opus-5-5"},
+            "emitRawSDKMessages": True,
+        }
         conn.set_session_model.assert_not_awaited()
         assert agent._post_turn_model_verification_required is True
         assert agent.current_model_id == "opus"
         assert state.agent_state["acp_current_model_id"] == "opus"
+
+    def test_read_only_selector_session_enables_raw_for_later_exact_switch(
+        self, tmp_path
+    ):
+        agent = _make_agent(
+            acp_command=[
+                "npx",
+                "-y",
+                f"@agentclientprotocol/claude-agent-acp@{CLAUDE_AGENT_ACP_VERSION}",
+            ],
+            acp_server="claude-code",
+            acp_model="opus",
+            acp_permission_policy="read_only",
+        )
+        state = _make_state(tmp_path)
+        conn = _make_config_conn(
+            agent_name="claude-agent-acp",
+            agent_version=CLAUDE_AGENT_ACP_VERSION,
+            options=self._qualified_claude_options(),
+            modes=self._qualified_claude_modes(),
+        )
+
+        with self._mocked_acp_runtime(agent, conn):
+            agent.init_state(state, on_event=lambda _: None)
+
+        _, kwargs = conn.new_session.await_args
+        assert kwargs["claudeCode"]["emitRawSDKMessages"] is True
+        assert agent._post_turn_model_verification_required is False
 
     def test_qualified_claude_exact_model_requires_read_only_before_prompt(
         self, tmp_path
@@ -5122,7 +5253,10 @@ class TestACPSessionIdPersistence:
         conn.new_session.assert_not_awaited()
         conn.set_session_model.assert_not_awaited()
         _, load_kwargs = conn.load_session.await_args
-        assert load_kwargs["claudeCode"] == {"options": {"model": "claude-opus-5-5"}}
+        assert load_kwargs["claudeCode"] == {
+            "options": {"model": "claude-opus-5-5"},
+            "emitRawSDKMessages": True,
+        }
         assert agent._post_turn_model_verification_required is True
         assert agent.current_model_id == "opus"
 
@@ -7159,21 +7293,17 @@ class TestACPAgentAstep:
         agent._client = client
         agent._conn = MagicMock()
         agent._session_id = "test-session"
-        response = TestExtractServedModel._response(
-            [
-                {
-                    "model": "claude-opus-5-4",
-                    "token_count": {
-                        "inputTokens": 10,
-                        "outputTokens": 20,
-                        "cachedInputTokens": 30,
-                        "cachedWriteTokens": 40,
-                    },
-                }
-            ]
-        )
+        response = MagicMock(usage=None, field_meta={"quota": {"model_usage": []}})
 
         async def _fake_prompt(prompt, session_id):  # noqa: ARG001
+            await client.ext_notification(
+                "claude/sdkMessage",
+                TestTurnModelEvidence._user(session_id),
+            )
+            await client.ext_notification(
+                "claude/sdkMessage",
+                TestTurnModelEvidence._assistant(session_id, "claude-opus-5-4"),
+            )
             return response
 
         _agent_conn(agent).prompt = _fake_prompt
@@ -7197,19 +7327,7 @@ class TestACPAgentAstep:
         agent._client = client
         agent._conn = MagicMock()
         agent._session_id = "test-session"
-        response = TestExtractServedModel._response(
-            [
-                {
-                    "model": "claude-opus-5-4",
-                    "token_count": {
-                        "inputTokens": 10,
-                        "outputTokens": 20,
-                        "cachedInputTokens": 30,
-                        "cachedWriteTokens": 40,
-                    },
-                }
-            ]
-        )
+        response = MagicMock(usage=None, field_meta={"quota": {"model_usage": []}})
 
         class _TimeoutDrainPortal:
             def __init__(self) -> None:
@@ -7218,6 +7336,11 @@ class TestACPAgentAstep:
             def start_task_soon(self, function, *args):  # noqa: ANN001
                 if args:
                     return self.prompt_future
+                TestTurnModelEvidence._complete(
+                    client,
+                    "test-session",
+                    root_models=("claude-opus-5-4",),
+                )
                 self.prompt_future.set_result(response)
                 cancel_future: Future = Future()
                 cancel_future.set_result(None)
@@ -7235,6 +7358,53 @@ class TestACPAgentAstep:
         assert conversation.state.execution_status == ConversationExecutionStatus.ERROR
         assert agent._restart_session_on_next_turn is True
         assert any(isinstance(event, ConversationErrorEvent) for event in events)
+
+    def test_astep_cancellation_ignores_late_valid_root_model(self, tmp_path):
+        agent = TestServedModelGate._agent()
+        conversation = self._make_conversation_with_message(tmp_path)
+        client = _OpenHandsACPBridge(permission_policy="read_only")
+        client.get_turn_usage_update = MagicMock(return_value=object())
+        agent._client = client
+        agent._conn = MagicMock()
+        agent._session_id = "test-session"
+        response = MagicMock(usage=None, field_meta=None, stop_reason="cancelled")
+
+        class _CancelPortal:
+            def __init__(self) -> None:
+                self.prompt_future: Future = Future()
+
+            def start_task_soon(self, _function, *args):  # noqa: ANN001
+                if args:
+                    return self.prompt_future
+                # This is provider evidence arriving after cancellation won.
+                # The production cancellation branch must have discarded the
+                # active scope before this callback runs.
+                client._record_raw_sdk_message(
+                    TestTurnModelEvidence._assistant("test-session", "claude-opus-5-5")
+                )
+                self.prompt_future.set_result(response)
+                cancel_future: Future = Future()
+                cancel_future.set_result(None)
+                return cancel_future
+
+        executor = MagicMock()
+        executor.portal = _CancelPortal()
+        agent._executor = executor
+        events: list = []
+
+        async def _run_cancelled() -> None:
+            task = asyncio.create_task(
+                agent.astep(conversation, on_event=events.append)
+            )
+            await asyncio.sleep(0)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        asyncio.run(_run_cancelled())
+
+        assert agent._restart_session_on_next_turn is True
+        assert not any(isinstance(event, ActionEvent) for event in events)
 
     def test_astep_emits_failed_tool_calls_on_cancellation(self, tmp_path):
         from openhands.sdk.utils.async_executor import AsyncExecutor
@@ -7402,22 +7572,9 @@ class TestACPAgentAstep:
         mock_client = _OpenHandsACPBridge(permission_policy="read_only")
         agent._client = mock_client
         agent._session_id = "test-session"
-        response = TestExtractServedModel._response(
-            [
-                {
-                    "model": "claude-opus-5-5",
-                    "token_count": {
-                        "inputTokens": 10,
-                        "outputTokens": 20,
-                        "cachedInputTokens": 30,
-                        "cachedWriteTokens": 40,
-                    },
-                }
-            ]
-        )
 
         prompt_future: Future = Future()
-        prompt_future.set_result(response)
+        prompt_future.set_result(None)
         emitted = []
 
         with conversation.state as state:

@@ -456,8 +456,9 @@ _GEMINI_FILE_SECRETS: tuple[ACPFileSecretSpec, ...] = (
 # ``CODEX_RUNTIME_VERSION``.
 # 0.81.0 is the first adapter version in the selected compatibility window
 # whose Claude Agent SDK dependency supports the exact Claude Opus 5.5 model
-# used by this profile. It also carries per-model turn usage in
-# PromptResponse._meta.quota.model_usage.
+# used by this profile. Its raw SDK-message extension also exposes the
+# provider-owned root assistant model used by the qualified exact-model gate;
+# PromptResponse._meta.quota.model_usage remains usage accounting only.
 CLAUDE_AGENT_ACP_VERSION = "0.81.0"
 CODEX_ACP_VERSION = "1.1.7"
 CODEX_RUNTIME_PACKAGE = "@openai/codex"
@@ -504,7 +505,8 @@ ACP_PROVIDERS: Mapping[str, ACPProviderInfo] = MappingProxyType(
             # ``set_session_model`` extension). The qualified 0.81.0 exact
             # Claude path sends the caller's concrete model in session _meta
             # and deliberately treats the returned config selector as routing
-            # evidence until the turn's model_usage proves what was served.
+            # evidence until the turn's root assistant SDK messages prove what
+            # was served.
             # The capability is still auto-detected from session/new, so this
             # registry flag remains true for non-qualified model requests.
             supports_set_session_model=True,
@@ -872,10 +874,20 @@ def _build_session_meta(
     *,
     acp_model: str | None = None,
     structured_output: StructuredOutputConfig | None = None,
+    emit_raw_sdk_messages: bool = False,
 ) -> dict[str, Any]:
     """Build new-session metadata from the bounded SDK-owned options."""
     model_meta = build_session_model_meta(agent_name, acp_model)
     structured_meta = _build_session_structured_output_meta(
         agent_name, structured_output
     )
-    return _merge_claude_session_meta(model_meta, structured_meta)
+    result = _merge_claude_session_meta(model_meta, structured_meta)
+    if emit_raw_sdk_messages:
+        claude_meta = result.setdefault("claudeCode", {})
+        if not isinstance(claude_meta, dict):
+            raise ValueError("Conflicting claudeCode session metadata")
+        existing = claude_meta.get("emitRawSDKMessages")
+        if existing not in (None, True):
+            raise ValueError("Conflicting raw Claude SDK message setting")
+        claude_meta["emitRawSDKMessages"] = True
+    return result
