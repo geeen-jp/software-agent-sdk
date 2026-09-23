@@ -14,6 +14,7 @@ from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
+from acp.connection import StreamDirection, StreamEvent
 from acp.exceptions import RequestError as ACPRequestError
 from acp.schema import (
     ClientCapabilities,
@@ -4486,6 +4487,68 @@ class TestTurnModelEvidence:
         assert evidence.root_models == ("claude-opus-5-5",)
         assert evidence.invalid_turn_binding is False
         assert "secret" not in repr(evidence)
+
+    def test_sync_stream_observer_extracts_before_prompt_response(self):
+        """Incoming raw evidence is available before async notification dispatch."""
+        client = _OpenHandsACPBridge(permission_policy="read_only")
+        client.attach_raw_sdk_message_observer()
+        client.begin_turn_model_evidence("session-1")
+
+        def observe(params: dict[str, Any]) -> None:
+            client.observe_raw_sdk_message(
+                StreamEvent(
+                    StreamDirection.INCOMING,
+                    {
+                        "jsonrpc": "2.0",
+                        "method": "_claude/sdkMessage",
+                        "params": params,
+                    },
+                )
+            )
+
+        observe(self._user("session-1"))
+        observe(self._assistant("session-1", "claude-opus-5-5"))
+        client.finish_turn_model_evidence("session-1")
+
+        evidence = client.pop_turn_model_evidence()
+        assert evidence is not None
+        assert evidence.root_models == ("claude-opus-5-5",)
+
+    def test_attached_observer_prevents_late_extension_duplicate(self):
+        client = _OpenHandsACPBridge(permission_policy="read_only")
+        client.attach_raw_sdk_message_observer()
+        client.begin_turn_model_evidence("session-1")
+        client.observe_raw_sdk_message(
+            StreamEvent(
+                StreamDirection.INCOMING,
+                {
+                    "jsonrpc": "2.0",
+                    "method": "_claude/sdkMessage",
+                    "params": self._user("session-1"),
+                },
+            )
+        )
+        client.observe_raw_sdk_message(
+            StreamEvent(
+                StreamDirection.INCOMING,
+                {
+                    "jsonrpc": "2.0",
+                    "method": "_claude/sdkMessage",
+                    "params": self._assistant("session-1", "claude-opus-5-5"),
+                },
+            )
+        )
+        asyncio.run(
+            client.ext_notification(
+                "claude/sdkMessage",
+                self._assistant("session-1", "claude-opus-5-5"),
+            )
+        )
+        client.finish_turn_model_evidence("session-1")
+
+        evidence = client.pop_turn_model_evidence()
+        assert evidence is not None
+        assert evidence.root_models == ("claude-opus-5-5",)
 
     def test_tool_loop_accepts_all_root_messages_and_excludes_delegated_model(self):
         client = _OpenHandsACPBridge(permission_policy="read_only")

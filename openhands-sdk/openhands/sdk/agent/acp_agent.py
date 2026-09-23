@@ -34,6 +34,7 @@ from typing import TYPE_CHECKING, Any, Final, Literal, NamedTuple
 from unittest.mock import Mock
 
 from acp.client.connection import ClientSideConnection
+from acp.connection import StreamDirection, StreamEvent
 from acp.exceptions import RequestError as ACPRequestError
 from acp.helpers import image_block, text_block
 from acp.schema import (
@@ -1997,6 +1998,11 @@ class _OpenHandsACPBridge:
         self._model_evidence_invalid_turn_binding = False
         self._completed_model_evidence: _TurnModelEvidence | None = None
         self._model_evidence_lock = threading.Lock()
+        # ``Connection`` observers run synchronously, before an incoming
+        # message is dispatched to the async notification handler.  The
+        # extension callback remains as a compatibility fallback for clients
+        # that invoke it directly, but must not double-record live messages.
+        self._raw_sdk_observer_attached = False
 
     def reset(self) -> None:
         self.accumulated_text.clear()
@@ -2055,6 +2061,29 @@ class _OpenHandsACPBridge:
     def _record_raw_sdk_message(self, params: Mapping[str, Any]) -> None:
         with self._model_evidence_lock:
             self._record_raw_sdk_message_unlocked(params)
+
+    def attach_raw_sdk_message_observer(self) -> None:
+        """Enable the synchronous raw-message path for a live ACP connection."""
+        self._raw_sdk_observer_attached = True
+
+    def observe_raw_sdk_message(self, event: StreamEvent) -> None:
+        """Record Claude raw SDK provenance before ACP dispatch can run.
+
+        ``agent-client-protocol`` invokes synchronous stream observers from
+        ``Connection._receive_loop`` before it resolves a response future or
+        queues a notification for its async dispatcher.  Recording only the
+        minimum provenance fields here closes the response/notification race
+        without retaining the provider's raw message contents.
+        """
+        if event.direction is not StreamDirection.INCOMING:
+            return
+        message = event.message
+        method = message.get("method")
+        if method not in ("claude/sdkMessage", "_claude/sdkMessage"):
+            return
+        params = message.get("params")
+        if isinstance(params, Mapping):
+            self._record_raw_sdk_message(params)
 
     def _root_message_belongs_to_turn(self, message: Mapping[str, Any]) -> bool:
         """Require the provider's current prompt UUID before accepting root data.
@@ -2467,6 +2496,11 @@ class _OpenHandsACPBridge:
         # method names, so 0.81.0 arrives here as ``claude/sdkMessage``. Keep
         # the underscored spelling for direct/provider-shaped clients too.
         if method not in ("claude/sdkMessage", "_claude/sdkMessage"):
+            return
+        # Live ACP connections use the synchronous stream observer above.  A
+        # queued extension notification may arrive after prompt() has already
+        # returned, so consuming it here would be both too late and a duplicate.
+        if self._raw_sdk_observer_attached:
             return
         if isinstance(params, Mapping):
             self._record_raw_sdk_message(params)
@@ -3706,10 +3740,15 @@ class ACPAgent(AgentBase):
                     _filter_jsonrpc_lines(process.stdout, filtered_reader)
                 )
 
+                # Install a public ACP stream observer.  It sees incoming
+                # raw SDK messages synchronously, before response futures are
+                # completed and before extension notifications are dispatched.
+                client.attach_raw_sdk_message_observer()
                 conn = ClientSideConnection(
                     client,
                     process.stdin,  # write to subprocess
                     filtered_reader,  # read filtered output
+                    observers=[client.observe_raw_sdk_message],
                 )
 
                 # Track subprocess handles early so partial-init cleanup can
