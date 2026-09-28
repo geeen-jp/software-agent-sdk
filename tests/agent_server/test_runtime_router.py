@@ -107,3 +107,49 @@ def test_runtime_readiness_uses_explicit_provider_source_roots(
         "claude-oauth": True,
         "codex-chatgpt": True,
     }
+
+
+def test_runtime_readiness_accepts_claude_oauth_token(tmp_path, monkeypatch):
+    _, codex_root = _write_provider_sources(tmp_path)
+    monkeypatch.delenv("OPENHANDS_CLAUDE_CREDENTIALS_SOURCE", raising=False)
+    monkeypatch.setenv("OPENHANDS_CODEX_AUTH_SOURCE", str(codex_root))
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "claude-token-value")
+    monkeypatch.setattr(
+        runtime_router_module,
+        "get_secrets_store",
+        lambda config: _EmptySecrets(),
+    )
+    client = TestClient(create_app(Config(session_api_keys=["runtime-key"])))
+
+    response = client.get(
+        "/api/runtime/readiness",
+        headers={"X-Session-API-Key": "runtime-key"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "ready"
+    assert payload["providers"]["claude-oauth"] is True
+    assert "claude-token-value" not in response.text
+
+
+def test_runtime_readiness_rejects_blank_claude_oauth_token(tmp_path, monkeypatch):
+    _, codex_root = _write_provider_sources(tmp_path)
+    monkeypatch.delenv("OPENHANDS_CLAUDE_CREDENTIALS_SOURCE", raising=False)
+    monkeypatch.setenv("OPENHANDS_CODEX_AUTH_SOURCE", str(codex_root))
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "  ")
+    monkeypatch.setattr(
+        runtime_router_module,
+        "get_secrets_store",
+        lambda config: _EmptySecrets(),
+    )
+    client = TestClient(create_app(Config(session_api_keys=["runtime-key"])))
+
+    response = client.get(
+        "/api/runtime/readiness",
+        headers={"X-Session-API-Key": "runtime-key"},
+    )
+
+    payload = response.json()
+    assert payload["status"] == "not_ready"
+    assert payload["providers"]["claude-oauth"] is False

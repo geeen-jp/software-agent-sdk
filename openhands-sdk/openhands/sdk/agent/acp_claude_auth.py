@@ -82,6 +82,18 @@ def claude_oauth_source_digest(credentials: str) -> str:
     return hashlib.sha256(credentials.encode("utf-8")).hexdigest()
 
 
+def claude_oauth_token_in_env(environ: Mapping[str, str] | None = None) -> bool:
+    """True when a long-lived ``CLAUDE_CODE_OAUTH_TOKEN`` is available.
+
+    Such a token takes precedence over the host credential file: copying the
+    host file lets isolated sessions rotate its refresh token and invalidates
+    the host's interactive login.
+    """
+    env = os.environ if environ is None else environ
+    token = env.get(CLAUDE_OAUTH_TOKEN_ENV)
+    return isinstance(token, str) and bool(token.strip())
+
+
 def claude_oauth_source_root(
     *,
     source_root: Path | None = None,

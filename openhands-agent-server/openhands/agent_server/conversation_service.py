@@ -51,6 +51,7 @@ from openhands.sdk import LLM, AgentContext, Event, Message
 from openhands.sdk.agent import ACPAgent
 from openhands.sdk.agent.acp_claude_auth import (
     CLAUDE_CREDENTIALS_SECRET_NAME,
+    claude_oauth_token_in_env,
     is_valid_claude_oauth_credentials,
     resolve_claude_oauth_credentials,
 )
@@ -946,7 +947,9 @@ class ConversationService:
             )
             candidate = self._secret_value(context_secret)
         if not is_valid_claude_oauth_credentials(candidate):
-            if not allow_host_source:
+            # A CLAUDE_CODE_OAUTH_TOKEN channel must not be shadowed by a copy
+            # of the host login, whose refresh token isolated sessions rotate.
+            if not allow_host_source or claude_oauth_token_in_env():
                 return False
             try:
                 candidate = resolve_claude_oauth_credentials(SecretRegistry())
