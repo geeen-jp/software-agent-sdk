@@ -217,6 +217,7 @@ def seed_claude_oauth_credentials(
     environ: Mapping[str, str] | None = None,
     last_source_digest: str | None = None,
     explicit_credentials: str | None = None,
+    oauth_token_available: bool = False,
 ) -> ClaudeOAuthSeedResult:
     """Copy Claude OAuth state into an isolated config directory when available.
 
@@ -228,6 +229,11 @@ def seed_claude_oauth_credentials(
     sessions can keep using isolated config plus environment authentication.
     Explicit registry/supplied credentials replace a pre-existing isolated
     copy; an unchanged source leaves runtime-rotated tokens in place.
+
+    When *oauth_token_available* is True (``CLAUDE_CODE_OAUTH_TOKEN`` is set)
+    and no explicit credentials are supplied, the host credential file is not
+    copied. Claude rotates refresh tokens on use, so a copy that refreshes in
+    isolation invalidates the host's interactive login.
     """
     data_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     target = data_dir / CLAUDE_CREDENTIALS_FILENAME
@@ -248,6 +254,14 @@ def seed_claude_oauth_credentials(
             track_claude_oauth_credentials_for_masking(secret_registry, existing)
         logger.info("Claude OAuth credentials are present in the isolated config")
         return ClaudeOAuthSeedResult(True, digest)
+
+    if oauth_token_available:
+        unlink_claude_oauth_credentials(data_dir)
+        logger.info(
+            "Claude OAuth token is set; not copying host OAuth credentials "
+            "into the isolated config"
+        )
+        return ClaudeOAuthSeedResult(False, last_source_digest)
 
     if existing is not None and not replace_existing:
         track_claude_oauth_credentials_for_masking(secret_registry, existing)

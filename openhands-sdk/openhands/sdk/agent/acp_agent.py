@@ -3048,6 +3048,18 @@ class ACPAgent(AgentBase):
                 return value
         return None
 
+    def _claude_oauth_token_available(self, env: Mapping[str, str]) -> bool:
+        token = env.get(CLAUDE_OAUTH_TOKEN_ENV)
+        if token is None and self.agent_context and self.agent_context.secrets:
+            secret = self.agent_context.secrets.get(CLAUDE_OAUTH_TOKEN_ENV)
+            if secret is not None:
+                token = (
+                    secret.get_value()
+                    if isinstance(secret, SecretSource)
+                    else str(secret)
+                )
+        return isinstance(token, str) and bool(token.strip())
+
     def _isolate_acp_data_dir(
         self, state: ConversationState, env: dict[str, str]
     ) -> bool:
@@ -3077,6 +3089,7 @@ class ACPAgent(AgentBase):
                         explicit_credentials=self._explicit_claude_oauth_credentials(
                             state
                         ),
+                        oauth_token_available=self._claude_oauth_token_available(env),
                     )
                 except BaseException:
                     self._cleanup_claude_config_runtime(discard=True)

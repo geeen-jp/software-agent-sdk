@@ -906,3 +906,110 @@ def test_oauth_token_without_isolate_still_strips_payg(tmp_path: Path) -> None:
     assert "ANTHROPIC_API_KEY" not in captured
     assert "ANTHROPIC_BASE_URL" not in captured
     assert "CLAUDE_CONFIG_DIR" not in captured
+
+
+def _write_host_oauth(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, refresh: str = "host"
+) -> Path:
+    source_root = tmp_path / "home" / ".claude"
+    source_root.mkdir(parents=True)
+    source = source_root / CLAUDE_CREDENTIALS_FILENAME
+    source.write_text(_oauth_payload(refresh), encoding="utf-8")
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    monkeypatch.setattr(
+        "openhands.sdk.agent.acp_claude_auth.Path.home",
+        classmethod(lambda cls: tmp_path / "home"),
+    )
+    return source
+
+
+def test_seed_with_oauth_token_does_not_copy_host_credentials(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = _write_host_oauth(tmp_path, monkeypatch)
+    before = source.read_text()
+    isolated = tmp_path / "claude-code"
+    result = seed_claude_oauth_credentials(
+        isolated, SecretRegistry(), required=True, oauth_token_available=True
+    )
+    assert result.seeded is False
+    assert isolated.is_dir()
+    assert not (isolated / CLAUDE_CREDENTIALS_FILENAME).exists()
+    assert source.read_text() == before
+
+
+def test_seed_with_oauth_token_removes_previous_host_copy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_host_oauth(tmp_path, monkeypatch)
+    isolated = tmp_path / "claude-code"
+    assert seed_claude_oauth_credentials(isolated, SecretRegistry()).seeded
+    result = seed_claude_oauth_credentials(
+        isolated, SecretRegistry(), oauth_token_available=True
+    )
+    assert result.seeded is False
+    assert not (isolated / CLAUDE_CREDENTIALS_FILENAME).exists()
+
+
+def test_seed_explicit_credentials_win_over_oauth_token(tmp_path: Path) -> None:
+    registry = SecretRegistry()
+    registry.update_secrets(
+        {CLAUDE_CREDENTIALS_SECRET_NAME: _oauth_payload("explicit")}
+    )
+    isolated = tmp_path / "claude-code"
+    result = seed_claude_oauth_credentials(
+        isolated, registry, oauth_token_available=True
+    )
+    assert result.seeded is True
+    seeded = json.loads((isolated / CLAUDE_CREDENTIALS_FILENAME).read_text())
+    assert seeded["claudeAiOauth"]["refreshToken"] == "explicit"
+
+
+def test_oauth_token_start_does_not_copy_host_credentials(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = _write_host_oauth(tmp_path, monkeypatch)
+    before = source.read_text()
+    agent = ACPAgent(
+        acp_command=["npx", "-y", "@agentclientprotocol/claude-agent-acp"],
+        acp_isolate_data_dir=True,
+        acp_env={
+            CLAUDE_OAUTH_TOKEN_ENV: "claude-sub-token",
+            "ANTHROPIC_API_KEY": "sk-payg",
+        },
+    )
+    captured = _capture_start_env(agent, tmp_path)
+    assert captured[CLAUDE_OAUTH_TOKEN_ENV] == "claude-sub-token"
+    assert "ANTHROPIC_API_KEY" not in captured
+    isolated = Path(captured["CLAUDE_CONFIG_DIR"])
+    assert not (isolated / CLAUDE_CREDENTIALS_FILENAME).exists()
+    assert source.read_text() == before
+
+
+def test_read_only_isolate_with_oauth_token_skips_host_credentials(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from openhands.sdk.conversation.state import ConversationState
+    from openhands.sdk.workspace.local import LocalWorkspace
+
+    source = _write_host_oauth(tmp_path, monkeypatch)
+    before = source.read_text()
+    agent = ACPAgent(
+        acp_command=["npx", "-y", "@agentclientprotocol/claude-agent-acp"],
+        acp_isolate_data_dir=True,
+        acp_permission_policy="read_only",
+    )
+    state = ConversationState.create(
+        id=uuid.uuid4(),
+        agent=agent,
+        workspace=LocalWorkspace(working_dir=str(tmp_path / "workspace")),
+        persistence_dir=str(tmp_path / "persist"),
+    )
+    env = {CLAUDE_OAUTH_TOKEN_ENV: "claude-sub-token"}
+    try:
+        assert agent._isolate_acp_data_dir(state, env) is False
+        isolated = Path(env["CLAUDE_CONFIG_DIR"])
+        assert not (isolated / CLAUDE_CREDENTIALS_FILENAME).exists()
+        assert source.read_text() == before
+    finally:
+        agent._cleanup_claude_config_runtime(discard=True)
