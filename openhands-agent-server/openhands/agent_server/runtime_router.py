@@ -16,6 +16,7 @@ from openhands.sdk.agent.acp_claude_auth import (
     CLAUDE_CREDENTIALS_FILENAME,
     CLAUDE_CREDENTIALS_SECRET_NAME,
     CLAUDE_OAUTH_SOURCE_ROOT_ENV,
+    claude_oauth_token_in_env,
     is_valid_claude_oauth_credentials,
 )
 from openhands.sdk.agent.acp_file_credentials import (
@@ -69,7 +70,9 @@ def _provider_readiness(config: Config) -> tuple[dict[str, bool], list[str]]:
             CLAUDE_OAUTH_SOURCE_ROOT_ENV,
             CLAUDE_CREDENTIALS_FILENAME,
         )
-    providers["claude-oauth"] = is_valid_claude_oauth_credentials(claude)
+    providers["claude-oauth"] = (
+        is_valid_claude_oauth_credentials(claude) or claude_oauth_token_in_env()
+    )
     if not providers["claude-oauth"]:
         failures.append("claude-oauth credential source is unavailable")
 

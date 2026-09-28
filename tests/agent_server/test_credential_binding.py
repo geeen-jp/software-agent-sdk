@@ -1434,3 +1434,63 @@ async def test_failed_canonical_preflight_preserves_legacy_auth_file(tmp_path) -
             )
 
         assert legacy_auth_file.read_text(encoding="utf-8") == "only-legacy-copy"
+
+
+@pytest.mark.asyncio
+async def test_claude_oauth_token_skips_host_credential_import(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "claude-token-value")
+    store = FileSecretsStore(tmp_path / "settings")
+    request = StartConversationRequest(
+        agent=ACPAgent(
+            acp_command=["claude-agent-acp"],
+            acp_server="claude-code",
+            acp_isolate_data_dir=True,
+        ),
+        workspace=LocalWorkspace(working_dir=tmp_path / "workspace"),
+    )
+
+    async with ConversationService(
+        conversations_dir=tmp_path / "conversations",
+        secrets_store=store,
+    ) as service:
+        with patch(
+            "openhands.agent_server.conversation_service.resolve_claude_oauth_credentials",
+            side_effect=AssertionError("host Claude login must not be imported"),
+        ):
+            info, _ = await service.start_conversation(request)
+            event_service = await service.get_event_service(info.id)
+        assert event_service is not None
+        assert CLAUDE_CREDENTIALS_SECRET_NAME not in event_service.credential_bindings
+    assert store.get_secret(CLAUDE_CREDENTIALS_SECRET_NAME) is None
+
+
+@pytest.mark.asyncio
+async def test_explicit_claude_credentials_still_bind_with_oauth_token(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "claude-token-value")
+    store = FileSecretsStore(tmp_path / "settings")
+    request = StartConversationRequest(
+        agent=ACPAgent(
+            acp_command=["claude-agent-acp"],
+            acp_server="claude-code",
+            acp_isolate_data_dir=True,
+        ),
+        workspace=LocalWorkspace(working_dir=tmp_path / "workspace"),
+        secrets={
+            CLAUDE_CREDENTIALS_SECRET_NAME: StaticSecret(
+                value=SecretStr(_claude_oauth())
+            )
+        },
+    )
+
+    async with ConversationService(
+        conversations_dir=tmp_path / "conversations",
+        secrets_store=store,
+    ) as service:
+        info, _ = await service.start_conversation(request)
+        event_service = await service.get_event_service(info.id)
+        assert event_service is not None
+        assert CLAUDE_CREDENTIALS_SECRET_NAME in event_service.credential_bindings
