@@ -68,6 +68,7 @@ class TestACPProviderInfo:
         models = {model.id: model.label for model in info.available_models}
         assert models["opus[1m]"] == "Claude Opus (1M)"
         assert models["claude-opus-5"] == "Claude Opus 5"
+        assert models["claude-sonnet-5-5"] == "Claude Sonnet 5.5"
         assert models["sonnet"] == "Claude Sonnet"
         assert models["haiku"] == "Claude Haiku"
         # Pinned binary exposed by the agent-server image wrappers.

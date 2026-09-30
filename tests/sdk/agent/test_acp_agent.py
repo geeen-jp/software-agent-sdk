@@ -132,6 +132,12 @@ async def _verified_set_session_model(
     return SetSessionModelResponse(field_meta={"current_model_id": model_id})
 
 
+_CLAUDE_EXACT_MODEL_CASES = (
+    pytest.param("claude-opus-5-5", "opus", "claude-opus-5-4", id="opus-5-5"),
+    pytest.param("claude-sonnet-5-5", "sonnet", "claude-sonnet-5", id="sonnet-5-5"),
+)
+
+
 # ---------------------------------------------------------------------------
 # Instantiation
 # ---------------------------------------------------------------------------
@@ -3886,8 +3892,13 @@ class TestACPPromptRetry:
         assert isinstance(events[0].action, FinishAction)
         assert "Success after server error retry" in events[0].action.message
 
-    def test_qualified_retry_accepts_only_second_turn_attempt_evidence(self, tmp_path):
-        agent = TestServedModelGate._agent()
+    @pytest.mark.parametrize(
+        ("model", "selector", "other_generation"), _CLAUDE_EXACT_MODEL_CASES
+    )
+    def test_qualified_retry_accepts_only_second_turn_attempt_evidence(
+        self, tmp_path, model, selector, other_generation
+    ):
+        agent = TestServedModelGate._agent(model=model, selector=selector)
         conversation = self._make_conversation_with_message(tmp_path)
         events: list = []
         client = _OpenHandsACPBridge(permission_policy="read_only")
@@ -3901,13 +3912,13 @@ class TestACPPromptRetry:
             nonlocal call_count
             call_count += 1
             if call_count == 1:
-                agent._served_model_id = "claude-opus-5-4"
+                agent._served_model_id = other_generation
                 raise ConnectionError("transient transport failure")
             client.accumulated_text.append("retry success")
             TestTurnModelEvidence._complete(
                 client,
                 "test-session",
-                root_models=("claude-opus-5-5",),
+                root_models=(model,),
             )
             return response
 
@@ -3919,13 +3930,18 @@ class TestACPPromptRetry:
             agent.step(conversation, on_event=events.append)
 
         assert call_count == 2
-        assert agent._served_model_id == "claude-opus-5-5"
+        assert agent._served_model_id == model
         assert (
             conversation.state.execution_status == ConversationExecutionStatus.FINISHED
         )
 
-    def test_qualified_repeated_turn_requires_fresh_evidence(self, tmp_path):
-        agent = TestServedModelGate._agent()
+    @pytest.mark.parametrize(
+        ("model", "selector", "_other_generation"), _CLAUDE_EXACT_MODEL_CASES
+    )
+    def test_qualified_repeated_turn_requires_fresh_evidence(
+        self, tmp_path, model, selector, _other_generation
+    ):
+        agent = TestServedModelGate._agent(model=model, selector=selector)
         conversation = self._make_conversation_with_message(tmp_path)
         client = _OpenHandsACPBridge(permission_policy="read_only")
         agent._client = client
@@ -3941,7 +3957,7 @@ class TestACPPromptRetry:
                 TestTurnModelEvidence._complete(
                     client,
                     "test-session",
-                    root_models=("claude-opus-5-5",),
+                    root_models=(model,),
                 )
             return response
 
@@ -4156,7 +4172,12 @@ class TestSetACPModel:
         assert agent.llm.model == "gpt-5.5"
         assert agent.current_model_id == "gpt-5.5"
 
-    def test_qualified_claude_switch_rebinds_next_turn_provenance(self):
+    @pytest.mark.parametrize(
+        ("model", "selector", "other_generation"), _CLAUDE_EXACT_MODEL_CASES
+    )
+    def test_qualified_claude_switch_rebinds_next_turn_provenance(
+        self, model, selector, other_generation
+    ):
         from acp.schema import SetSessionConfigOptionResponse
 
         agent = self._wire(
@@ -4168,7 +4189,7 @@ class TestSetACPModel:
         _agent_conn(agent).set_config_option = AsyncMock(
             return_value=SetSessionConfigOptionResponse(
                 config_options=[
-                    _config_option("model", "opus", ["opus", "sonnet"]),
+                    _config_option("model", selector, ["default", "opus", "sonnet"]),
                     _config_option(
                         "reasoning_effort",
                         "medium",
@@ -4177,31 +4198,31 @@ class TestSetACPModel:
                 ]
             )
         )
-        effective = agent.set_acp_model("claude-opus-5-5")
+        effective = agent.set_acp_model(model)
 
-        assert effective == "opus"
-        assert agent.current_model_id == "opus"
-        assert agent._selector_model_id == "opus"
-        assert agent.llm.model == "claude-opus-5-5"
-        assert agent._requested_model_id == "claude-opus-5-5"
+        assert effective == selector
+        assert agent.current_model_id == selector
+        assert agent._selector_model_id == selector
+        assert agent.llm.model == model
+        assert agent._requested_model_id == model
         assert agent._post_turn_model_verification_required is True
         assert agent._served_model_id is None
 
         TestTurnModelEvidence._complete(
             agent._client,
             "sess-1",
-            root_models=("claude-opus-5-4",),
+            root_models=(other_generation,),
         )
-        with pytest.raises(ACPSessionModelError, match="served=.*claude-opus-5-4"):
+        with pytest.raises(ACPSessionModelError, match=f"served=.*{other_generation}"):
             agent._verify_served_model_for_turn()
 
         TestTurnModelEvidence._complete(
             agent._client,
             "sess-1",
-            root_models=("claude-opus-5-5",),
+            root_models=(model,),
         )
         agent._verify_served_model_for_turn()
-        assert agent._served_model_id == "claude-opus-5-5"
+        assert agent._served_model_id == model
 
     def test_qualified_claude_switch_rejects_writable_session(self):
         agent = self._wire(
@@ -4895,7 +4916,11 @@ class TestTurnModelEvidence:
 
 class TestServedModelGate:
     @staticmethod
-    def _agent(**kwargs) -> ACPAgent:
+    def _agent(
+        model: str = "claude-opus-5-5",
+        selector: str = "opus",
+        **kwargs,
+    ) -> ACPAgent:
         agent = _make_agent(
             acp_command=[
                 "npx",
@@ -4903,26 +4928,34 @@ class TestServedModelGate:
                 f"@agentclientprotocol/claude-agent-acp@{CLAUDE_AGENT_ACP_VERSION}",
             ],
             acp_server="claude-code",
-            acp_model="claude-opus-5-5",
+            acp_model=model,
             acp_permission_policy="read_only",
             **kwargs,
         )
         agent._post_turn_model_verification_required = True
-        agent._current_model_id = "opus"
-        agent._selector_model_id = "opus"
+        agent._current_model_id = selector
+        agent._selector_model_id = selector
         agent._session_id = "session-1"
         agent._client = _OpenHandsACPBridge(permission_policy="read_only")
         return agent
 
-    def test_exact_match_passes_after_alias_selector(self):
-        agent = self._agent()
+    @pytest.mark.parametrize(
+        ("model", "selector"),
+        [
+            ("claude-opus-5-5", "opus"),
+            ("claude-sonnet-5-5", "sonnet"),
+            ("claude-sonnet-5-5", "default"),
+        ],
+    )
+    def test_exact_match_passes_after_provider_selector(self, model, selector):
+        agent = self._agent(model=model, selector=selector)
         TestTurnModelEvidence._complete(
             agent._client,
             "session-1",
-            root_models=("claude-opus-5-5",),
+            root_models=(model,),
         )
         agent._verify_served_model_for_turn()
-        assert agent._served_model_id == "claude-opus-5-5"
+        assert agent._served_model_id == model
 
     def test_passing_turn_publishes_model_and_failed_next_turn_restores_selector(
         self, tmp_path
@@ -4970,22 +5003,30 @@ class TestServedModelGate:
         agent._verify_served_model_for_turn()
         assert agent._served_model_id == "claude-opus-5-5"
 
-    def test_mismatch_fails_closed(self):
-        agent = self._agent()
+    @pytest.mark.parametrize(
+        ("model", "selector", "other_generation"), _CLAUDE_EXACT_MODEL_CASES
+    )
+    def test_mismatch_fails_closed(self, model, selector, other_generation):
+        agent = self._agent(model=model, selector=selector)
         TestTurnModelEvidence._complete(
             agent._client,
             "session-1",
-            root_models=("claude-opus-5-4",),
+            root_models=(other_generation,),
         )
-        with pytest.raises(ACPSessionModelError, match="served=.*claude-opus-5-4"):
+        with pytest.raises(ACPSessionModelError, match=f"served=.*{other_generation}"):
             agent._verify_served_model_for_turn()
 
-    def test_conflicting_root_models_fail_closed(self):
-        agent = self._agent()
+    @pytest.mark.parametrize(
+        ("model", "selector", "other_generation"), _CLAUDE_EXACT_MODEL_CASES
+    )
+    def test_conflicting_root_models_fail_closed(
+        self, model, selector, other_generation
+    ):
+        agent = self._agent(model=model, selector=selector)
         TestTurnModelEvidence._complete(
             agent._client,
             "session-1",
-            root_models=("claude-opus-5-5", "claude-sonnet-5"),
+            root_models=(model, other_generation),
         )
         with pytest.raises(ACPSessionModelError, match="root_models"):
             agent._verify_served_model_for_turn()
@@ -5006,9 +5047,14 @@ class TestServedModelGate:
         with pytest.raises(ACPSessionModelError, match="served='UNKNOWN'"):
             agent._verify_served_model_for_turn()
 
-    def test_stale_served_evidence_is_not_reused(self):
-        agent = self._agent()
-        agent._served_model_id = "claude-opus-5-5"
+    @pytest.mark.parametrize(
+        ("model", "selector", "_other_generation"), _CLAUDE_EXACT_MODEL_CASES
+    )
+    def test_stale_served_evidence_is_not_reused(
+        self, model, selector, _other_generation
+    ):
+        agent = self._agent(model=model, selector=selector)
+        agent._served_model_id = model
         with pytest.raises(ACPSessionModelError, match="served='UNKNOWN'"):
             agent._verify_served_model_for_turn()
         assert agent._served_model_id is None
@@ -5030,8 +5076,13 @@ class TestServedModelGate:
             agent._verify_served_model_for_turn()
         assert agent.current_model_id == "opus"
 
-    def test_step_accepts_provider_shaped_turn_only_after_model_gate(self, tmp_path):
-        agent = self._agent()
+    @pytest.mark.parametrize(
+        ("model", "selector", "_other_generation"), _CLAUDE_EXACT_MODEL_CASES
+    )
+    def test_step_accepts_provider_shaped_turn_only_after_model_gate(
+        self, tmp_path, model, selector, _other_generation
+    ):
+        agent = self._agent(model=model, selector=selector)
         state = _make_state(tmp_path)
         state.events.append(
             MessageEvent(
@@ -5054,7 +5105,7 @@ class TestServedModelGate:
             TestTurnModelEvidence._complete(
                 client,
                 "session-1",
-                root_models=("claude-opus-5-5",),
+                root_models=(model,),
             )
             return response
 
@@ -5066,8 +5117,8 @@ class TestServedModelGate:
 
         assert state.execution_status == ConversationExecutionStatus.FINISHED
         assert any(isinstance(event, ActionEvent) for event in events)
-        assert agent.current_model_id == "claude-opus-5-5"
-        assert state.agent_state["acp_current_model_id"] == "claude-opus-5-5"
+        assert agent.current_model_id == model
+        assert state.agent_state["acp_current_model_id"] == model
 
     def test_step_restarts_flagged_session_before_prompt(self, tmp_path):
         agent = self._agent()
@@ -5358,14 +5409,25 @@ class TestACPSessionIdPersistence:
         )
 
     @staticmethod
-    def _qualified_claude_options() -> list[SessionConfigOption]:
+    def _qualified_claude_options(
+        selector: str = "default",
+    ) -> list[SessionConfigOption]:
         return [
-            _config_option("model", "opus", ["default", "opus", "sonnet"]),
+            _config_option("model", selector, ["default", "opus", "sonnet"]),
             _config_option("mode", "default", ["default", "plan", "bypassPermissions"]),
             _config_option("effort", "low", ["low", "medium", "high"]),
         ]
 
-    def test_qualified_claude_exact_model_defers_to_same_turn_evidence(self, tmp_path):
+    @pytest.mark.parametrize(
+        ("model", "selector"),
+        [
+            ("claude-opus-5-5", "default"),
+            ("claude-sonnet-5-5", "default"),
+        ],
+    )
+    def test_qualified_claude_exact_model_defers_to_same_turn_evidence(
+        self, tmp_path, model, selector
+    ):
         agent = _make_agent(
             acp_command=[
                 "npx",
@@ -5373,12 +5435,12 @@ class TestACPSessionIdPersistence:
                 f"@agentclientprotocol/claude-agent-acp@{CLAUDE_AGENT_ACP_VERSION}",
             ],
             acp_server="claude-code",
-            acp_model="claude-opus-5-5",
+            acp_model=model,
             acp_config_options={"effort": "medium"},
             acp_permission_policy="read_only",
         )
         state = _make_state(tmp_path)
-        options = self._qualified_claude_options()
+        options = self._qualified_claude_options(selector)
         conn = _make_config_conn(
             agent_name="claude-agent-acp",
             agent_version=CLAUDE_AGENT_ACP_VERSION,
@@ -5391,16 +5453,23 @@ class TestACPSessionIdPersistence:
 
         _, kwargs = conn.new_session.await_args
         assert kwargs["claudeCode"] == {
-            "options": {"model": "claude-opus-5-5"},
+            "options": {"model": model},
             "emitRawSDKMessages": True,
         }
         conn.set_session_model.assert_not_awaited()
         assert agent._post_turn_model_verification_required is True
-        assert agent.current_model_id == "opus"
-        assert state.agent_state["acp_current_model_id"] == "opus"
+        assert agent.current_model_id == selector
+        assert state.agent_state["acp_current_model_id"] == selector
 
+    @pytest.mark.parametrize(
+        ("model", "selector"),
+        [
+            ("claude-opus-5-5", "default"),
+            ("claude-sonnet-5-5", "default"),
+        ],
+    )
     def test_resume_preserves_historical_verified_model_until_fresh_turn(
-        self, tmp_path
+        self, tmp_path, model, selector
     ):
         agent = _make_agent(
             acp_command=[
@@ -5409,33 +5478,59 @@ class TestACPSessionIdPersistence:
                 f"@agentclientprotocol/claude-agent-acp@{CLAUDE_AGENT_ACP_VERSION}",
             ],
             acp_server="claude-code",
-            acp_model="claude-opus-5-5",
+            acp_model=model,
             acp_config_options={"effort": "medium"},
             acp_permission_policy="read_only",
         )
         state = _make_state(tmp_path)
         state.agent_state = {
             "acp_session_id": "sess-old",
-            "acp_current_model_id": "claude-opus-5-5",
+            "acp_current_model_id": model,
         }
         conn = _make_config_conn(
             agent_name="claude-agent-acp",
             agent_version=CLAUDE_AGENT_ACP_VERSION,
             session_id="sess-old",
-            options=self._qualified_claude_options(),
+            options=self._qualified_claude_options(selector),
             modes=self._qualified_claude_modes(),
         )
 
         with self._mocked_acp_runtime(agent, conn):
             agent.init_state(state, on_event=lambda _: None)
 
-        assert agent.current_model_id == "claude-opus-5-5"
-        assert agent._selector_model_id == "opus"
-        assert state.agent_state["acp_current_model_id"] == "claude-opus-5-5"
+        assert agent.current_model_id == model
+        assert agent._selector_model_id == selector
+        assert state.agent_state["acp_current_model_id"] == model
 
         agent._reset_client_for_turn(None, lambda _: None, [], state=state)
-        assert agent.current_model_id == "opus"
-        assert state.agent_state["acp_current_model_id"] == "opus"
+        assert agent.current_model_id == selector
+        assert state.agent_state["acp_current_model_id"] == selector
+
+    def test_claude_sonnet_alias_does_not_publish_exact_identity(self, tmp_path):
+        agent = _make_agent(
+            acp_command=[
+                "npx",
+                "-y",
+                f"@agentclientprotocol/claude-agent-acp@{CLAUDE_AGENT_ACP_VERSION}",
+            ],
+            acp_server="claude-code",
+            acp_model="sonnet",
+            acp_permission_policy="read_only",
+        )
+        state = _make_state(tmp_path)
+        conn = _make_config_conn(
+            agent_name="claude-agent-acp",
+            agent_version=CLAUDE_AGENT_ACP_VERSION,
+            options=self._qualified_claude_options("sonnet"),
+            modes=self._qualified_claude_modes(),
+        )
+
+        with self._mocked_acp_runtime(agent, conn):
+            agent.init_state(state, on_event=lambda _: None)
+
+        assert agent.current_model_id == "sonnet"
+        assert agent._post_turn_model_verification_required is False
+        assert agent._served_model_id is None
 
     def test_read_only_selector_session_enables_raw_for_later_exact_switch(
         self, tmp_path
@@ -5518,8 +5613,9 @@ class TestACPSessionIdPersistence:
         conn.prompt.assert_not_called()
         assert agent._initialized is False
 
+    @pytest.mark.parametrize("model", ["claude-opus-5-5", "claude-sonnet-5-5"])
     def test_qualified_claude_exact_model_resumes_without_reusing_selector_as_proof(
-        self, tmp_path
+        self, tmp_path, model
     ):
         agent = _make_agent(
             acp_command=[
@@ -5528,7 +5624,7 @@ class TestACPSessionIdPersistence:
                 f"@agentclientprotocol/claude-agent-acp@{CLAUDE_AGENT_ACP_VERSION}",
             ],
             acp_server="claude-code",
-            acp_model="claude-opus-5-5",
+            acp_model=model,
             acp_permission_policy="read_only",
         )
         state = _make_state(tmp_path)
@@ -5552,11 +5648,11 @@ class TestACPSessionIdPersistence:
         conn.set_session_model.assert_not_awaited()
         _, load_kwargs = conn.load_session.await_args
         assert load_kwargs["claudeCode"] == {
-            "options": {"model": "claude-opus-5-5"},
+            "options": {"model": model},
             "emitRawSDKMessages": True,
         }
         assert agent._post_turn_model_verification_required is True
-        assert agent.current_model_id == "opus"
+        assert agent.current_model_id == "default"
 
     def test_init_state_writes_session_id_into_agent_state(self, tmp_path):
         """init_state lands the session id in state.agent_state so
@@ -7580,10 +7676,15 @@ class TestACPAgentAstep:
             conversation.state.execution_status == ConversationExecutionStatus.FINISHED
         )
 
-    def test_astep_model_gate_runs_before_successful_turn_event(self, tmp_path):
+    @pytest.mark.parametrize(
+        ("model", "selector", "other_generation"), _CLAUDE_EXACT_MODEL_CASES
+    )
+    def test_astep_model_gate_runs_before_successful_turn_event(
+        self, tmp_path, model, selector, other_generation
+    ):
         from openhands.sdk.utils.async_executor import AsyncExecutor
 
-        agent = TestServedModelGate._agent()
+        agent = TestServedModelGate._agent(model=model, selector=selector)
         conversation = self._make_conversation_with_message(tmp_path)
         client = _OpenHandsACPBridge(permission_policy="read_only")
         client.get_turn_usage_update = MagicMock(return_value=object())
@@ -7600,7 +7701,7 @@ class TestACPAgentAstep:
             )
             await client.ext_notification(
                 "claude/sdkMessage",
-                TestTurnModelEvidence._assistant(session_id, "claude-opus-5-4"),
+                TestTurnModelEvidence._assistant(session_id, other_generation),
             )
             return response
 
@@ -7609,7 +7710,9 @@ class TestACPAgentAstep:
         events: list = []
         try:
             agent._executor = executor
-            with pytest.raises(ACPSessionModelError, match="served=.*claude-opus-5-4"):
+            with pytest.raises(
+                ACPSessionModelError, match=f"served=.*{other_generation}"
+            ):
                 asyncio.run(agent.astep(conversation, on_event=events.append))
         finally:
             executor.close()
@@ -7657,8 +7760,13 @@ class TestACPAgentAstep:
         assert agent._restart_session_on_next_turn is True
         assert any(isinstance(event, ConversationErrorEvent) for event in events)
 
-    def test_astep_cancellation_ignores_late_valid_root_model(self, tmp_path):
-        agent = TestServedModelGate._agent()
+    @pytest.mark.parametrize(
+        ("model", "selector", "_other_generation"), _CLAUDE_EXACT_MODEL_CASES
+    )
+    def test_astep_cancellation_ignores_late_valid_root_model(
+        self, tmp_path, model, selector, _other_generation
+    ):
+        agent = TestServedModelGate._agent(model=model, selector=selector)
         conversation = self._make_conversation_with_message(tmp_path)
         client = _OpenHandsACPBridge(permission_policy="read_only")
         client.get_turn_usage_update = MagicMock(return_value=object())
@@ -7678,7 +7786,7 @@ class TestACPAgentAstep:
                 # The production cancellation branch must have discarded the
                 # active scope before this callback runs.
                 client._record_raw_sdk_message(
-                    TestTurnModelEvidence._assistant("test-session", "claude-opus-5-5")
+                    TestTurnModelEvidence._assistant("test-session", model)
                 )
                 self.prompt_future.set_result(response)
                 cancel_future: Future = Future()

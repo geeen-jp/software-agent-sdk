@@ -931,12 +931,13 @@ def test_read_only_claude_uses_complete_mode_config_without_update(tmp_path) -> 
     )
 
 
+@pytest.mark.parametrize("model", ["claude-opus-5-5", "claude-sonnet-5-5"])
 def test_read_only_claude_model_and_effort_keep_mode_proof_independent(
-    tmp_path,
+    tmp_path, model: str
 ) -> None:
     agent = ACPAgent(
         acp_command=_CLAUDE_COMMAND,
-        acp_model="claude-opus-5-5",
+        acp_model=model,
         acp_permission_policy="read_only",
         acp_config_options={"effort": "medium"},
     )
@@ -953,12 +954,14 @@ def test_read_only_claude_model_and_effort_keep_mode_proof_independent(
             _select_config_option(
                 "model",
                 "default",
-                ["default", "claude-opus-5-5"],
+                ["default", "opus", "sonnet"],
             ),
             _select_config_option("effort", "low", ["low", "medium", "high"]),
         ],
     )
 
+    _, session_kwargs = conn.new_session.await_args
+    assert session_kwargs["claudeCode"]["options"]["model"] == model
     conn.set_session_model.assert_not_awaited()
     assert [call.kwargs for call in conn.set_config_option.await_args_list] == [
         {
@@ -967,6 +970,32 @@ def test_read_only_claude_model_and_effort_keep_mode_proof_independent(
             "value": "medium",
         }
     ]
+
+
+@pytest.mark.parametrize("model", ["claude-opus-5-5", "claude-sonnet-5-5"])
+@pytest.mark.asyncio
+async def test_read_only_exact_claude_profile_denies_write_permission(
+    model: str,
+) -> None:
+    agent = ACPAgent(
+        acp_command=_CLAUDE_COMMAND,
+        acp_model=model,
+        acp_permission_policy="read_only",
+    )
+    bridge = _OpenHandsACPBridge(permission_policy=agent.acp_permission_policy)
+    response = await bridge.request_permission(
+        [
+            PermissionOption(kind="allow_once", name="Allow", option_id="allow_once"),
+            PermissionOption(
+                kind="reject_once", name="Reject", option_id="reject_once"
+            ),
+        ],
+        "session-1",
+        {"kind": "write", "path": "/workspace/probe.txt"},
+    )
+
+    assert isinstance(response.outcome, AllowedOutcome)
+    assert response.outcome.option_id == "reject_once"
 
 
 @pytest.mark.parametrize("adapter_version", [None, "0.64.0"])
