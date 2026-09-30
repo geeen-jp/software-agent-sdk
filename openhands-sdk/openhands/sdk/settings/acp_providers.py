@@ -352,15 +352,18 @@ class ACPProviderInfo:
 # ``acp_model`` outside these lists is always allowed.
 # ---------------------------------------------------------------------------
 
-# Suggestions for the Claude model picker. Short selectors mirror the
-# ``model`` configOptions values reported at ``session/new``; explicit full IDs
-# are available through the runtime's custom-model path.
+# Model IDs the Claude Code CLI accepts, mirroring the ``model`` configOptions
+# select claude-agent-acp reports at ``session/new`` (the short aliases the CLI's
+# own ``/model`` menu offers, switched via ``set_config_option``).
 # ``opus[1m]`` is the SDK-documented version-agnostic 1M-context alias and the
 # CLI's own default (``currentValue``); ``default`` is the CLI's recommended tier
-# for the account. ``claude-opus-5`` and ``claude-sonnet-5-5`` are explicit
-# full model pins for users who want those generations rather than an alias.
-# The ``/model`` menu is dynamic/account-dependent, so these are pre-session
-# suggestions, not ground truth; live options and user access remain authoritative.
+# for the account. ``claude-opus-5`` is the explicit full model pin for users who
+# want Opus 5 rather than the provider-dependent alias; ``claude-sonnet-5-5`` is
+# the explicit full model pin for Sonnet 5.5. The ``/model`` menu is
+# dynamic/account-dependent and the CLI validates ``set_config_option(model)``
+# against the live select — it rejects an absent id (e.g. ``sonnet`` on accounts
+# without it), so these are pre-session suggestions, not ground truth; a rejected
+# id degrades to the server default.
 _CLAUDE_MODELS: tuple[ACPModelOption, ...] = (
     ACPModelOption(id="default", label="Default (recommended)"),
     ACPModelOption(id="opus[1m]", label="Claude Opus (1M)"),

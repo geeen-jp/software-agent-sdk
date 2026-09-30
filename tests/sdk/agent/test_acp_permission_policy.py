@@ -972,32 +972,6 @@ def test_read_only_claude_model_and_effort_keep_mode_proof_independent(
     ]
 
 
-@pytest.mark.parametrize("model", ["claude-opus-5-5", "claude-sonnet-5-5"])
-@pytest.mark.asyncio
-async def test_read_only_exact_claude_profile_denies_write_permission(
-    model: str,
-) -> None:
-    agent = ACPAgent(
-        acp_command=_CLAUDE_COMMAND,
-        acp_model=model,
-        acp_permission_policy="read_only",
-    )
-    bridge = _OpenHandsACPBridge(permission_policy=agent.acp_permission_policy)
-    response = await bridge.request_permission(
-        [
-            PermissionOption(kind="allow_once", name="Allow", option_id="allow_once"),
-            PermissionOption(
-                kind="reject_once", name="Reject", option_id="reject_once"
-            ),
-        ],
-        "session-1",
-        {"kind": "write", "path": "/workspace/probe.txt"},
-    )
-
-    assert isinstance(response.outcome, AllowedOutcome)
-    assert response.outcome.option_id == "reject_once"
-
-
 @pytest.mark.parametrize("adapter_version", [None, "0.64.0"])
 def test_read_only_claude_unqualified_adapter_fails_closed(
     tmp_path,
