@@ -358,7 +358,8 @@ class ACPProviderInfo:
 # ``opus[1m]`` is the SDK-documented version-agnostic 1M-context alias and the
 # CLI's own default (``currentValue``); ``default`` is the CLI's recommended tier
 # for the account. ``claude-opus-5`` is the explicit full model pin for users who
-# want Opus 5 rather than the provider-dependent alias. The ``/model`` menu is
+# want Opus 5 rather than the provider-dependent alias; ``claude-sonnet-5-5`` is
+# the explicit full model pin for Sonnet 5.5. The ``/model`` menu is
 # dynamic/account-dependent and the CLI validates ``set_config_option(model)``
 # against the live select — it rejects an absent id (e.g. ``sonnet`` on accounts
 # without it), so these are pre-session suggestions, not ground truth; a rejected
@@ -367,6 +368,7 @@ _CLAUDE_MODELS: tuple[ACPModelOption, ...] = (
     ACPModelOption(id="default", label="Default (recommended)"),
     ACPModelOption(id="opus[1m]", label="Claude Opus (1M)"),
     ACPModelOption(id="claude-opus-5", label="Claude Opus 5"),
+    ACPModelOption(id="claude-sonnet-5-5", label="Claude Sonnet 5.5"),
     ACPModelOption(id="sonnet", label="Claude Sonnet"),
     ACPModelOption(id="haiku", label="Claude Haiku"),
 )
@@ -455,8 +457,8 @@ _GEMINI_FILE_SECRETS: tuple[ACPFileSecretSpec, ...] = (
 # points ``CODEX_PATH`` at that binary. Do not treat ``agentInfo.version`` as
 # ``CODEX_RUNTIME_VERSION``.
 # 0.81.0 is the first adapter version in the selected compatibility window
-# whose Claude Agent SDK dependency supports the exact Claude Opus 5.5 model
-# used by this profile. Its raw SDK-message extension also exposes the
+# whose Claude Agent SDK dependency supports the exact Claude 5.5 model IDs
+# used by these profiles. Its raw SDK-message extension also exposes the
 # provider-owned root assistant model used by the qualified exact-model gate;
 # PromptResponse._meta.quota.model_usage remains usage accounting only.
 CLAUDE_AGENT_ACP_VERSION = "0.81.0"
