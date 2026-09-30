@@ -6832,28 +6832,50 @@ class TestACPSessionConfigOptions:
         )
         conn.set_config_option.assert_not_called()
 
-    def test_claude_fresh_session_sends_structured_output_meta(self, tmp_path):
+    @pytest.mark.parametrize("model", ["claude-opus-5-5", "claude-sonnet-5-5"])
+    def test_claude_fresh_session_sends_structured_output_meta(self, tmp_path, model):
         config = _structured_output_config()
         agent = _make_agent(
+            acp_command=[
+                "npx",
+                "-y",
+                f"@agentclientprotocol/claude-agent-acp@{CLAUDE_AGENT_ACP_VERSION}",
+            ],
             acp_server="claude-code",
+            acp_model=model,
+            acp_config_options={"effort": "medium"},
+            acp_permission_policy="read_only",
             structured_output=config,
         )
         state = _make_state(tmp_path)
-        conn = _make_config_conn(agent_name="claude-agent-acp")
+        conn = _make_config_conn(
+            agent_name="claude-agent-acp",
+            agent_version=CLAUDE_AGENT_ACP_VERSION,
+            options=TestACPSessionIdPersistence._qualified_claude_options(),
+            modes=TestACPSessionIdPersistence._qualified_claude_modes(),
+        )
 
-        TestACPSessionIdPersistence._patched_start_acp_server(agent, state, conn=conn)
+        with TestACPSessionIdPersistence._mocked_acp_runtime(agent, conn):
+            agent.init_state(state, on_event=lambda _: None)
 
         conn.new_session.assert_awaited_once_with(
             cwd=str(tmp_path),
             mcp_servers=[],
             claudeCode={
                 "options": {
+                    "model": model,
                     "outputFormat": {
                         "type": "json_schema",
                         "schema": config.schema,
-                    }
-                }
+                    },
+                },
+                "emitRawSDKMessages": True,
             },
+        )
+        conn.set_config_option.assert_awaited_once_with(
+            config_id="effort",
+            session_id="sess-new",
+            value="medium",
         )
 
     def test_claude_resumed_session_preserves_structured_output_meta(self, tmp_path):
@@ -6887,14 +6909,22 @@ class TestACPSessionConfigOptions:
         )
         conn.new_session.assert_not_awaited()
 
+    @pytest.mark.parametrize("model", ["claude-opus-5-5", "claude-sonnet-5-5"])
     def test_claude_resumed_session_combines_structured_output_and_model(
-        self, tmp_path
+        self, tmp_path, model
     ):
         """Load carries output metadata and the requested model intent."""
         config = _structured_output_config()
         agent = _make_agent(
+            acp_command=[
+                "npx",
+                "-y",
+                f"@agentclientprotocol/claude-agent-acp@{CLAUDE_AGENT_ACP_VERSION}",
+            ],
             acp_server="claude-code",
-            acp_model="opus",
+            acp_model=model,
+            acp_config_options={"effort": "medium"},
+            acp_permission_policy="read_only",
             structured_output=config,
         )
         state = _make_state(tmp_path)
@@ -6903,9 +6933,15 @@ class TestACPSessionConfigOptions:
             "acp_session_id": "stored-sess",
             "acp_session_cwd": str(tmp_path),
         }
-        conn = _make_config_conn(agent_name="claude-agent-acp")
+        conn = _make_config_conn(
+            agent_name="claude-agent-acp",
+            agent_version=CLAUDE_AGENT_ACP_VERSION,
+            options=TestACPSessionIdPersistence._qualified_claude_options(),
+            modes=TestACPSessionIdPersistence._qualified_claude_modes(),
+        )
 
-        TestACPSessionIdPersistence._patched_start_acp_server(agent, state, conn=conn)
+        with TestACPSessionIdPersistence._mocked_acp_runtime(agent, conn):
+            agent.init_state(state, on_event=lambda _: None)
 
         conn.load_session.assert_awaited_once_with(
             cwd=str(tmp_path),
@@ -6913,18 +6949,20 @@ class TestACPSessionConfigOptions:
             mcp_servers=[],
             claudeCode={
                 "options": {
-                    "model": "opus",
+                    "model": model,
                     "outputFormat": {
                         "type": "json_schema",
                         "schema": config.schema,
                     },
-                }
+                },
+                "emitRawSDKMessages": True,
             },
         )
         conn.new_session.assert_not_awaited()
-        conn.set_session_model.assert_awaited_once_with(
-            model_id="opus",
+        conn.set_config_option.assert_awaited_once_with(
+            config_id="effort",
             session_id="stored-sess",
+            value="medium",
         )
 
     def test_missing_option_fails_init_state_and_cleans_up(self, tmp_path):
