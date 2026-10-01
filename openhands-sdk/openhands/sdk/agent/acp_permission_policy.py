@@ -95,7 +95,7 @@ def initial_agent_mode_env_for_policy(
 ) -> dict[str, str]:
     """Env that makes Codex advertise the verified read_only mode at session/new.
 
-    pinned codex-acp 1.1.7 applies ``set_session_mode`` in-memory and does not
+    pinned codex-acp 2.1.0 applies ``set_session_mode`` in-memory and does not
     emit ``current_mode_update``. ``INITIAL_AGENT_MODE`` is the adapter's
     documented initial-mode contract, so session/new can advertise
     ``current_mode_id=read-only`` for the existing advertise+confirm check.

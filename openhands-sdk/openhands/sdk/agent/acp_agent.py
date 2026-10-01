@@ -900,7 +900,7 @@ def _verify_read_only_mode_after_config(
 ) -> None:
     """Fail closed if session configuration replaced the verified read_only mode.
 
-    Codex ACP 1.1.7 updates ``agentMode`` in memory and exposes it as config
+    Codex ACP 2.1.0 updates ``agentMode`` in memory and exposes it as config
     option ``mode``; it does not emit ``current_mode_update``. Cursor likewise
     keeps the confirmed ``ask`` mode effective while updating model-dependent
     options without emitting a second mode notification. Those providers may
