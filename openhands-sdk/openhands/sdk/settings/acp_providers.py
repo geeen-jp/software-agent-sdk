@@ -376,9 +376,12 @@ _CLAUDE_MODELS: tuple[ACPModelOption, ...] = (
 # Bare preset ids advertised by the Codex app server through
 # ``@agentclientprotocol/codex-acp``. The reasoning-effort tier is a
 # separate ``reasoning_effort`` configOption, not part of the model id, so it is
-# not encoded here. GPT-5.6 variants are rollout/account-dependent suggestions;
-# the adapter's live model list remains authoritative.
+# not encoded here. GPT-6/GPT-5.6 variants are rollout/account-dependent
+# suggestions; the adapter's live model list remains authoritative (the pinned
+# Codex runtime rejects ids it does not list).
 _CODEX_MODELS: tuple[ACPModelOption, ...] = (
+    ACPModelOption(id="gpt-6.1-sol", label="GPT-6.1 Sol"),
+    ACPModelOption(id="gpt-6-luna", label="GPT-6 Luna"),
     ACPModelOption(id="gpt-5.6", label="GPT-5.6"),
     ACPModelOption(id="gpt-5.6-sol", label="GPT-5.6 Sol"),
     ACPModelOption(id="gpt-5.6-terra", label="GPT-5.6 Terra"),
@@ -452,7 +455,7 @@ _GEMINI_FILE_SECRETS: tuple[ACPFileSecretSpec, ...] = (
 # ``configOptions`` entry (and retain the legacy ``session/set_model``
 # extension); the SDK detects which mechanism each session advertises.
 #
-# Codex adapter 1.1.7 depends on ``@openai/codex ^0.145.0``. The adapter pin
+# Codex adapter 2.1.0 depends on ``@openai/codex ^0.159.1``. The adapter pin
 # is not a Codex runtime pin; Docker installs the exact runtime package and
 # points ``CODEX_PATH`` at that binary. Do not treat ``agentInfo.version`` as
 # ``CODEX_RUNTIME_VERSION``.
@@ -462,9 +465,9 @@ _GEMINI_FILE_SECRETS: tuple[ACPFileSecretSpec, ...] = (
 # provider-owned root assistant model used by the qualified exact-model gate;
 # PromptResponse._meta.quota.model_usage remains usage accounting only.
 CLAUDE_AGENT_ACP_VERSION = "0.81.0"
-CODEX_ACP_VERSION = "1.1.7"
+CODEX_ACP_VERSION = "2.1.0"
 CODEX_RUNTIME_PACKAGE = "@openai/codex"
-CODEX_RUNTIME_VERSION = "0.145.0"
+CODEX_RUNTIME_VERSION = "0.159.3"
 GEMINI_CLI_VERSION = "0.46.0"
 
 
@@ -625,7 +628,7 @@ def resolve_acp_package_version(
 ) -> str | None:
     """Adapter package version from a launch ``@version`` token or known binary.
 
-    ``npx .../codex-acp@1.1.7`` carries the pin in the command. The production
+    ``npx .../codex-acp@2.1.0`` carries the pin in the command. The production
     Docker wrapper is the bare ``codex-acp`` binary, which has no ``@version``
     token; that path reports the registry adapter pin, not ``agentInfo.version``.
     """

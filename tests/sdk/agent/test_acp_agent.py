@@ -3476,14 +3476,14 @@ def test_classify_acp_init_error_maps_auth_selection_failure():
 
 def test_startup_failure_logs_provider_and_runtime_identity(tmp_path, caplog):
     agent = ACPAgent(
-        acp_command=["npx", "-y", "@agentclientprotocol/codex-acp@1.1.7"],
+        acp_command=["npx", "-y", "@agentclientprotocol/codex-acp@2.1.0"],
         acp_server="codex",
         acp_isolate_data_dir=True,
     )
     state = _make_state(tmp_path)
     conn = TestACPSessionIdPersistence._make_conn()
     conn.initialize.return_value.agent_info.name = "codex-acp"
-    conn.initialize.return_value.agent_info.version = "1.1.7-adapter"
+    conn.initialize.return_value.agent_info.version = "2.1.0-adapter"
     conn.initialize.return_value.auth_methods = [
         TestSelectAuthMethod._make_auth_method("chat-gpt")
     ]
@@ -3497,10 +3497,10 @@ def test_startup_failure_logs_provider_and_runtime_identity(tmp_path, caplog):
 
     record = next(r for r in caplog.records if r.getMessage() == "ACP startup failed")
     assert record.provider_key == "codex"
-    assert record.package_version == "1.1.7"
+    assert record.package_version == "2.1.0"
     assert record.adapter_name == "codex-acp"
-    assert record.adapter_version == "1.1.7-adapter"
-    assert record.runtime_version == "0.145.0"
+    assert record.adapter_version == "2.1.0-adapter"
+    assert record.runtime_version == "0.159.3"
     assert record.runtime_version != record.adapter_version
     assert record.rpc == "authenticate"
     assert record.stage == "select"
@@ -3529,7 +3529,7 @@ def test_startup_failure_before_initialize_reports_command_provider(tmp_path, ca
     assert record.package_version == "9.9.9"
     assert record.adapter_name is None
     assert record.adapter_version is None
-    assert record.runtime_version == "0.145.0"
+    assert record.runtime_version == "0.159.3"
     assert record.rpc is None
     assert record.stage == "spawn"
     assert record.phase == "spawn"

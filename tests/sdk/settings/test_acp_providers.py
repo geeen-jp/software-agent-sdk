@@ -90,6 +90,8 @@ class TestACPProviderInfo:
         assert info.supports_runtime_model_switch is True
         assert info.session_meta_key is None
         assert info.default_model == "gpt-5.5"
+        assert any(m.id == "gpt-6.1-sol" for m in info.available_models)
+        assert any(m.id == "gpt-6-luna" for m in info.available_models)
         assert any(m.id == "gpt-5.6" for m in info.available_models)
         assert any(m.id == "gpt-5.6-sol" for m in info.available_models)
         assert any(m.id == "gpt-5.6-terra" for m in info.available_models)
@@ -246,8 +248,8 @@ class TestDetectACPProviderByCommand:
 
 class TestStartupProviderResolution:
     def test_extract_acp_package_version_from_pinned_command(self):
-        command = ("npx", "-y", "@agentclientprotocol/codex-acp@1.1.7")
-        assert extract_acp_package_version(command) == "1.1.7"
+        command = ("npx", "-y", "@agentclientprotocol/codex-acp@2.1.0")
+        assert extract_acp_package_version(command) == "2.1.0"
 
     def test_extract_acp_package_version_absent_for_unpinned_binary(self):
         assert extract_acp_package_version(("codex-acp",)) is None
@@ -353,8 +355,8 @@ class TestProviderRegistryConsistency:
         )
         assert ts_providers["codex"]["runtime_package"] == CODEX_RUNTIME_PACKAGE
         assert ts_providers["codex"]["runtime_version"] == CODEX_RUNTIME_VERSION
-        assert CODEX_ACP_VERSION == "1.1.7"
-        assert CODEX_RUNTIME_VERSION == "0.145.0"
+        assert CODEX_ACP_VERSION == "2.1.0"
+        assert CODEX_RUNTIME_VERSION == "0.159.3"
 
 
 class TestProviderModelLists:
