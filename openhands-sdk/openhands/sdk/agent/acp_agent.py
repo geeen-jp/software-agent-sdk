@@ -76,6 +76,9 @@ from openhands.sdk.agent.acp_claude_auth import (
     track_claude_oauth_credentials_from_file,
     unlink_claude_oauth_credentials,
 )
+from openhands.sdk.agent.acp_codex_output_schema import (
+    build_codex_output_schema_env,
+)
 from openhands.sdk.agent.acp_file_credentials import (
     ACPFileCredentialLifecycle,
     codex_auth_file_is_chatgpt,
@@ -127,6 +130,7 @@ from openhands.sdk.settings.acp_providers import (
     resolve_acp_runtime_version,
     resolve_effective_acp_provider_key,
     validate_claude_structured_output_schema,
+    validate_codex_structured_output_schema,
 )
 from openhands.sdk.settings.structured_output import StructuredOutputConfig
 from openhands.sdk.tool import Tool  # noqa: TC002
@@ -2624,8 +2628,9 @@ class ACPAgent(AgentBase):
         default=None,
         exclude_if=lambda value: value is None,
         description=(
-            "Provider-neutral structured-output configuration. The current "
-            "implementation maps JSON Schema to Claude ACP session metadata."
+            "Provider-neutral structured-output configuration. JSON Schema is "
+            "mapped to Claude ACP session metadata, or attached to every Codex "
+            "turn/start through a repository-owned CODEX_PATH proxy."
         ),
     )
     acp_client_capabilities: ClientCapabilities | None = Field(
@@ -2699,12 +2704,16 @@ class ACPAgent(AgentBase):
                 acp_server=self.acp_server,
                 command=self.acp_command,
             )
-            if configured_provider != "claude-code":
+            if configured_provider == "claude-code":
+                validate_claude_structured_output_schema(self.structured_output.schema)
+            elif configured_provider == "codex":
+                validate_codex_structured_output_schema(self.structured_output.schema)
+            else:
                 raise ValueError(
                     "structured_output is unsupported for ACP provider "
-                    f"{configured_provider!r}; only Claude ACP is qualified"
+                    f"{configured_provider!r}; only Claude and Codex ACP are "
+                    "qualified"
                 )
-            validate_claude_structured_output_schema(self.structured_output.schema)
         # Propagate the actual model name to the sentinel LLM and its
         # metrics so that logs, serialized state, and cost/token entries
         # show the real model instead of the "acp-managed" placeholder.
@@ -3727,6 +3736,13 @@ class ACPAgent(AgentBase):
                 mode_id=preflight_mode,
             )
         )
+
+        if self.structured_output is not None and (
+            self._startup_provider_key == "codex"
+        ):
+            env.update(
+                build_codex_output_schema_env(self.structured_output.schema, env)
+            )
 
         command = self.acp_command[0]
         args = list(self.acp_command[1:]) + list(self.acp_args)

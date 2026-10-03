@@ -51,6 +51,24 @@ class ACPStructuredOutputCompatibilityError(ValueError):
 _CLAUDE_UNSUPPORTED_TOP_LEVEL_COMBINATORS = ("oneOf", "anyOf", "allOf")
 
 
+def _validate_root_object_schema(
+    schema: Mapping[str, Any], provider_label: str
+) -> None:
+    for keyword in _CLAUDE_UNSUPPORTED_TOP_LEVEL_COMBINATORS:
+        if keyword in schema:
+            raise ACPStructuredOutputCompatibilityError(
+                f"{provider_label} ACP structured output does not support top-level "
+                f"{keyword!r}; no generic semantics-preserving projection is "
+                "available"
+            )
+
+    if schema.get("type") != "object":
+        raise ACPStructuredOutputCompatibilityError(
+            f"{provider_label} ACP structured output requires a top-level JSON "
+            "Schema object with type='object'"
+        )
+
+
 def validate_claude_structured_output_schema(
     schema: Mapping[str, Any],
 ) -> None:
@@ -68,19 +86,22 @@ def validate_claude_structured_output_schema(
     caller's schema remains the semantic authority and the qualified provider
     currently accepts the nested features unchanged.
     """
-    for keyword in _CLAUDE_UNSUPPORTED_TOP_LEVEL_COMBINATORS:
-        if keyword in schema:
-            raise ACPStructuredOutputCompatibilityError(
-                "Claude ACP structured output does not support top-level "
-                f"{keyword!r}; no generic semantics-preserving projection is "
-                "available"
-            )
+    _validate_root_object_schema(schema, "Claude")
 
-    if schema.get("type") != "object":
-        raise ACPStructuredOutputCompatibilityError(
-            "Claude ACP structured output requires a top-level JSON Schema "
-            "object with type='object'"
-        )
+
+def validate_codex_structured_output_schema(
+    schema: Mapping[str, Any],
+) -> None:
+    """Validate the qualified root boundary of Codex ACP structured output.
+
+    Only the root shape is qualified: a root object without root-level
+    oneOf/anyOf/allOf (the OpenAI structured-output root rule, live-qualified
+    with a neutral root-object schema). Nested $ref/$defs, additionalProperties,
+    required, enum, const and conditionals are unqualified: they are passed to
+    the App Server unchanged and a rejection surfaces as a deterministic turn
+    failure, never as a prompt-only downgrade.
+    """
+    _validate_root_object_schema(schema, "Codex")
 
 
 @dataclass(frozen=True)
@@ -768,26 +789,31 @@ def build_session_model_meta(agent_name: str, acp_model: str | None) -> dict[str
     return {provider.session_meta_key: {"options": {"model": acp_model}}}
 
 
+_STRUCTURED_OUTPUT_PROVIDER_KEYS = ("claude-code", "codex")
+
+
 def _build_session_structured_output_meta(
     agent_name: str,
     structured_output: StructuredOutputConfig | None,
 ) -> dict[str, Any]:
     """Build the qualified provider metadata for structured output.
 
+    Codex has no session-level mapping: outputSchema is a turn/start input,
+    so it returns no metadata after validating the schema.
+
     Claude ACP 0.81.0 forwards ``claudeCode.options`` to the pinned Claude
     Agent SDK 0.3.280, whose ``Options.outputFormat`` accepts the JSON Schema
     shape.
-    No other provider mapping is inferred here; unsupported providers fail
-    closed before ``session/new`` or ``session/load`` is called.
     """
     if structured_output is None:
         return {}
 
     provider = detect_acp_provider_by_agent_name(agent_name)
-    if provider is None or provider.key != "claude-code":
+    if provider is None or provider.key not in _STRUCTURED_OUTPUT_PROVIDER_KEYS:
         raise ValueError(
             "ACP structured_output is unsupported for provider "
-            f"{agent_name!r}; only the qualified Claude ACP mapping is available"
+            f"{agent_name!r}; only the qualified Claude and Codex ACP mappings "
+            "are available"
         )
     if structured_output.mode != "json_schema":
         raise ValueError(
@@ -801,6 +827,9 @@ def _build_session_structured_output_meta(
         mode=structured_output.mode,
         schema=copy.deepcopy(structured_output.schema),
     ).schema
+    if provider.key == "codex":
+        validate_codex_structured_output_schema(schema)
+        return {}
     validate_claude_structured_output_schema(schema)
     return {
         "claudeCode": {

@@ -346,7 +346,13 @@ class TestProviderRegistryConsistency:
         )
         assert f"@agentclientprotocol/codex-acp@{CODEX_ACP_VERSION}" in dockerfile
         assert f"{CODEX_RUNTIME_PACKAGE}@{CODEX_RUNTIME_VERSION}" in dockerfile
-        assert 'export CODEX_PATH="%s/bin/codex"' in dockerfile
+        assert 'export CODEX_PATH="${OH_CODEX_BRIDGE_PATH:-%s/bin/codex}"' in (
+            dockerfile
+        )
+        assert (
+            'export OH_CODEX_RUNTIME_PATH="${OH_CODEX_RUNTIME_PATH:-%s/bin/codex}"'
+            in dockerfile
+        )
         assert f"@google/gemini-cli@{GEMINI_CLI_VERSION}" in dockerfile
 
         ts_providers = json.loads(_TS_ACP_PROVIDERS.read_text(encoding="utf-8"))
@@ -515,7 +521,7 @@ class TestStructuredOutputSessionMeta:
             "json_schema"
         )
 
-    @pytest.mark.parametrize("agent_name", ["codex-acp", "gemini-cli", "custom"])
+    @pytest.mark.parametrize("agent_name", ["gemini-cli", "custom"])
     def test_unsupported_provider_fails_closed(self, agent_name):
         with pytest.raises(ValueError, match="unsupported"):
             _build_session_structured_output_meta(agent_name, self._config())
@@ -644,3 +650,39 @@ class TestACPFileSecrets:
                 ACPFileSecretSpec(
                     secret_name="X", filename="x.json", env_var="X", subdir=bad
                 )
+
+
+_CODEX_SCHEMA = {"type": "object", "properties": {"verdict": {"type": "string"}}}
+
+
+class TestCodexStructuredOutput:
+    def test_codex_session_metadata_carries_no_schema(self):
+        config = StructuredOutputConfig(mode="json_schema", schema=_CODEX_SCHEMA)
+
+        assert _build_session_structured_output_meta("codex-acp", config) == {}
+        assert (
+            _build_session_meta(
+                "codex-acp", acp_model="gpt-6.1-sol", structured_output=config
+            )
+            == {}
+        )
+
+    @pytest.mark.parametrize("keyword", ["oneOf", "anyOf", "allOf"])
+    def test_codex_top_level_composition_fails_closed(self, keyword):
+        config = StructuredOutputConfig(
+            mode="json_schema",
+            schema={"type": "object", keyword: [{"type": "object"}]},
+        )
+
+        with pytest.raises(
+            ACPStructuredOutputCompatibilityError,
+            match=rf"Codex ACP structured output does not support top-level "
+            rf"'{keyword}'",
+        ):
+            _build_session_structured_output_meta("codex-acp", config)
+
+    def test_codex_non_object_root_fails_closed(self):
+        config = StructuredOutputConfig(mode="json_schema", schema={"type": "array"})
+
+        with pytest.raises(ACPStructuredOutputCompatibilityError, match="Codex ACP"):
+            _build_session_structured_output_meta("codex-acp", config)
