@@ -1976,6 +1976,9 @@ class _OpenHandsACPBridge:
             permission_policy
         )
         self.accumulated_text: list[str] = []
+        # Codex constrains only the last agent message.
+        self.final_message_only = False
+        self._last_message_id: str | None = None
         self.accumulated_thoughts: list[str] = []
         self.accumulated_tool_calls: list[dict[str, Any]] = []
         self.trace = ACPTurnTrace(acp_server=None, model_id=None)
@@ -2037,6 +2040,7 @@ class _OpenHandsACPBridge:
 
     def reset(self, session_id: str | None = None) -> None:
         self.accumulated_text.clear()
+        self._last_message_id = None
         self.accumulated_thoughts.clear()
         self.accumulated_tool_calls.clear()
         self.on_token = None
@@ -2301,6 +2305,16 @@ class _OpenHandsACPBridge:
 
     # -- Client protocol methods ------------------------------------------
 
+    def _begin_message(self, update: AgentMessageChunk) -> None:
+        if not self.final_message_only:
+            return
+        message_id = update.message_id
+        if message_id is None:
+            return
+        if self._last_message_id not in (None, message_id):
+            self.accumulated_text.clear()
+        self._last_message_id = message_id
+
     async def session_update(
         self,
         session_id: str,
@@ -2322,6 +2336,7 @@ class _OpenHandsACPBridge:
         if isinstance(update, AgentMessageChunk):
             if isinstance(update.content, TextContentBlock):
                 text = self._mask_value(update.content.text)
+                self._begin_message(update)
                 self.accumulated_text.append(text)
                 if self.on_token is not None:
                     try:
@@ -3664,6 +3679,9 @@ class ACPAgent(AgentBase):
             self.acp_config_options,
         )
         client = _OpenHandsACPBridge(permission_policy=self.acp_permission_policy)
+        client.final_message_only = (
+            self.structured_output is not None and self._startup_provider_key == "codex"
+        )
         self._client = client
         self._secret_registry_for_masking = state.secret_registry
         client.mask = state.secret_registry.mask_secrets_in_output

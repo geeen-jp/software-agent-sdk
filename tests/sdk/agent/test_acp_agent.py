@@ -17,6 +17,7 @@ import pytest
 from acp.connection import StreamDirection, StreamEvent
 from acp.exceptions import RequestError as ACPRequestError
 from acp.schema import (
+    AgentMessageChunk,
     ClientCapabilities,
     ConfigOptionUpdate,
     LoadSessionResponse,
@@ -29,6 +30,7 @@ from acp.schema import (
     SessionModelState,
     SessionModeState,
     SetSessionConfigOptionResponse,
+    TextContentBlock,
 )
 from pydantic import ValidationError
 
@@ -106,6 +108,14 @@ def _structured_output_config() -> StructuredOutputConfig:
             "properties": {"result": {"type": "string"}},
             "required": ["result"],
         },
+    )
+
+
+def _message_chunk(text: str, message_id: str | None) -> AgentMessageChunk:
+    return AgentMessageChunk(
+        content=TextContentBlock(text=text, type="text"),
+        message_id=message_id,
+        session_update="agent_message_chunk",
     )
 
 
@@ -690,6 +700,43 @@ class TestOpenHandsACPClient:
         assert client.accumulated_text == []
         assert client.accumulated_thoughts == []
         assert client.on_token is None
+
+    @pytest.mark.asyncio
+    async def test_final_message_only_keeps_last_agent_message(self):
+        client = _OpenHandsACPBridge()
+        client.final_message_only = True
+
+        await client.session_update("sess-1", _message_chunk("commentary", "m1"))
+        await client.session_update("sess-1", _message_chunk('{"result":', "m2"))
+        await client.session_update("sess-1", _message_chunk('"ok"}', "m2"))
+
+        assert "".join(client.accumulated_text) == '{"result":"ok"}'
+
+        client.reset()
+        assert client.accumulated_text == []
+        assert client._last_message_id is None
+
+        await client.session_update("sess-1", _message_chunk("new turn", "m3"))
+        assert "".join(client.accumulated_text) == "new turn"
+
+    @pytest.mark.parametrize(
+        ("final_message_only", "message_ids"),
+        [
+            (False, ["m1", "m2"]),
+            (True, [None, None]),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_agent_message_chunks_concatenate_by_default(
+        self, final_message_only, message_ids
+    ):
+        client = _OpenHandsACPBridge()
+        client.final_message_only = final_message_only
+
+        for text, message_id in zip(("first", " second"), message_ids):
+            await client.session_update("sess-1", _message_chunk(text, message_id))
+
+        assert "".join(client.accumulated_text) == "first second"
 
     @pytest.mark.asyncio
     async def test_session_update_accumulates_text(self):
@@ -6293,6 +6340,7 @@ class TestACPEnvConflictSuppression:
         assert env["OH_CODEX_RUNTIME_PATH"] == "/opt/node/bin/codex"
         assert json.loads(env["OH_CODEX_OUTPUT_SCHEMA"]) == config.schema
         assert env["CODEX_HOME"] == "/h"
+        assert agent._client.final_message_only is True
 
     def test_codex_without_structured_output_keeps_codex_path(self, tmp_path):
         agent = ACPAgent(acp_command=["codex-acp"], acp_server="codex")
@@ -6302,6 +6350,7 @@ class TestACPEnvConflictSuppression:
 
         assert env["CODEX_PATH"] == "/opt/node/bin/codex"
         assert not [name for name in env if name.startswith("OH_CODEX_")]
+        assert agent._client.final_message_only is False
 
     def test_codex_structured_output_session_new_sends_no_schema_meta(self, tmp_path):
         agent = ACPAgent(
