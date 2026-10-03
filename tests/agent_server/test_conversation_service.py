@@ -3283,6 +3283,24 @@ class TestAutoTitle:
         assert str(exc) == "model does not exist"
 
     @pytest.mark.asyncio
+    async def test_autotitle_acp_llm_error_not_published_as_event(self, caplog):
+        service = self._make_service()
+        service._conversation.agent = MagicMock(spec=ACPAgent)
+        service._conversation.agent.llm = LLM(model="gpt-4o", usage_id="test-llm")
+
+        with patch(
+            "openhands.sdk.llm.llm.LLM.completion",
+            side_effect=Exception("Missing Anthropic API Key"),
+        ):
+            subscriber = AutoTitleSubscriber(service=service)
+            await subscriber(self._user_message_event())
+            await self._drain_title_task(lambda: service.stored.title is not None)
+
+        assert "Missing Anthropic API Key" in caplog.text
+        service._publish_error_event_sync.assert_not_called()
+        assert service.stored.title == "Fix the login bug"
+
+    @pytest.mark.asyncio
     async def test_autotitle_skips_empty_message(self):
         """No title generation if the user message has no text content."""
         service = self._make_service()

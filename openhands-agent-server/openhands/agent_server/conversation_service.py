@@ -2837,6 +2837,12 @@ class AutoTitleSubscriber(Subscriber):
         def _on_title_error(exc: Exception) -> None:
             self.service._publish_error_event_sync(exc)
 
+        on_title_error = (
+            None
+            if conversation and isinstance(conversation.agent, ACPAgent)
+            else _on_title_error
+        )
+
         async def _generate_and_save() -> None:
             try:
                 loop = asyncio.get_running_loop()
@@ -2847,7 +2853,7 @@ class AutoTitleSubscriber(Subscriber):
                     message_text,
                     title_llm,
                     50,
-                    _on_title_error,
+                    on_title_error,
                 )
                 if title and self.service.stored.title is None:
                     self.service.stored.title = title
