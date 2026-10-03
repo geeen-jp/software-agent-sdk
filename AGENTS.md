@@ -74,6 +74,7 @@ All pull requests must comply with [`.agents/skills/custom-codereview-guide.md`]
 
 
 - Auto-title generation should not re-read `ConversationState.events` from a background task triggered by a freshly received `MessageEvent`; extract message text synchronously from the incoming event and then reuse shared title helpers (`extract_message_text`, `generate_title_from_message`) to avoid persistence-order races.
+- Auto-title LLM failures on ACP conversations (`ACPAgent`) are only logged by `title_utils`; `AutoTitleSubscriber` passes no `on_error` there, so no `ConversationErrorEvent` is recorded (subscription/OAuth ACP runs have no litellm key, and downstream workflow adapters treat a PAUSED conversation with an error event as inconsistent). Non-ACP conversations still surface title LLM errors via `_publish_error_event_sync` (#16686). AC 'start ai-dev-workflow-go runtime and confirm #97 Q5' is verified by the orchestrator after merge, not in this repo.
 - `RemoteConversation.generate_title()` now reconciles remote events and reuses the shared local `generate_conversation_title(...)` helper instead of calling the removed deprecated agent-server `/generate_title` REST route, so explicit remote title generation still works without a transport-only compatibility endpoint.
 
 
