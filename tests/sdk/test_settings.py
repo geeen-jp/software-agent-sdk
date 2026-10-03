@@ -391,8 +391,15 @@ def test_structured_output_rejects_invalid_schema_before_provider_dispatch() -> 
 def test_acp_structured_output_rejects_unsupported_provider() -> None:
     config = StructuredOutputConfig(mode="json_schema", schema={"type": "object"})
 
-    with pytest.raises(ValidationError, match="only for acp_server='claude-code'"):
-        ACPAgentSettings(acp_server="codex", structured_output=config)
+    with pytest.raises(ValidationError, match="only for acp_server="):
+        ACPAgentSettings(acp_server="gemini-cli", structured_output=config)
+
+
+def test_acp_codex_structured_output_settings_create_agent() -> None:
+    config = StructuredOutputConfig(mode="json_schema", schema={"type": "object"})
+    settings = ACPAgentSettings(acp_server="codex", structured_output=config)
+
+    assert settings.create_agent().structured_output == config
 
 
 # ---------------------------------------------------------------------------

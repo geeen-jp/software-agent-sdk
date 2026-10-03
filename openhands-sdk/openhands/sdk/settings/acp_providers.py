@@ -37,7 +37,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import PurePosixPath
 from types import MappingProxyType
-from typing import Any, Literal
+from typing import Any, Literal, NoReturn
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -92,16 +92,101 @@ def validate_claude_structured_output_schema(
 def validate_codex_structured_output_schema(
     schema: Mapping[str, Any],
 ) -> None:
-    """Validate the qualified root boundary of Codex ACP structured output.
+    """Validate Codex schemas against the live-qualified provider boundary.
 
-    Only the root shape is qualified: a root object without root-level
-    oneOf/anyOf/allOf (the OpenAI structured-output root rule, live-qualified
-    with a neutral root-object schema). Nested $ref/$defs, additionalProperties,
-    required, enum, const and conditionals are unqualified: they are passed to
-    the App Server unchanged and a rejection surfaces as a deterministic turn
-    failure, never as a prompt-only downgrade.
+    Live evidence for the pinned ChatGPT OAuth path (codex 0.159.3, codex-acp
+    2.1.0; see ``/workspace/pipeline/34-sdk/qual``) established three classes:
+    qualified schemas, known provider rejections (the two 400
+    ``invalid_json_schema`` cases), and unqualified schemas whose behavior is
+    not established. Qualified schemas use the strict supported subset checked
+    below. Known rejections and unqualified keywords, including integers above
+    JavaScript's exact range of 2**53 - 1, fail before provider execution. The
+    caller's schema is never rewritten.
     """
     _validate_root_object_schema(schema, "Codex")
+    _validate_codex_subschema(schema, "#")
+    _check_codex_integers(schema, "#")
+
+
+_CODEX_QUALIFIED_KEYWORDS = frozenset(
+    {
+        "type",
+        "properties",
+        "required",
+        "additionalProperties",
+        "items",
+        "enum",
+        "const",
+        "anyOf",
+        "minLength",
+        "pattern",
+        "minItems",
+        "maxItems",
+        "minimum",
+    }
+)
+_JS_MAX_SAFE_INTEGER = 2**53 - 1
+
+
+def _reject_codex_schema(path: str, reason: str) -> NoReturn:
+    raise ACPStructuredOutputCompatibilityError(
+        f"Codex ACP structured output schema at {path}: {reason}"
+    )
+
+
+def _check_codex_integers(value: Any, path: str) -> None:
+    if isinstance(value, int) and not isinstance(value, bool):
+        if abs(value) > _JS_MAX_SAFE_INTEGER:
+            _reject_codex_schema(path, f"integer {value} exceeds 2**53 - 1")
+    elif isinstance(value, Mapping):
+        for key, item in value.items():
+            _check_codex_integers(item, f"{path}/{key}")
+    elif isinstance(value, list):
+        for i, item in enumerate(value):
+            _check_codex_integers(item, f"{path}/{i}")
+
+
+def _validate_codex_subschema(schema: Any, path: str) -> None:
+    if not isinstance(schema, Mapping):
+        _reject_codex_schema(path, "must be a schema object")
+    unqualified = sorted(set(schema) - _CODEX_QUALIFIED_KEYWORDS)
+    if unqualified:
+        _reject_codex_schema(path, f"unqualified keyword(s) {unqualified}")
+    if "anyOf" in schema:
+        branches = schema["anyOf"]
+        if not isinstance(branches, list) or not branches:
+            _reject_codex_schema(path, "anyOf must be a non-empty list")
+        for i, branch in enumerate(branches):
+            _validate_codex_subschema(branch, f"{path}/anyOf/{i}")
+    elif "type" not in schema:
+        _reject_codex_schema(path, "provider rejects a schema without a 'type' key")
+    if "properties" in schema:
+        properties = schema["properties"]
+        if not isinstance(properties, Mapping):
+            _reject_codex_schema(path, "properties must be an object")
+        if schema.get("additionalProperties") is not False:
+            _reject_codex_schema(
+                path,
+                "provider requires additionalProperties: false on objects "
+                "with properties",
+            )
+        required = schema.get("required")
+        missing = [
+            name
+            for name in properties
+            if not isinstance(required, list) or name not in required
+        ]
+        if missing:
+            _reject_codex_schema(
+                path,
+                f"provider requires every property in 'required'; missing {missing}",
+            )
+        for name, subschema in properties.items():
+            _validate_codex_subschema(subschema, f"{path}/properties/{name}")
+    elif schema.get("additionalProperties") not in (None, False):
+        _reject_codex_schema(path, "only additionalProperties: false is qualified")
+    if "items" in schema:
+        _validate_codex_subschema(schema["items"], f"{path}/items")
 
 
 @dataclass(frozen=True)
@@ -789,7 +874,7 @@ def build_session_model_meta(agent_name: str, acp_model: str | None) -> dict[str
     return {provider.session_meta_key: {"options": {"model": acp_model}}}
 
 
-_STRUCTURED_OUTPUT_PROVIDER_KEYS = ("claude-code", "codex")
+STRUCTURED_OUTPUT_PROVIDER_KEYS = ("claude-code", "codex")
 
 
 def _build_session_structured_output_meta(
@@ -809,7 +894,7 @@ def _build_session_structured_output_meta(
         return {}
 
     provider = detect_acp_provider_by_agent_name(agent_name)
-    if provider is None or provider.key not in _STRUCTURED_OUTPUT_PROVIDER_KEYS:
+    if provider is None or provider.key not in STRUCTURED_OUTPUT_PROVIDER_KEYS:
         raise ValueError(
             "ACP structured_output is unsupported for provider "
             f"{agent_name!r}; only the qualified Claude and Codex ACP mappings "

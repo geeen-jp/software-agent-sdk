@@ -107,6 +107,7 @@ def _structured_output_config() -> StructuredOutputConfig:
             "type": "object",
             "properties": {"result": {"type": "string"}},
             "required": ["result"],
+            "additionalProperties": False,
         },
     )
 
@@ -253,6 +254,18 @@ class TestACPAgentInstantiation:
             structured_output=_structured_output_config(),
         )
         assert agent.structured_output is not None
+
+    def test_codex_structured_output_rejects_unqualified_schema(self):
+        config = StructuredOutputConfig(
+            mode="json_schema", schema={"type": "object", "$defs": {}}
+        )
+
+        with pytest.raises(ValidationError, match="unqualified keyword"):
+            _make_agent(
+                acp_command=["codex-acp"],
+                acp_server="codex",
+                structured_output=config,
+            )
 
     @pytest.mark.parametrize("keyword", ["oneOf", "anyOf", "allOf"])
     def test_codex_top_level_composition_fails_before_runtime(self, keyword):

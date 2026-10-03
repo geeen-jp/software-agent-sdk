@@ -153,7 +153,7 @@ RUN set -eux; \
     PATH="$ACP_NODE_DIR/bin:$PATH" "$ACP_NODE_DIR/bin/npm" install -g $PACKAGES; \
     for bin in $WRAPPER_BINS; do \
       if [ "$bin" = "codex-acp" ]; then \
-        printf '#!/bin/sh\nPATH="%s/bin:$PATH"\nexport OH_CODEX_RUNTIME_PATH="${OH_CODEX_RUNTIME_PATH:-%s/bin/codex}"\nexport CODEX_PATH="${OH_CODEX_BRIDGE_PATH:-%s/bin/codex}"\nexec "%s/bin/%s" "$@"\n' \
+        printf '#!/bin/sh\nPATH="%s/bin:$PATH"\nexport OH_CODEX_RUNTIME_PATH="%s/bin/codex"\nexport CODEX_PATH="${OH_CODEX_BRIDGE_PATH:-%s/bin/codex}"\nexec "%s/bin/%s" "$@"\n' \
           "$ACP_NODE_DIR" "$ACP_NODE_DIR" "$ACP_NODE_DIR" "$ACP_NODE_DIR" "$bin" \
           > "$ACP_WRAPPER_DIR/$bin"; \
       else \
