@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import json
+import os
+import re
+import subprocess
 from pathlib import Path
 from types import MappingProxyType
 
@@ -38,6 +41,16 @@ _DOCKERFILE = (
     _REPO_ROOT / "openhands-agent-server/openhands/agent_server/docker/Dockerfile"
 )
 _TS_ACP_PROVIDERS = _REPO_ROOT / "clients/typescript/src/models/acp-providers.json"
+
+
+def _wrapper_printf_format() -> str:
+    dockerfile = _DOCKERFILE.read_text(encoding="utf-8")
+    match = re.search(
+        r"printf '([^']*)'\s*\\\s*\"\$ACP_NODE_DIR\"",
+        dockerfile,
+    )
+    assert match is not None
+    return match.group(1)
 
 
 class TestACPProviderInfo:
@@ -346,7 +359,10 @@ class TestProviderRegistryConsistency:
         )
         assert f"@agentclientprotocol/codex-acp@{CODEX_ACP_VERSION}" in dockerfile
         assert f"{CODEX_RUNTIME_PACKAGE}@{CODEX_RUNTIME_VERSION}" in dockerfile
-        assert 'export CODEX_PATH="%s/bin/codex"' in dockerfile
+        assert 'export CODEX_PATH="${OH_CODEX_BRIDGE_PATH:-%s/bin/codex}"' in (
+            dockerfile
+        )
+        assert 'export OH_CODEX_RUNTIME_PATH="%s/bin/codex"' in dockerfile
         assert f"@google/gemini-cli@{GEMINI_CLI_VERSION}" in dockerfile
 
         ts_providers = json.loads(_TS_ACP_PROVIDERS.read_text(encoding="utf-8"))
@@ -515,7 +531,7 @@ class TestStructuredOutputSessionMeta:
             "json_schema"
         )
 
-    @pytest.mark.parametrize("agent_name", ["codex-acp", "gemini-cli", "custom"])
+    @pytest.mark.parametrize("agent_name", ["gemini-cli", "custom"])
     def test_unsupported_provider_fails_closed(self, agent_name):
         with pytest.raises(ValueError, match="unsupported"):
             _build_session_structured_output_meta(agent_name, self._config())
@@ -644,3 +660,211 @@ class TestACPFileSecrets:
                 ACPFileSecretSpec(
                     secret_name="X", filename="x.json", env_var="X", subdir=bad
                 )
+
+
+_CODEX_SCHEMA = {
+    "type": "object",
+    "properties": {"verdict": {"type": "string"}},
+    "required": ["verdict"],
+    "additionalProperties": False,
+}
+
+_CODEX_QUALIFIED_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "const": {"type": "string", "const": "ready"},
+        "status": {"type": "string", "enum": ["passed", "failed"]},
+        "summary": {
+            "type": ["string", "null"],
+            "minLength": 1,
+            "pattern": "^[a-z]+$",
+        },
+        "score": {"type": "integer", "minimum": 0},
+        "items": {
+            "type": "array",
+            "items": {"type": "string"},
+            "minItems": 1,
+            "maxItems": 4,
+        },
+        "optional": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+        "nested": {
+            "type": "object",
+            "properties": {"const": {"type": "boolean", "const": True}},
+            "required": ["const"],
+            "additionalProperties": False,
+        },
+    },
+    "required": [
+        "const",
+        "status",
+        "summary",
+        "score",
+        "items",
+        "optional",
+        "nested",
+    ],
+    "additionalProperties": False,
+}
+
+
+class TestCodexStructuredOutput:
+    def test_codex_session_metadata_carries_no_schema(self):
+        config = StructuredOutputConfig(mode="json_schema", schema=_CODEX_SCHEMA)
+
+        assert _build_session_structured_output_meta("codex-acp", config) == {}
+        assert (
+            _build_session_meta(
+                "codex-acp", acp_model="gpt-6.1-sol", structured_output=config
+            )
+            == {}
+        )
+
+    def test_codex_accepts_live_qualified_schema(self):
+        config = StructuredOutputConfig(
+            mode="json_schema", schema=_CODEX_QUALIFIED_SCHEMA
+        )
+
+        assert _build_session_structured_output_meta("codex-acp", config) == {}
+
+    @pytest.mark.parametrize(
+        "schema",
+        [
+            pytest.param(
+                {
+                    "type": "object",
+                    "properties": {"value": {"type": "string"}},
+                    "required": ["value"],
+                },
+                id="object-without-additional-properties-false",
+            ),
+            pytest.param(
+                {
+                    "type": "object",
+                    "properties": {"value": {"type": "string"}},
+                    "required": [],
+                    "additionalProperties": False,
+                },
+                id="property-not-required",
+            ),
+            pytest.param(
+                {
+                    "type": "object",
+                    "properties": {"value": {"const": "yes"}},
+                    "required": ["value"],
+                    "additionalProperties": False,
+                },
+                id="subschema-without-type",
+            ),
+            pytest.param(
+                {"type": "object", "$defs": {"value": {"type": "string"}}},
+                id="defs",
+            ),
+            pytest.param(
+                {"type": "object", "if": {"type": "object"}},
+                id="conditional",
+            ),
+            pytest.param(
+                {
+                    "type": "object",
+                    "properties": {"value": {"type": "string", "format": "date"}},
+                    "required": ["value"],
+                    "additionalProperties": False,
+                },
+                id="nested-format",
+            ),
+            pytest.param(
+                {
+                    "type": "object",
+                    "properties": {
+                        "value": {
+                            "type": "array",
+                            "items": {"oneOf": [{"type": "string"}]},
+                        }
+                    },
+                    "required": ["value"],
+                    "additionalProperties": False,
+                },
+                id="items-oneOf",
+            ),
+            pytest.param(
+                {
+                    "type": "object",
+                    "properties": {"value": {"type": "integer", "minimum": 2**53}},
+                    "required": ["value"],
+                    "additionalProperties": False,
+                },
+                id="unsafe-integer",
+            ),
+        ],
+    )
+    def test_codex_rejects_unqualified_or_known_rejected_schema(self, schema):
+        config = StructuredOutputConfig(mode="json_schema", schema=schema)
+
+        with pytest.raises(ACPStructuredOutputCompatibilityError, match="Codex ACP"):
+            _build_session_structured_output_meta("codex-acp", config)
+
+    @pytest.mark.parametrize("keyword", ["oneOf", "anyOf", "allOf"])
+    def test_codex_top_level_composition_fails_closed(self, keyword):
+        config = StructuredOutputConfig(
+            mode="json_schema",
+            schema={"type": "object", keyword: [{"type": "object"}]},
+        )
+
+        with pytest.raises(
+            ACPStructuredOutputCompatibilityError,
+            match=rf"Codex ACP structured output does not support top-level "
+            rf"'{keyword}'",
+        ):
+            _build_session_structured_output_meta("codex-acp", config)
+
+    def test_codex_non_object_root_fails_closed(self):
+        config = StructuredOutputConfig(mode="json_schema", schema={"type": "array"})
+
+        with pytest.raises(ACPStructuredOutputCompatibilityError, match="Codex ACP"):
+            _build_session_structured_output_meta("codex-acp", config)
+
+    @pytest.mark.parametrize("inherited_bridge", [None, "/tmp/bridge.cjs"])
+    def test_docker_codex_wrapper_always_uses_pinned_runtime(
+        self, tmp_path, inherited_bridge
+    ):
+        node_dir = tmp_path / "node"
+        bin_dir = node_dir / "bin"
+        bin_dir.mkdir(parents=True)
+        fake_acp = bin_dir / "codex-acp"
+        fake_acp.write_text('#!/bin/sh\necho "$CODEX_PATH|$OH_CODEX_RUNTIME_PATH"\n')
+        os.chmod(fake_acp, 0o755)
+
+        pinned_runtime = str(bin_dir / "codex")
+        rendered_wrapper = subprocess.run(
+            [
+                "printf",
+                _wrapper_printf_format(),
+                str(node_dir),
+                str(node_dir),
+                str(node_dir),
+                str(node_dir),
+                "codex-acp",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        wrapper = tmp_path / "codex-acp-wrapper"
+        wrapper.write_text(rendered_wrapper)
+        os.chmod(wrapper, 0o755)
+
+        env = os.environ.copy()
+        env["CODEX_PATH"] = "/usr/local/bin/codex"
+        env["OH_CODEX_RUNTIME_PATH"] = "/usr/local/bin/codex"
+        if inherited_bridge is None:
+            env.pop("OH_CODEX_BRIDGE_PATH", None)
+        else:
+            env["OH_CODEX_BRIDGE_PATH"] = inherited_bridge
+
+        result = subprocess.run(
+            [str(wrapper)], check=True, capture_output=True, text=True, env=env
+        )
+
+        assert (
+            result.stdout == f"{inherited_bridge or pinned_runtime}|{pinned_runtime}\n"
+        )

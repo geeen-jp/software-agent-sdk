@@ -138,11 +138,9 @@ settings = ACPAgentSettings(
 agent = settings.create_agent()
 ```
 
-The current qualified provider mapping is Claude ACP. The SDK maps the
-caller-supplied schema to Claude's provider-native JSON Schema output
-mechanism; its internal `_meta.claudeCode.options.outputFormat` path is
-provider-specific session metadata, not an ACP standard field. This setting
-is not an arbitrary raw ACP `_meta` passthrough.
+Two provider mappings are qualified. Claude ACP: the SDK maps the caller-supplied schema to Claude's provider-native JSON Schema output mechanism through internal `_meta.claudeCode.options.outputFormat` session metadata, which is provider-specific, not an ACP standard field. Codex ACP (built-in `codex-acp` path): the SDK attaches the schema to every `turn/start.outputSchema` through a small repository-owned proxy that replaces `CODEX_PATH`; this needs Node and a resolvable Codex runtime (the pinned runtime in the Docker image, otherwise `OH_CODEX_RUNTIME_PATH`, `CODEX_PATH` or `codex` on `PATH`), and the turn fails closed when either is missing. The setting is not an arbitrary raw ACP `_meta` passthrough.
+
+Codex App Server forwards the schema to the provider under OpenAI strict structured-output rules, so the Codex schema boundary is the live-qualified subset: a root `type: object` (no root `oneOf`/`anyOf`/`allOf`) built from `type` (including type arrays), `properties`, `required`, `additionalProperties: false`, `items`, `enum`, `const` (together with `type`), nested `anyOf` whose branches each have a `type`, `minLength`, `pattern`, `minItems`, `maxItems` and `minimum`. Every object with `properties` must set `additionalProperties: false` and list every property in `required`, and every subschema other than an `anyOf` wrapper needs a `type`; the provider rejects violations (known rejections). Everything else (`$ref`, `$defs`, `if`/`then`/`else`, `not`, `oneOf`, `allOf`, `format`, `maxLength`, ...) is unqualified, as are integers above 2^53 - 1 (the proxy is JavaScript). Known-rejected and unqualified schemas fail with `ACPStructuredOutputCompatibilityError` before any provider run; the SDK never rewrites the caller's schema.
 
 The caller owns the schema's meaning and validates the returned semantic
 result. The SDK owns only provider/ACP attachment mechanics and does not

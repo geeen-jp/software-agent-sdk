@@ -61,6 +61,7 @@ from openhands.sdk.utils.pydantic_secrets import (
 from openhands.sdk.workspace import LocalWorkspace
 
 from .acp_providers import (
+    STRUCTURED_OUTPUT_PROVIDER_KEYS,
     ACPFileSecretSpec,
     ACPProviderInfo,
     default_acp_file_secrets,
@@ -1589,7 +1590,8 @@ class ACPAgentSettings(AgentSettingsBase):
         exclude_if=lambda value: value is None,
         description=(
             "Provider-neutral structured-output configuration. The current SDK "
-            "supports JSON Schema through the qualified Claude ACP mapping; "
+            "supports JSON Schema through the qualified Claude and Codex ACP "
+            "mappings; "
             "leave unset to preserve the existing ACP behavior."
         ),
     )
@@ -1760,10 +1762,11 @@ class ACPAgentSettings(AgentSettingsBase):
         value: StructuredOutputConfig | None,
         info: ValidationInfo,
     ) -> StructuredOutputConfig | None:
-        if value is not None and info.data.get("acp_server") != "claude-code":
+        acp_server = info.data.get("acp_server")
+        if value is not None and acp_server not in STRUCTURED_OUTPUT_PROVIDER_KEYS:
             raise ValueError(
                 "structured_output is currently supported only for "
-                "acp_server='claude-code'"
+                "acp_server='claude-code' or 'codex'"
             )
         return value
 

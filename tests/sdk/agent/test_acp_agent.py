@@ -17,6 +17,7 @@ import pytest
 from acp.connection import StreamDirection, StreamEvent
 from acp.exceptions import RequestError as ACPRequestError
 from acp.schema import (
+    AgentMessageChunk,
     ClientCapabilities,
     ConfigOptionUpdate,
     LoadSessionResponse,
@@ -29,6 +30,7 @@ from acp.schema import (
     SessionModelState,
     SessionModeState,
     SetSessionConfigOptionResponse,
+    TextContentBlock,
 )
 from pydantic import ValidationError
 
@@ -105,7 +107,16 @@ def _structured_output_config() -> StructuredOutputConfig:
             "type": "object",
             "properties": {"result": {"type": "string"}},
             "required": ["result"],
+            "additionalProperties": False,
         },
+    )
+
+
+def _message_chunk(text: str, message_id: str | None) -> AgentMessageChunk:
+    return AgentMessageChunk(
+        content=TextContentBlock(text=text, type="text"),
+        message_id=message_id,
+        session_update="agent_message_chunk",
     )
 
 
@@ -232,8 +243,42 @@ class TestACPAgentInstantiation:
     def test_structured_output_rejects_unsupported_provider(self):
         with pytest.raises(ValueError, match="unsupported for ACP provider"):
             _make_agent(
-                acp_server="codex",
+                acp_server="gemini-cli",
                 structured_output=_structured_output_config(),
+            )
+
+    def test_codex_structured_output_is_accepted(self):
+        agent = _make_agent(
+            acp_command=["codex-acp"],
+            acp_server="codex",
+            structured_output=_structured_output_config(),
+        )
+        assert agent.structured_output is not None
+
+    def test_codex_structured_output_rejects_unqualified_schema(self):
+        config = StructuredOutputConfig(
+            mode="json_schema", schema={"type": "object", "$defs": {}}
+        )
+
+        with pytest.raises(ValidationError, match="unqualified keyword"):
+            _make_agent(
+                acp_command=["codex-acp"],
+                acp_server="codex",
+                structured_output=config,
+            )
+
+    @pytest.mark.parametrize("keyword", ["oneOf", "anyOf", "allOf"])
+    def test_codex_top_level_composition_fails_before_runtime(self, keyword):
+        config = StructuredOutputConfig(
+            mode="json_schema",
+            schema={"type": "object", keyword: [{"type": "object"}]},
+        )
+
+        with pytest.raises(ValidationError, match=rf"top-level '{keyword}'"):
+            _make_agent(
+                acp_command=["codex-acp"],
+                acp_server="codex",
+                structured_output=config,
             )
 
     def test_acp_model_propagated_to_llm_model(self):
@@ -668,6 +713,43 @@ class TestOpenHandsACPClient:
         assert client.accumulated_text == []
         assert client.accumulated_thoughts == []
         assert client.on_token is None
+
+    @pytest.mark.asyncio
+    async def test_final_message_only_keeps_last_agent_message(self):
+        client = _OpenHandsACPBridge()
+        client.final_message_only = True
+
+        await client.session_update("sess-1", _message_chunk("commentary", "m1"))
+        await client.session_update("sess-1", _message_chunk('{"result":', "m2"))
+        await client.session_update("sess-1", _message_chunk('"ok"}', "m2"))
+
+        assert "".join(client.accumulated_text) == '{"result":"ok"}'
+
+        client.reset()
+        assert client.accumulated_text == []
+        assert client._last_message_id is None
+
+        await client.session_update("sess-1", _message_chunk("new turn", "m3"))
+        assert "".join(client.accumulated_text) == "new turn"
+
+    @pytest.mark.parametrize(
+        ("final_message_only", "message_ids"),
+        [
+            (False, ["m1", "m2"]),
+            (True, [None, None]),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_agent_message_chunks_concatenate_by_default(
+        self, final_message_only, message_ids
+    ):
+        client = _OpenHandsACPBridge()
+        client.final_message_only = final_message_only
+
+        for text, message_id in zip(("first", " second"), message_ids):
+            await client.session_update("sess-1", _message_chunk(text, message_id))
+
+        assert "".join(client.accumulated_text) == "first second"
 
     @pytest.mark.asyncio
     async def test_session_update_accumulates_text(self):
@@ -6253,6 +6335,49 @@ class TestACPEnvConflictSuppression:
                     agent._start_acp_server(_make_state(tmp_path))
         agent._cleanup_claude_config_runtime(discard=True)
         return captured
+
+    def test_codex_structured_output_routes_codex_path_through_bridge(self, tmp_path):
+        config = _structured_output_config()
+        agent = ACPAgent(
+            acp_command=["codex-acp"],
+            acp_server="codex",
+            structured_output=config,
+        )
+        env = self._run_start_capturing_env(
+            agent,
+            tmp_path,
+            extra_os_env={"CODEX_PATH": "/opt/node/bin/codex", "CODEX_HOME": "/h"},
+        )
+
+        assert env["CODEX_PATH"] == env["OH_CODEX_BRIDGE_PATH"]
+        assert env["OH_CODEX_RUNTIME_PATH"] == "/opt/node/bin/codex"
+        assert json.loads(env["OH_CODEX_OUTPUT_SCHEMA"]) == config.schema
+        assert env["CODEX_HOME"] == "/h"
+        assert agent._client.final_message_only is True
+
+    def test_codex_without_structured_output_keeps_codex_path(self, tmp_path):
+        agent = ACPAgent(acp_command=["codex-acp"], acp_server="codex")
+        env = self._run_start_capturing_env(
+            agent, tmp_path, extra_os_env={"CODEX_PATH": "/opt/node/bin/codex"}
+        )
+
+        assert env["CODEX_PATH"] == "/opt/node/bin/codex"
+        assert not [name for name in env if name.startswith("OH_CODEX_")]
+        assert agent._client.final_message_only is False
+
+    def test_codex_structured_output_session_new_sends_no_schema_meta(self, tmp_path):
+        agent = ACPAgent(
+            acp_command=["codex-acp"],
+            acp_server="codex",
+            structured_output=_structured_output_config(),
+        )
+        state = _make_state(tmp_path)
+        conn = TestACPSessionIdPersistence._make_conn()
+        conn.initialize.return_value.agent_info.name = "codex-acp"
+
+        TestACPSessionIdPersistence._patched_start_acp_server(agent, state, conn=conn)
+
+        conn.new_session.assert_awaited_once_with(cwd=str(tmp_path), mcp_servers=[])
 
     @pytest.mark.parametrize(
         "command",
