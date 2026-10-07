@@ -20,6 +20,7 @@ from acp.schema import (
     SetSessionConfigOptionResponse,
 )
 
+from openhands.sdk.agent import acp_agent as acp_agent_module
 from openhands.sdk.agent.acp_agent import (
     ACPAgent,
     ACPSessionModeError,
@@ -55,6 +56,11 @@ _CODEX_COMMAND = [
     "-y",
     "@agentclientprotocol/codex-acp",
 ]
+
+
+@pytest.fixture(autouse=True)
+def _short_mode_confirm_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(acp_agent_module, "_ACP_SESSION_MODE_CONFIRM_TIMEOUT", 0.05)
 
 
 def _claude_session_modes(current: str = "default") -> SessionModeState:
@@ -600,6 +606,105 @@ async def test_read_only_confirms_mode_via_current_mode_update() -> None:
         ),
     )
     assert client.get_current_mode_id("sess-1") == "default"
+
+
+def _mode_update(mode_id: str) -> CurrentModeUpdate:
+    return CurrentModeUpdate(
+        session_update="current_mode_update", current_mode_id=mode_id
+    )
+
+
+async def _apply_default_mode(conn: MagicMock, client: _OpenHandsACPBridge) -> None:
+    await _apply_acp_session_mode(
+        conn,
+        client,
+        policy="read_only",
+        mode_id="default",
+        agent_name="claude-agent-acp",
+        session_id="sess-1",
+        session_response=NewSessionResponse(
+            session_id="sess-1",
+            modes=_claude_session_modes("bypassPermissions"),
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_read_only_waits_for_mode_update_after_set_mode_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(acp_agent_module, "_ACP_SESSION_MODE_CONFIRM_TIMEOUT", 5.0)
+    conn = MagicMock()
+    conn.set_session_mode = AsyncMock()
+    client = _OpenHandsACPBridge(permission_policy="read_only")
+
+    async def _late_update() -> None:
+        await asyncio.sleep(0.05)
+        await client.session_update("sess-1", _mode_update("default"))
+
+    late = asyncio.create_task(_late_update())
+    await _apply_default_mode(conn, client)
+    await late
+    assert client.get_current_mode_id("sess-1") == "default"
+
+
+@pytest.mark.asyncio
+async def test_read_only_mode_confirmation_timeout_reports_wait() -> None:
+    conn = MagicMock()
+    conn.set_session_mode = AsyncMock()
+    client = _OpenHandsACPBridge(permission_policy="read_only")
+    with pytest.raises(ACPSessionModeError, match=r"did not confirm.*within 0\.05s"):
+        await _apply_default_mode(conn, client)
+
+
+@pytest.mark.asyncio
+async def test_read_only_wrong_mode_update_fails_without_waiting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(acp_agent_module, "_ACP_SESSION_MODE_CONFIRM_TIMEOUT", 60.0)
+    conn = MagicMock()
+    conn.set_session_mode = AsyncMock()
+    client = _OpenHandsACPBridge(permission_policy="read_only")
+
+    async def _wrong_update() -> None:
+        await asyncio.sleep(0.01)
+        await client.session_update("sess-1", _mode_update("bypassPermissions"))
+
+    wrong = asyncio.create_task(_wrong_update())
+    with pytest.raises(ACPSessionModeError, match="observed='bypassPermissions'"):
+        await asyncio.wait_for(_apply_default_mode(conn, client), timeout=5)
+    await wrong
+
+
+@pytest.mark.asyncio
+async def test_read_only_wrong_mode_before_response_fails_without_waiting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(acp_agent_module, "_ACP_SESSION_MODE_CONFIRM_TIMEOUT", 60.0)
+    conn = MagicMock()
+    client = _OpenHandsACPBridge(permission_policy="read_only")
+
+    async def _set_mode(*, mode_id: str, session_id: str) -> None:
+        await client.session_update(session_id, _mode_update("bypassPermissions"))
+
+    conn.set_session_mode = AsyncMock(side_effect=_set_mode)
+    with pytest.raises(ACPSessionModeError, match="observed='bypassPermissions'"):
+        await asyncio.wait_for(_apply_default_mode(conn, client), timeout=5)
+
+
+@pytest.mark.asyncio
+async def test_read_only_confirmed_before_response_does_not_wait(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(acp_agent_module, "_ACP_SESSION_MODE_CONFIRM_TIMEOUT", 60.0)
+    conn = MagicMock()
+    client = _OpenHandsACPBridge(permission_policy="read_only")
+
+    async def _set_mode(*, mode_id: str, session_id: str) -> None:
+        await client.session_update(session_id, _mode_update(mode_id))
+
+    conn.set_session_mode = AsyncMock(side_effect=_set_mode)
+    await asyncio.wait_for(_apply_default_mode(conn, client), timeout=5)
 
 
 @pytest.mark.asyncio

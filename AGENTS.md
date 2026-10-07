@@ -85,6 +85,7 @@ All pull requests must comply with [`.agents/skills/custom-codereview-guide.md`]
 - Agent-server persistence detects whether settings or secret payloads contain values by exercising the real Pydantic secret-serialization pipeline with `_SecretProbeCipher` (`persistence/models.py`). Do not replace this with a hardcoded field list or a recursive `SecretStr` walk: fields such as `AgentContext.secrets` store plain strings and only become secret-bearing inside their serializers.
 
 - `LookupSecret` normalizes hostless URLs against `OH_INTERNAL_SERVER_URL` (set by `openhands-agent-server.__main__` from the bound host/port, rewriting wildcard binds to loopback) and otherwise falls back to `http://127.0.0.1:8000`, so relative secret URLs can safely target the current agent-server instance.
+- read_only ACP session-mode confirmation (`_apply_acp_session_mode`) waits at most `_ACP_SESSION_MODE_CONFIRM_TIMEOUT` (5s) on a per-session `asyncio.Event` in `_OpenHandsACPBridge.wait_for_current_mode` when `set_mode` returned with no observed mode and the advertised current mode differs; a different observed mode or a timeout still raises `ACPSessionModeError` (fail-closed, no provider/CLI version conditions). `_verify_read_only_mode_after_config` is deliberately unchanged (sync, generation-based, post-config), so the wait applies only to the initial `session/set_mode` confirmation.
 
 
 
