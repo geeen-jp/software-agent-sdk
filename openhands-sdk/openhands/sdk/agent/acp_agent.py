@@ -217,6 +217,10 @@ _ACP_RUNTIME_SHUTDOWN_TIMEOUT: float = float(
     os.environ.get("ACP_RUNTIME_SHUTDOWN_TIMEOUT", "5.0")
 )
 
+# Upper bound on how long a read_only session/set_mode waits for its
+# CurrentModeUpdate confirmation when the notification trails the response.
+_ACP_SESSION_MODE_CONFIRM_TIMEOUT: float = 5.0
+
 # Minimum interval between on_activity heartbeat signals (seconds).
 # Throttled to avoid excessive calls while still keeping the idle timer
 # well below the ~20 min runtime-api kill threshold.
@@ -873,9 +877,16 @@ async def _apply_acp_session_mode(
     observed = client.get_current_mode_id(session_id)
     if observed == mode_id or (observed is None and current_mode_id == mode_id):
         return
+    waited = ""
+    if observed is None:
+        timeout = _ACP_SESSION_MODE_CONFIRM_TIMEOUT
+        observed = await client.wait_for_current_mode(session_id, timeout)
+        if observed == mode_id:
+            return
+        waited = f" within {timeout:g}s" if observed is None else ""
     raise ACPSessionModeError(
         f"ACP server {agent_name!r} session {session_id} did not confirm "
-        f"read_only session mode {mode_id!r} "
+        f"read_only session mode {mode_id!r}{waited} "
         f"(advertised current={current_mode_id!r}, observed={observed!r})."
     )
 
@@ -2021,6 +2032,7 @@ class _OpenHandsACPBridge:
         self._config_options_by_session: dict[str, list[SessionConfigOption]] = {}
         self._current_mode_by_session: dict[str, str] = {}
         self._current_mode_generation_by_session: dict[str, int] = {}
+        self._current_mode_updated: dict[str, asyncio.Event] = {}
         # Fork session state for ask_agent() — guarded by _fork_lock to
         # prevent concurrent ask_agent() calls from colliding.
         self._fork_lock = threading.Lock()
@@ -2275,6 +2287,18 @@ class _OpenHandsACPBridge:
         """Return the last confirmed session mode id for *session_id*."""
         return self._current_mode_by_session.get(session_id)
 
+    async def wait_for_current_mode(
+        self, session_id: str, timeout: float
+    ) -> str | None:
+        """Wait up to *timeout* seconds for a CurrentModeUpdate for *session_id*.
+
+        Returns the confirmed mode id, or ``None`` if none arrived in time.
+        """
+        event = self._current_mode_updated.setdefault(session_id, asyncio.Event())
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(event.wait(), timeout)
+        return self.get_current_mode_id(session_id)
+
     def get_current_mode_generation(self, session_id: str) -> int:
         """Return how many CurrentModeUpdate notifications this session has seen."""
         return self._current_mode_generation_by_session.get(session_id, 0)
@@ -2367,6 +2391,7 @@ class _OpenHandsACPBridge:
                 self._current_mode_generation_by_session[session_id] = (
                     self._current_mode_generation_by_session.get(session_id, 0) + 1
                 )
+                self._current_mode_updated.setdefault(session_id, asyncio.Event()).set()
         elif isinstance(update, ToolCallStart):
             entry = {
                 "tool_call_id": update.tool_call_id,
