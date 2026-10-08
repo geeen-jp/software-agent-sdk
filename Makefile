@@ -57,18 +57,16 @@ pre-commit:
 	@$(ECHO) "$(GREEN)Pre-commit run successfully.$(RESET)"
 
 # Canonical validation for the ai-dev runtime VERIFY step and the `validate` CI job.
-# The OAuth variables make TestACPEnvConflictSuppression fail, and the
-# agent-server variables point tests at the host's real persistence, secrets,
-# Codex auth and config. All of them are unset first; tests/conftest.py strips
-# the agent-server ones again for direct pytest runs.
+# `validate` re-runs `validate-steps` through scripts/validate-env.sh, which starts
+# it under `env -i` with an allowlisted environment and a throwaway HOME/TMPDIR,
+# so no inherited credential or agent-server variable reaches the suites.
 # Scope: tests/sdk, tools, workspace, agent_server and cross, as in tests.yml.
 # tests/examples and tests/integration need a live LLM and are excluded.
-VALIDATE_UNSET_ENV := CLAUDE_CODE_OAUTH_TOKEN CLAUDE_AUTH_CODE \
-	OPENHANDS_CODEX_AUTH_SOURCE OPENHANDS_AGENT_SERVER_CONFIG_PATH \
-	OH_PERSISTENCE_DIR OH_SECRETS_DIR CLOUD_AGENT_INJECTED_SECRET_NAMES \
-	OH_INTERNAL_SERVER_URL
 validate:
-	@unset $(VALIDATE_UNSET_ENV); \
+	@sh scripts/validate-env.sh make --no-print-directory validate-steps
+
+.PHONY: validate-steps
+validate-steps:
 	uv sync --dev --frozen && \
 	CI=true uv run python -m pytest -n auto -p no:cacheprovider tests/sdk && \
 	CI=true uv run python -m pytest -n auto -p no:cacheprovider tests/agent_server && \
