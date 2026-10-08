@@ -1,5 +1,6 @@
 """Common test fixtures and utilities."""
 
+import os
 import uuid
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -20,6 +21,29 @@ TOKENIZER_FIXTURES_DIR = REPO_ROOT / "tests" / "fixtures" / "tokenizers"
 QWEN3_TOKENIZER_CONFIG = (
     TOKENIZER_FIXTURES_DIR / "qwen3-4b-instruct-2507-tokenizer_config.json"
 )
+
+
+# Inherited from an agent-server shell, these point tests at the host's real
+# persistence, secrets, Codex auth and server config.
+AGENT_SERVER_ENV_VARS = (
+    "OPENHANDS_CODEX_AUTH_SOURCE",
+    "OPENHANDS_AGENT_SERVER_CONFIG_PATH",
+    "OH_PERSISTENCE_DIR",
+    "OH_SECRETS_DIR",
+    "CLOUD_AGENT_INJECTED_SECRET_NAMES",
+    "OH_INTERNAL_SERVER_URL",
+)
+
+
+def strip_agent_server_env() -> None:
+    for name in AGENT_SERVER_ENV_VARS:
+        os.environ.pop(name, None)
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    # Before collection and before xdist spawns workers, so no fixture can
+    # capture a host value and restore it on teardown.
+    strip_agent_server_env()
 
 
 def pytest_addoption(parser: pytest.Parser) -> None:
