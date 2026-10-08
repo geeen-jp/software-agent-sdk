@@ -1,59 +1,78 @@
-"""The test suite must never inherit the agent-server's host-side env."""
+"""`make validate` must run in an allowlisted environment, not inherit the parent's."""
 
 import os
 import subprocess
-import sys
 from pathlib import Path
 
-from tests.conftest import AGENT_SERVER_ENV_VARS, REPO_ROOT, strip_agent_server_env
+from tests.conftest import REPO_ROOT
 
 
-ISOLATED_ENV_VARS = (
-    "CLAUDE_CODE_OAUTH_TOKEN",
-    "CLAUDE_AUTH_CODE",
-    *AGENT_SERVER_ENV_VARS,
-)
+SENTINEL = "dummy-sentinel-do-not-leak"
+POLLUTED_ENV = {
+    "OPENHANDS_SESSION_API_KEY": SENTINEL,
+    "OPENHANDS_CODEX_AUTH_SOURCE": SENTINEL,
+    "OH_PERSISTENCE_DIR": SENTINEL,
+    "OH_SECRETS_DIR": SENTINEL,
+    "CLAUDE_CODE_OAUTH_TOKEN": SENTINEL,
+    "OPENAI_API_KEY": SENTINEL,
+    "CODEX_HOME": SENTINEL,
+    "CURSOR_API_KEY": SENTINEL,
+    "GH_TOKEN": SENTINEL,
+    "GITHUB_TOKEN": SENTINEL,
+    "CLOUD_AGENT_INJECTED_SECRET_NAMES": SENTINEL,
+    "SOME_UNLISTED_SECRET": SENTINEL,
+}
+ALLOWED_NAMES = {
+    "PATH",
+    "LANG",
+    "HOME",
+    "TMPDIR",
+    "UV_CACHE_DIR",
+    "UV_PYTHON_INSTALL_DIR",
+    "PRE_COMMIT_HOME",
+    "CI",
+}
 
 
-def test_strip_agent_server_env_removes_inherited_values(monkeypatch):
-    for name in AGENT_SERVER_ENV_VARS:
-        monkeypatch.setenv(name, "/dummy")
-    strip_agent_server_env()
-    assert [n for n in AGENT_SERVER_ENV_VARS if n in os.environ] == []
-
-
-def test_pytest_run_strips_inherited_env(tmp_path: Path):
-    probe = tmp_path / "test_probe.py"
-    probe.write_text(
-        "import os\n"
-        f"NAMES = {AGENT_SERVER_ENV_VARS!r}\n"
-        "def test_probe():\n"
-        "    assert [n for n in NAMES if n in os.environ] == []\n"
-    )
-    env = {**os.environ, **{name: "/dummy" for name in AGENT_SERVER_ENV_VARS}}
-    result = subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "pytest",
-            "-q",
-            "-p",
-            "no:cacheprovider",
-            "-p",
-            "tests.conftest",
-            "--rootdir",
-            str(tmp_path),
-            str(probe),
-        ],
+def run_in_validate_env(
+    tmp_path: Path, *command: str
+) -> subprocess.CompletedProcess[str]:
+    env = {
+        **os.environ,
+        **POLLUTED_ENV,
+        "LC_ALL": "C.UTF-8",
+        "TMPDIR": str(tmp_path),
+        "HOME": str(tmp_path / "real-home"),
+    }
+    return subprocess.run(
+        ["sh", "scripts/validate-env.sh", *command],
         cwd=REPO_ROOT,
         env=env,
         capture_output=True,
         text=True,
+        check=True,
     )
-    assert result.returncode == 0, result.stdout + result.stderr
 
 
-def test_make_validate_unsets_isolated_env():
+def test_validate_env_contains_only_allowlisted_names(tmp_path: Path):
+    result = run_in_validate_env(tmp_path, "env")
+    names = {line.split("=", 1)[0] for line in result.stdout.splitlines()}
+    locale_names = {name for name in names if name.startswith("LC_")}
+    assert names <= ALLOWED_NAMES | locale_names
+    assert {"PATH", "HOME", "TMPDIR", "CI", "LC_ALL"} <= names
+    assert SENTINEL not in result.stdout + result.stderr
+
+
+def test_validate_env_uses_throwaway_home_and_tmpdir(tmp_path: Path):
+    result = run_in_validate_env(tmp_path, "sh", "-c", 'echo "$HOME" "$TMPDIR"')
+    home, tmpdir = (Path(p) for p in result.stdout.split())
+    assert home != tmp_path / "real-home"
+    assert home.parent == tmpdir.parent
+    assert home.parent.parent == tmp_path
+    assert not home.parent.exists()
+
+
+def test_make_validate_runs_steps_in_validate_env():
     result = subprocess.run(
         ["make", "-n", "validate"],
         cwd=REPO_ROOT,
@@ -61,9 +80,5 @@ def test_make_validate_unsets_isolated_env():
         text=True,
         check=True,
     )
-    unset_line = next(
-        line for line in result.stdout.splitlines() if line.startswith("unset ")
-    )
-    assert set(unset_line.removeprefix("unset ").split(";")[0].split()) == set(
-        ISOLATED_ENV_VARS
-    )
+    assert result.stdout.startswith("sh scripts/validate-env.sh ")
+    assert "validate-steps" in result.stdout
