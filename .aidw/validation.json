@@ -1,0 +1,6 @@
+{
+  "schema": "aidw.repository-validation.v1",
+  "commands": [
+    {"id": "validate", "executable": "make", "args": ["validate"]}
+  ]
+}

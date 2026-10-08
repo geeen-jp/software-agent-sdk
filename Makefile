@@ -14,7 +14,7 @@ UNDERLINE := \033[4m
 REQUIRED_UV_VERSION := 0.8.13
 PKGS ?= openhands-sdk openhands-tools openhands-workspace openhands-agent-server
 
-.PHONY: build format lint clean help check-uv-version
+.PHONY: build format lint clean help check-uv-version validate
 
 # Default target
 .DEFAULT_GOAL := help
@@ -56,6 +56,24 @@ pre-commit:
 	uv run pre-commit run --all-files
 	@$(ECHO) "$(GREEN)Pre-commit run successfully.$(RESET)"
 
+# Canonical validation for the ai-dev runtime VERIFY step and the `validate` CI job.
+# Both OAuth variables are unset first: the workflow environment exports them and
+# they make TestACPEnvConflictSuppression fail.
+# Scope: tests/sdk, tools, workspace, agent_server and cross, as in tests.yml.
+# tests/examples and tests/integration need a live LLM and are excluded.
+validate:
+	@unset CLAUDE_CODE_OAUTH_TOKEN CLAUDE_AUTH_CODE; \
+	uv sync --dev --frozen && \
+	CI=true uv run python -m pytest -n auto -p no:cacheprovider tests/sdk && \
+	CI=true uv run python -m pytest -n auto -p no:cacheprovider tests/agent_server && \
+	CI=true uv run python -m pytest -n auto -p no:cacheprovider tests/workspace && \
+	CI=true uv run python -m pytest -p no:cacheprovider --basetemp="$${TMPDIR:-/tmp}/oh-validate-pytest" -o tmp_path_retention_count=0 tests/cross --deselect tests/cross/test_remote_conversation_live_server.py::test_openai_chat_completions_gateway_over_real_server && \
+	CI=true uv run python -m pytest --forked -p no:cacheprovider tests/tools && \
+	uv run pyright && \
+	uv run pre-commit run --all-files --show-diff-on-failure && \
+	git diff --check && \
+	git diff --exit-code
+
 clean:
 	@$(ECHO) "$(YELLOW)Cleaning up cache files...$(RESET)"
 	@find . -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
@@ -77,6 +95,7 @@ help:
 	@$(ECHO) "  $(GREEN)format$(RESET)               Format code with uv format"
 	@$(ECHO) "  $(GREEN)lint$(RESET)                 Lint code with ruff"
 	@$(ECHO) "  $(GREEN)pre-commit$(RESET)           Run the pre-commit"
+	@$(ECHO) "  $(GREEN)validate$(RESET)             Run the canonical validation (sync, tests, pyright, pre-commit)"
 	@$(ECHO) "  $(GREEN)clean$(RESET)                Clean up cache files"
 	@$(ECHO) "  $(GREEN)help$(RESET)                 Show this help message"
 
