@@ -83,9 +83,8 @@ The convention:
    interface before and after when you touch one — signatures, schemas, or event shapes — and
    state the compatibility impact (additive, breaking, or behind a flag).
 2. Commit it under the temporary **`.pr/`** directory, e.g. `.pr/design.html`. This directory is
-   for PR-only artifacts and is **removed automatically** by `.github/workflows/pr-artifacts.yml`:
-   same-repository PRs are cleaned up when the PR is approved, and fork PRs are cleaned up
-   automatically from the base branch right after merge — either way it does not persist in `main`.
+   for PR-only artifacts and must be **removed by hand** before the PR is merged, so it does not
+   persist in `main` (this fork has no automatic cleanup workflow).
 3. Link it near the top of the PR description via htmlpreview, pointing at the fork and branch the
    PR is opened from so it renders before the PR is merged:
 

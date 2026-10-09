@@ -69,6 +69,7 @@ All pull requests must comply with [`.agents/skills/custom-codereview-guide.md`]
 
 - Agent-server Docker publish tags are defined centrally in `openhands-agent-server/openhands/agent_server/docker/build.py`; keep `server.yml` tag publication (`publish-images`) derived from the arch-less tags that `build.py --arch ''` emits so SHA/branch/git-tag aliases stay in sync, while preserving the legacy `latest-<variant>` alias used by workspace defaults.
 - Docker images are on-demand (sdk#83): in `server.yml` only `workflow_dispatch` builds/pushes GHCR images (`build-and-push-image` pushes just the run-scoped `verify-<run_id>-<run_attempt>-<variant>` tag), `docker-smoke-test` pulls the built digest from the `image-ref-<variant>` artifact and checks `/health`, and `publish-images` (input `publish=true`) re-tags that verified digest. `release-binaries.yml` has no Docker job and nothing waits on another workflow's images; do not reintroduce image builds on push/tag/pull_request/release, a manifest-merge job, build-info consolidation or the PR-description image blurb. Verification vs published images, retention, tag-user impact and the "Required checks 移行" list live in `.github/workflows/README-RELEASE.md`.
+- Fork CI scope (sdk#84): upstream-only workflows (docs deploy, release preparation/creation, version-bump PRs, stale/duplicate/TODO/readiness issue automation, `pr-artifacts`) are deleted; the PyPI/npm/GitHub Packages publish workflows are `workflow_dispatch`-only and need an exact `confirm` input (`publish-pypi`, `publish-npm`, `publish-github-packages`); `run-eval`/`integration-runner` run only from dispatch or a label on a same-repository PR. `tests/cross/test_fork_workflow_triggers.py` guards this after upstream merges, and the keep/stop/manual table, acceptance decisions and "Required checks 移行" list live in `.github/workflows/README-RELEASE.md`. `pr-description-check.yml` passes no token, so the `ready-for-dev` label lookup in `check_pr_description.py` is skipped.
 - The published agent-server Docker images in `.github/workflows/server.yml` must pass `OPENHANDS_BUILD_GIT_SHA` and `OPENHANDS_BUILD_GIT_REF` as explicit `docker/build-push-action` build args; the workflow only uses `docker/build.py` for context/tag generation, so those runtime env vars are otherwise left at the Dockerfile `unknown` defaults.
 - The PyInstaller agent-server binary should copy OpenHands distribution metadata (`openhands-agent-server`, `openhands-sdk`, `openhands-tools`, `openhands-workspace`) in `openhands-agent-server/openhands/agent_server/agent-server.spec`, otherwise `/server_info` version lookups via `importlib.metadata` can fall back to `unknown` inside published binary images.
 - Agent-server deferred init (warm-pool / dormant mode) is driven by `Config.deferred_init` (env `OH_DEFERRED_INIT`). The `InitService` in `openhands-agent-server/openhands/agent_server/init_router.py` owns the dormant→initializing→ready transition and is registered on `app.state.init_service` only when `deferred_init=True`; the `require_initialized` dependency, added to the `/api/*` router, returns 503 while not `ready`. Bootstrap auth for `POST /api/init` uses the existing `secret_key` (`X-Init-API-Key` header) — the orchestrator already holds this key for encryption, and it is overwritten when the per-user runtime config arrives in the init body. The agent-server's 5xx exception handler rewrites `detail` on 503s, so warm-pool orchestrators should rely on the HTTP status code (not the body) when probing dormant state.
@@ -153,9 +154,10 @@ consult each relevant package-level AGENTS.md.
 <PR_ARTIFACTS>
 # PR-Specific Evidence Documents
 
-The `.pr/` directory is intentionally temporary by repository policy: the
-`PR Artifacts` workflow (`.github/workflows/pr-artifacts.yml`) treats it as
-PR-only reviewer context and automatically removes it after PR approval.
+The `.pr/` directory is intentionally temporary by repository policy: it is
+PR-only reviewer context and must be removed by hand before merging (the
+upstream `PR Artifacts` workflow that cleaned it up automatically is not part of
+this fork; see `.github/workflows/README-RELEASE.md`).
 
 When working on a PR that requires design documents, scripts meant for development-only, or other temporary artifacts that should NOT be merged to main, store them in a `.pr/` directory at the repository root.
 
@@ -176,15 +178,13 @@ mkdir -p .pr
 
 ## How It Works
 
-1. **Notification**: When `.pr/` exists, a single comment is posted to the PR conversation alerting reviewers
-2. **Auto-cleanup**: When the PR is approved, the `.pr/` directory is automatically removed via commit
-3. **Fork PRs**: Auto-cleanup cannot push to forks, so manual removal is required before merging
+No workflow checks or cleans `.pr/` in this fork. Remove it with a commit before
+the PR is merged.
 
 ## Important Notes
 
 - Do NOT put anything in `.pr/` that needs to be preserved
-- The `.pr/` check passes (green ✅) during development - it only posts a notification, not a blocking error
-- For fork PRs: You must manually remove `.pr/` before the PR can be merged
+- Do not merge a PR that still contains `.pr/`
 
 ## When to Use
 

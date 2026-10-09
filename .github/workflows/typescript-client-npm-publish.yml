@@ -1,14 +1,22 @@
 ---
 name: Publish TypeScript client to npm
 
+# Manual only. Publishing to npm is not adopted for this fork by default: the
+# job runs only when a person dispatches the workflow and types the exact
+# confirmation `publish-npm`; any other value skips the job. There is no
+# release/push/pull_request trigger. See README-RELEASE.md.
+
 on:
-    release:
-        types: [published]
     workflow_dispatch:
         inputs:
             version:
                 description: Version to publish without a leading v
                 required: true
+                type: string
+            confirm:
+                description: Type publish-npm to publish to npm (anything else does nothing)
+                required: true
+                default: ''
                 type: string
 
 concurrency:
@@ -25,11 +33,7 @@ defaults:
 
 jobs:
     publish:
-        if: >-
-            github.repository == 'OpenHands/software-agent-sdk' &&
-            (github.event_name == 'workflow_dispatch' ||
-             (!github.event.release.prerelease &&
-              startsWith(github.event.release.tag_name, 'v')))
+        if: inputs.confirm == 'publish-npm'
         runs-on: ubuntu-latest
         timeout-minutes: 15
         steps:
@@ -55,15 +59,8 @@ jobs:
 
             - name: Set package version
               env:
-                  DISPATCH_VERSION: ${{ inputs.version }}
-                  RELEASE_TAG: ${{ github.event.release.tag_name }}
-              run: |
-                  if [ "${{ github.event_name }}" = workflow_dispatch ]; then
-                    target_version="$DISPATCH_VERSION"
-                  else
-                    target_version="${RELEASE_TAG#v}"
-                  fi
-                  npm version "$target_version" --no-git-tag-version --allow-same-version
+                  TARGET_VERSION: ${{ inputs.version }}
+              run: npm version "$TARGET_VERSION" --no-git-tag-version --allow-same-version
 
             - name: Build package
               run: npm run build

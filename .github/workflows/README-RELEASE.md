@@ -1,67 +1,148 @@
-# Release Automation Workflows
+# Release and CI Workflows (geeen-jp fork)
 
-This document describes the automated release workflows for the OpenHands Software Agent SDK.
+This document describes which GitHub Actions workflows run in the independent
+geeen-jp fork of the OpenHands Software Agent SDK, which are stopped, and how a
+person starts the manual ones. sdk#84 removed or disabled every workflow that
+operates the upstream `OpenHands/software-agent-sdk` project (Cloud automation,
+upstream docs, upstream downstream-release bumps, registry publishing).
 
-## Overview
+## Fork workflow inventory (sdk#84)
 
-The release process has been automated with three GitHub Actions workflows:
+"Auto" means a `push`, `pull_request`, `issues`, `issue_comment`, `schedule` or
+`release` event starts the workflow. No workflow in the "removed" or "manual"
+groups starts automatically.
 
-1. **prepare-release.yml** - Prepares a release PR with version updates
-2. **pypi-release.yml** - Automatically publishes packages to PyPI when a release is created
-3. **release-binaries.yml** - Builds and smoke-tests the linux x86_64 agent-server binary
-   on releases and main pushes; release runs also attach binaries to the release
-   (no Docker; see Step 4c)
+### Removed (upstream-only; the file is deleted)
 
-## How to Create a New Release
+| Workflow | Former trigger | Why removed |
+|---|---|---|
+| `deploy-docs.yml` | push to main (agent-server paths), dispatch | deploys upstream docs |
+| `cancel-eval.yml` | dispatch | cancels upstream OpenHands/evaluation runs |
+| `prepare-release.yml` | dispatch | opens `rel-X.Y.Z` PRs for the upstream release train |
+| `version-bump-prs.yml` | dispatch (from `pypi-release.yml`) | opens version-bump PRs in OpenHands-CLI, automation and this repository |
+| `create-release.yml` | merged `rel-*` PR (`contents: write`, `actions: write`) | creates the upstream GitHub release and dispatches publish workflows |
+| `stale.yml` | daily cron | closes upstream stale issues/PRs |
+| `issue-duplicate-checker.yml` | `issues: opened`, daily cron, dispatch | OpenHands Cloud duplicate check, auto-closes issues |
+| `remove-duplicate-candidate-label.yml` | `issue_comment` | upstream label hygiene |
+| `todo-management.yml` | dispatch, PR label `automatic-todo` | OpenHands Cloud TODO automation |
+| `issue-readiness-check.yml` | `issues` events (`issues: write`, `actions: write`) | auto-labels `ready-for-dev`; no label policy is established for this fork, so unknown automatic issue writes fail closed |
+| `pr-artifacts.yml` | `pull_request_target`, `pull_request_review` (`pull-requests: write`, `contents: write`) | auto-commits removal of `.pr/` and comments on PRs; the `.pr/` directory is now removed by hand before merge |
 
-### Step 1: Trigger the Prepare Release Workflow
+### Manual only (dispatch with a confirmation input)
 
-1. Go to the [Actions tab](https://github.com/OpenHands/software-agent-sdk/actions)
-2. Select **"Prepare Release"** workflow from the left sidebar
-3. Click **"Run workflow"** button
-4. Enter the version number (e.g., `1.2.3`) - must be in format `X.Y.Z`
-5. Click **"Run workflow"**
+| Workflow | How to run | Guard |
+|---|---|---|
+| `pypi-release.yml` | Actions > "Publish all OpenHands packages (uv)" > Run workflow, set `confirm` to `publish-pypi` | job `if: inputs.confirm == 'publish-pypi'`; fails when secret `PYPI_TOKEN_OPENHANDS` is missing; no token fallback; `contents: read` only |
+| `typescript-client-npm-publish.yml` | Run workflow with `version` and `confirm` = `publish-npm` | job `if: inputs.confirm == 'publish-npm'`; npm trusted publishing (OIDC) only |
+| `typescript-client-github-packages-publish.yml` | Run workflow with `version` and `confirm` = `publish-github-packages` | job `if: inputs.confirm == 'publish-github-packages'`; uses `GITHUB_TOKEN` |
+| `run-eval.yml` | Run workflow with `reason` and `eval_limit`; or add `run-eval-1/50/200/500` to a same-repository PR | same-repository PRs only; no `release` trigger; needs secret `OPENHANDS_BOT_GITHUB_PAT_EVAL_DISPATCH` (fails when missing); it dispatches `OpenHands/evaluation`, so only run it when that is intended; permissions `contents: read`, `pull-requests: write` |
+| `integration-runner.yml` | Run workflow, or add `integration-test` / `behavior-test` to a same-repository PR | fork PRs never run; `id-token` removed |
+| `run-examples.yml` | Run workflow, or add `test-examples` to a PR (unchanged) | label or dispatch only |
+| `security-scan.yml` | Run workflow, or add `security-scan` to a PR, or any label on a `rel-*` PR (unchanged) | plain `pull_request` (read-only token on forks) |
 
-The workflow will automatically:
-- ✅ Create a new branch named `rel-X.Y.Z`
-- ✅ Update all package versions using `make set-package-version`
-- ✅ Commit the changes
-- ✅ Push the branch
-- ✅ Create a PR with labels `integration-tests` and `test-examples`
+### Kept (automatic, local rules)
 
-### Step 2: Review the PR
+| Workflow | Trigger | Permissions |
+|---|---|---|
+| `validate.yml` (job `validate`) | `pull_request` | read |
+| `tests.yml`, `precommit.yml`, `check-docstrings.yml`, `deprecation-check.yml`, `check-documented-examples.yml`, `check-duplicate-examples.yml` | push / pull_request | read |
+| `api-breakage.yml`, `agent-server-rest-api-breakage.yml`, `persisted-settings-compat.yml` | push / pull_request | unchanged |
+| `typescript-client-ci.yml`, `typescript-client-integration-tests.yml`, `typescript-client-endpoint-audit.yml` | push / pull_request | unchanged |
+| `server.yml` | binary and OpenAPI jobs on push/PR; Docker jobs on dispatch only (sdk#83) | unchanged |
+| `release-binaries.yml` | push to main, `release: published`, dispatch | unchanged (linux binaries and `openapi.json`, not a registry publish) |
+| `version-bump-guard.yml` | `pull_request` to main | `contents: read` |
+| `review-thread-gate.yml` | `pull_request` to main | `contents: read`, `pull-requests: read` |
+| `pr-description-check.yml` | `pull_request` | `contents: read`, `pull-requests: read` (was `pull_request_target`; `issues: read` and the `GITHUB_TOKEN` env were dropped) |
 
-The created PR will include a checklist. Complete the following:
+`oh-update-documentation.yml.back` is not a workflow (GitHub ignores the
+`.back` suffix) and is left as is.
 
-- [ ] Fix any deprecation deadlines if they exist
-- [ ] Verify integration tests pass (triggered by `integration-tests` label)
-- [ ] Verify example checks pass (triggered by `test-examples` label)
-- [ ] Confirm any merged `release-note-required` PRs are accurately called out in the final release notes
-- [ ] Review and approve the PR
+### Acceptance decisions (sdk#84)
 
-### Step 3: Create the GitHub Release
+- Removed upstream-only workflows leave no `push`, `pull_request`, `issues`,
+  `issue_comment`, `schedule` or `release` trigger behind; `release-binaries.yml`
+  keeps its `release` trigger because it only builds and attaches linux binaries
+  and is covered by sdk#83. `tests/cross/test_fork_workflow_triggers.py` fails if
+  a removed workflow file returns or if any other workflow gains a `release`,
+  `schedule`, `issues` or `issue_comment` trigger.
+- Publishing is not adopted by default. The three publish workflows keep their
+  steps (a future publish is not forbidden) but only start from
+  `workflow_dispatch`, and the job is skipped unless the `confirm` input equals
+  the exact word listed above. There is no fallback publish path when a secret
+  is missing, and fork PRs have no way to start them.
+- `pypi-release.yml` no longer dispatches `version-bump-prs.yml` after
+  publishing, and its `actions: write` permission was removed.
+- The `pr-description-check.yml` linked-issue `ready-for-dev` label lookup is
+  not enforced: the workflow passes no `GITHUB_TOKEN`, so
+  `check_pr_description.py` still requires a linked issue reference and the PR
+  template sections but skips the label lookup. This is because
+  `issue-readiness-check.yml` was removed and nothing applies the label.
+  `.github/scripts/check_issue_readiness.py` and `post-readiness-comment.mjs`
+  are left in place unused (non-goal: no source changes).
+- `pr-artifacts.yml` was removed instead of reduced to a read-only check: its
+  only valuable part was the automatic `.pr/` cleanup, which needs write
+  access. Delete `.pr/` yourself before merging (see AGENTS.md "PR_ARTIFACTS").
+- `run-eval.yml`, `integration-runner.yml`, `run-examples.yml` and
+  `security-scan.yml` stay as the evaluation path. They start only from
+  dispatch, a label on a same-repository PR, or (security-scan) a `rel-*` PR;
+  an unlabeled PR starts none of them. Unchanged and still correct:
+  `run-examples.yml` and `security-scan.yml`.
+- Out of scope and kept as is: `validate`, Python/REST/OpenAPI compatibility
+  checks, and the TypeScript CI / integration / endpoint-audit workflows.
 
-1. Go to [Releases](https://github.com/OpenHands/software-agent-sdk/releases/new)
-2. Click **"Draft a new release"**
-3. Configure the release:
-   - **Tag**: `vX.Y.Z` (must match the version)
-   - **Branch**: `rel-X.Y.Z` (the branch created by the workflow)
-   - **Previous tag**: Select the previous release version
-4. Click **"Generate release notes"** to auto-generate the changelog
-5. Review and edit the release notes as needed
-6. Click **"Publish release"**
+### Required checks 移行 (sdk#84)
 
-### Step 4: PyPI Publication (Automated)
+Main branch protection is unconfirmed (403 with the available token, rulesets
+API returns `[]`). The operator must check Settings > Branches in the GitHub UI
+and remove any of the following that is required; nothing was changed in
+repository settings.
 
-Once the release is published, the **pypi-release.yml** workflow will automatically:
-- ✅ Build all packages (openhands-sdk, openhands-tools, openhands-workspace, openhands-agent-server)
-- ✅ Publish them to PyPI
+| Check / job | Workflow | Change |
+|---|---|---|
+| `dispatch` | `deploy-docs.yml` | deleted |
+| `cancel-eval` | `cancel-eval.yml` | deleted |
+| `prepare-release` | `prepare-release.yml` | deleted |
+| `create-version-bump-prs`, `bump-typescript-client` | `version-bump-prs.yml` | deleted |
+| `create-release` | `create-release.yml` | deleted |
+| `stale` | `stale.yml` | deleted |
+| `smoke-clone`, `issue-duplicate-check`, `auto-close-duplicates` | `issue-duplicate-checker.yml` | deleted |
+| `remove-duplicate-candidate` | `remove-duplicate-candidate-label.yml` | deleted |
+| `scan-todos`, `process-todos`, `summary` | `todo-management.yml` | deleted |
+| `check`, `Refresh PR gates for linked issues` | `issue-readiness-check.yml` | deleted |
+| `cleanup-on-approval`, `check-pr-artifacts`, `cleanup-after-merge` | `pr-artifacts.yml` | deleted |
+| `publish` | `pypi-release.yml`, `typescript-client-*-publish.yml` | skipped unless dispatched with `confirm` |
+| `print-parameters`, `build-and-evaluate` | `run-eval.yml` | skipped on fork PRs and on release |
+| `Validate PR description` | `pr-description-check.yml` | kept, trigger is now `pull_request` |
 
-You can monitor the progress in the [Actions tab](https://github.com/OpenHands/software-agent-sdk/actions/workflows/pypi-release.yml).
+Unchanged and required to stay: `validate`, `build-binary-and-test (ubuntu-latest)`,
+`check-openapi-schema`, `Check package versions`, the review-thread gate and the
+TypeScript client checks.
+
+### Re-syncing with upstream and restoring a workflow
+
+When merging upstream `OpenHands/software-agent-sdk`, expect modify/delete
+conflicts for every removed file and content conflicts in the manual workflows.
+Do not take the upstream side blindly: upstream re-adds `release`, `schedule`
+and `issues` triggers, the `OpenHands/software-agent-sdk` repository gate and
+the write permissions removed here. After a merge run
+`pytest tests/cross/test_fork_workflow_triggers.py`; it names any workflow that
+came back.
+
+To restore a deleted workflow deliberately, take it from the last commit that
+had it (`git show c62f7a493:.github/workflows/<name>.yml > .github/workflows/<name>.yml`),
+replace the `OpenHands/software-agent-sdk` repository gate with this
+repository, remove triggers and write permissions you do not need, update
+`tests/cross/test_fork_workflow_triggers.py` and this document, then confirm
+the required checks in the GitHub UI.
+
+## Release binaries and Agent Server images
+
+`release-binaries.yml` and `server.yml` are kept (sdk#82, sdk#83); the sections
+below describe them.
 
 ### Step 4b: Release Binaries (Automated)
 
-In parallel with the PyPI workflow, **release-binaries.yml** also fires on `release: published`.
+**release-binaries.yml** fires on `release: published` (a release created by hand).
 It also runs on every push to `main` as ongoing smoke coverage. It:
 
 - ✅ Builds the agent-server PyInstaller binary on `ubuntu-24.04` (linux x86_64
@@ -132,10 +213,8 @@ that was published with `publish=true`.
 - Credentials: only `secrets.GITHUB_TOKEN` through `docker/login-action`; it is
   never echoed. Auth failures, tag conflicts, pull failures, an unreachable
   `/health` and cancellations show as failed or cancelled jobs.
-- Not changed: `version-bump-prs.yml` `bump-typescript-client` still waits up to
-  45 minutes for `ghcr.io/openhands/agent-server:<X.Y.Z>-python`; it runs only
-  in `OpenHands/software-agent-sdk` (never in this fork), so it is out of scope.
-  A release there needs a `server.yml` dispatch with `publish=true` first.
+- `version-bump-prs.yml` (which waited for `ghcr.io/openhands/agent-server:<X.Y.Z>-python`)
+  was removed in sdk#84.
 
 #### Build time / runner expectations
 
@@ -150,36 +229,18 @@ No QEMU is needed: every job runs on an `ubuntu-24.04` (x86_64) runner and runs
 `linux/amd64` images natively. The Docker jobs in `server.yml` set up Docker
 Buildx for `docker/build-push-action` and `docker buildx imagetools`.
 
-### Step 5: Version Bump PRs (Automated)
-
-After successful PyPI publication, the workflow will automatically create PRs to update SDK versions in downstream repositories:
-
-- **[OpenHands-CLI](https://github.com/OpenHands/openhands-cli)** - Updates `openhands-sdk` and `openhands-tools` versions
-- **[automation](https://github.com/OpenHands/automation)** - Updates `openhands-sdk` and `openhands-workspace` versions. Opened with a `fix:` title so the repo's release-please cuts a patch release, publishing an `openhands-automation` build pinned to this SDK (which the agent-canvas `sdk-version-sync` check requires).
-- **TypeScript client (`clients/typescript`)** - Opens a PR in this repository after both the exact GHCR image and release `openapi.json` are available, updates `config.agentServerImage`, regenerates the checked-in transport types, and includes an API-change summary.
-
-These PRs will:
-- Be created automatically with branch name `bump-sdk-X.Y.Z` (`bump-agent-server-X.Y.Z` for typescript-client)
-- Include links back to the SDK release
-- Include generated Agent Server contract changes for the exact released
-  version rather than only changing the image tag
-- Need to be reviewed and merged by maintainers
-
-### Step 6: Post-Release Tasks
-
-- [ ] Merge the release PR to main
-- [ ] Review and merge the auto-created version bump PRs in OpenHands-CLI, automation, and the TypeScript client (merging the automation PR triggers its release-please release PR; merge that too to publish the pinned `openhands-automation`)
-- [ ] Announce the release
-
 ## Manual PyPI Release (If Needed)
 
-If you need to manually trigger the PyPI release workflow:
+Publishing is not adopted by default (sdk#84). To publish deliberately:
 
-1. Go to the [Actions tab](https://github.com/OpenHands/software-agent-sdk/actions)
-2. Select **"Publish all OpenHands packages (uv)"** workflow
-3. Click **"Run workflow"**
-4. Select the branch/tag you want to publish from
-5. Click **"Run workflow"**
+1. Go to the Actions tab of this repository.
+2. Select **"Publish all OpenHands packages (uv)"** and click **"Run workflow"**.
+3. Select the branch/tag to publish from and type `publish-pypi` in `confirm`.
+4. Click **"Run workflow"**. Any other `confirm` value skips the job.
+
+The secret `PYPI_TOKEN_OPENHANDS` must exist; the job fails when it is missing.
+The npm and GitHub Packages workflows work the same way with `publish-npm` and
+`publish-github-packages` plus a `version` input.
 
 ## CI scope and required checks
 
@@ -211,25 +272,13 @@ checks. In `release-binaries.yml`, `resolve-tag`, `build-binary`,
 
 ## Workflow Files
 
-- `.github/workflows/prepare-release.yml` - Automated release preparation
-- `.github/workflows/pypi-release.yml` - PyPI package publication
+- `.github/workflows/pypi-release.yml` - PyPI package publication (manual, confirmation required)
 - `.github/workflows/release-binaries.yml` - Linux x86_64 binary and OpenAPI
   publishing on releases and main pushes
 - `.github/workflows/server.yml` - binary/OpenAPI checks on push and PR; on
   demand (`workflow_dispatch`) Docker build, smoke test and optional publish
 
 ## Troubleshooting
-
-### Version Format Error
-
-If you get a version format error, ensure you're using the format `X.Y.Z` (e.g., `1.2.3`), not `vX.Y.Z`.
-
-### PR Creation Failed
-
-If the PR creation fails, check:
-- The branch doesn't already exist
-- You have proper permissions
-- The `GITHUB_TOKEN` has sufficient permissions
 
 ### PyPI Publication Failed
 
@@ -257,17 +306,3 @@ If a `server.yml` dispatch fails:
   the dispatch.
 - **`/health` never responded**: open the failing job; the cleanup trap dumps
   the last 100 lines of `docker logs` for the container.
-
-## Previous Manual Process
-
-For reference, the previous manual release checklist was:
-
-- [ ] Checkout SDK repo, use `make set-package-version version=x.x.x` to set the version
-- [ ] Push to a branch like `rel-x.x.x` and start a PR
-- [ ] Fix any "deprecation deadlines" if they exist
-- [ ] Tag "integration-tests" and make sure integration test all pass
-- [ ] Tag "test-examples" and make sure example checks all pass
-- [ ] Draft a new release
-- [ ] Use workflow to publish to PyPI on tag `v1.X.X`
-
-Most of these steps are now automated!
