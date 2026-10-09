@@ -1,7 +1,10 @@
 """Shared test utilities for terminal tests."""
 
 import platform
+import socket
+import subprocess
 import tempfile
+import time
 from pathlib import Path
 
 import pytest
@@ -26,6 +29,28 @@ _WINDOWS_UNSUPPORTED_BACKEND_TEST_MODULES = {
     "test_terminal_tool.py",
     "test_tmux_pane_pool.py",
 }
+
+
+def free_port() -> int:
+    with socket.socket() as sock:
+        sock.bind(("", 0))
+        return sock.getsockname()[1]
+
+
+def server_pids(port: int) -> list[str]:
+    result = subprocess.run(
+        ["pgrep", "-f", f"http.server {port}"], capture_output=True, text=True
+    )
+    return result.stdout.split()
+
+
+def wait_server_gone(port: int, timeout: float = 5.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while server_pids(port):
+        if time.monotonic() > deadline:
+            return False
+        time.sleep(0.1)
+    return True
 
 
 def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:

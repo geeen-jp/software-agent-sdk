@@ -11,7 +11,6 @@ and run the parametrized tests for each one.
 
 import logging
 import os
-import socket
 import subprocess
 import tempfile
 import time
@@ -29,7 +28,12 @@ from openhands.tools.terminal.terminal import (
     create_terminal_session,
 )
 
-from .conftest import get_no_change_timeout_suffix
+from .conftest import (
+    free_port,
+    get_no_change_timeout_suffix,
+    server_pids,
+    wait_server_gone,
+)
 
 
 logger = get_logger(__name__)
@@ -658,32 +662,10 @@ def _run_bash_action(session, command: str, **kwargs):
     return obs
 
 
-def _free_port() -> int:
-    with socket.socket() as sock:
-        sock.bind(("", 0))
-        return sock.getsockname()[1]
-
-
-def _server_pids(port: int) -> list[str]:
-    result = subprocess.run(
-        ["pgrep", "-f", f"http.server {port}"], capture_output=True, text=True
-    )
-    return result.stdout.split()
-
-
-def _wait_server_gone(port: int, timeout: float = 5.0) -> bool:
-    deadline = time.monotonic() + timeout
-    while _server_pids(port):
-        if time.monotonic() > deadline:
-            return False
-        time.sleep(0.1)
-    return True
-
-
 @parametrize_terminal_types
 def test_bash_server(terminal_type):
     """Test running a server with timeout and interrupt."""
-    port = _free_port()
+    port = free_port()
     with tempfile.TemporaryDirectory() as temp_dir:
         session = create_terminal_session(
             work_dir=temp_dir, terminal_type=terminal_type
@@ -716,13 +698,13 @@ def test_bash_server(terminal_type):
 
         finally:
             session.close()
-    assert _wait_server_gone(port)
+    assert wait_server_gone(port)
 
 
 @parametrize_terminal_types
 def test_bash_background_server(terminal_type):
     """Test running a server in background."""
-    server_port = _free_port()
+    server_port = free_port()
     with tempfile.TemporaryDirectory() as temp_dir:
         session = create_terminal_session(
             work_dir=temp_dir, terminal_type=terminal_type
@@ -748,7 +730,7 @@ def test_bash_background_server(terminal_type):
 
         finally:
             session.close()
-    assert _wait_server_gone(server_port)
+    assert wait_server_gone(server_port)
 
 
 @parametrize_terminal_types
@@ -762,7 +744,7 @@ def test_bash_background_server(terminal_type):
 )
 def test_close_reaps_server_process_group(terminal_type, command_template):
     """close() must end servers that run in their own job-control process group."""
-    port = _free_port()
+    port = free_port()
     with tempfile.TemporaryDirectory() as temp_dir:
         session = create_terminal_session(
             work_dir=temp_dir, terminal_type=terminal_type
@@ -771,12 +753,12 @@ def test_close_reaps_server_process_group(terminal_type, command_template):
         try:
             _run_bash_action(session, command_template.format(port=port), timeout=1.0)
             deadline = time.monotonic() + 5
-            while not _server_pids(port) and time.monotonic() < deadline:
+            while not server_pids(port) and time.monotonic() < deadline:
                 time.sleep(0.1)
-            assert _server_pids(port)
+            assert server_pids(port)
         finally:
             session.close()
-    assert _wait_server_gone(port)
+    assert wait_server_gone(port)
 
 
 @parametrize_terminal_types
