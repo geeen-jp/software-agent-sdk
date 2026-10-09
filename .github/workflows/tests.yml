@@ -1,4 +1,9 @@
 ---
+# Overlap with `make validate` (workflow Validate), kept on purpose: these jobs
+# run the same test directories but add what validate does not provide: `-vvs`
+# with coverage collection/upload and the PR coverage report, per-directory
+# change detection, the agent-server stress suite, and the test-directory
+# guard. No job here is a pure duplicate, so none was removed or manualized.
 name: Run tests
 
 on:
