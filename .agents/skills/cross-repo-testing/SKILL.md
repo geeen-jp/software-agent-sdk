@@ -73,11 +73,10 @@ Use this when the Cloud server depends on SDK changes that haven't been released
 
 ### B1. Get the SDK PR merged (or identify the commit)
 
-The SDK PR must have CI pass so its agent-server Docker image is built. The image is tagged with the **merge-commit SHA** from GitHub Actions — NOT the head-commit SHA shown in the PR.
+The agent-server Docker image is no longer built by PR or main CI. Dispatch the **Agent Server** workflow (`server.yml`) on the branch or commit with `publish=true`; the published image is tagged `<short-sha>-<variant>` for the commit that was dispatched.
 
 Find the correct image tag:
-- Check the SDK PR description for an `AGENT_SERVER_IMAGES` section
-- Or check the "Consolidate Build Information" CI job for `"short_sha": "<tag>"`
+- Check the `Publish GHCR tags` job log of that run for the `Published ... as:` line
 
 ### B2. Pin SDK packages to the commit in the OpenHands PR
 
