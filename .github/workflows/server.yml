@@ -11,9 +11,11 @@ on:
     workflow_dispatch:
         inputs:
             base_image:
-                description: Base runtime image
+                description: >-
+                    Base runtime image (empty uses each variant's own base
+                    image: python, java and golang)
                 type: string
-                default: nikolaik/python-nodejs:python3.13-nodejs22-slim
+                default: ''
             image:
                 description: GHCR image name (empty uses ghcr.io/<owner>/agent-server)
                 type: string

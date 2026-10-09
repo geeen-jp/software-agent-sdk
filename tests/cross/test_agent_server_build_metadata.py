@@ -205,3 +205,15 @@ def test_server_workflow_is_ubuntu_amd64_only() -> None:
         for entry in job.get("strategy", {}).get("matrix", {}).get("include", []):
             assert entry.get("arch", "amd64") == "amd64"
             assert entry.get("platform", "linux/amd64") == "linux/amd64"
+
+
+def test_server_workflow_default_dispatch_keeps_each_variant_base_image() -> None:
+    workflow = yaml.safe_load(SERVER_WORKFLOW.read_text(encoding="utf-8"))
+    dispatch_inputs = workflow[True]["workflow_dispatch"]["inputs"]
+    assert dispatch_inputs["base_image"]["default"] == ""
+
+    job = workflow["jobs"]["build-and-push-image"]
+    legs = job["strategy"]["matrix"]["include"]
+    bases = {leg["variant"]: leg["base_image"] for leg in legs}
+    assert len(set(bases.values())) == len(bases) == 3
+    assert "matrix.base_image" in job["env"]["BASE_IMAGE"]
