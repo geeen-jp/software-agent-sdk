@@ -21,7 +21,7 @@ on:
             platforms:
                 description: Target platforms
                 type: string
-                default: linux/amd64,linux/arm64
+                default: linux/amd64
             install_acp_providers:
                 description: Comma-separated ACP provider keys to bake into the image
                 type: string
@@ -35,13 +35,17 @@ permissions:
     contents: read
     packages: write
 
+# CI scope: Ubuntu linux/amd64 only. Windows, macOS and linux/arm64 jobs were
+# removed (sdk#82); the single-entry matrices below are kept so the existing
+# check names (e.g. `build-binary-and-test (ubuntu-latest)`) do not change.
+
 jobs:
     build-binary-and-test:
         runs-on: ${{ matrix.os }}
         strategy:
             fail-fast: false
             matrix:
-                os: [ubuntu-latest, macos-latest, windows-latest]
+                os: [ubuntu-latest]
         steps:
             - uses: actions/checkout@v7
 
@@ -53,26 +57,15 @@ jobs:
             - name: Install dependencies
               run: uv sync --dev
 
-            - name: Build binary (Unix)
-              if: runner.os != 'Windows'
+            - name: Build binary
               run: make build-server
-
-            # Windows runners have no `make`; invoke PyInstaller directly.
-            - name: Build binary (Windows)
-              if: runner.os == 'Windows'
-              shell: bash
-              run: uv run pyinstaller openhands-agent-server/openhands/agent_server/agent-server.spec
 
             - name: Test binary
               shell: bash
               run: |
                   set -euo pipefail
 
-                  if [[ "${RUNNER_OS:-}" == "Windows" ]]; then
-                      BIN=./dist/openhands-agent-server.exe
-                  else
-                      BIN=./dist/openhands-agent-server
-                  fi
+                  BIN=./dist/openhands-agent-server
 
                   "$BIN" --help
 
@@ -115,11 +108,7 @@ jobs:
               run: |
                   set -euo pipefail
 
-                  if [[ "${RUNNER_OS:-}" == "Windows" ]]; then
-                      BIN=./dist/openhands-agent-server.exe
-                  else
-                      BIN=./dist/openhands-agent-server
-                  fi
+                  BIN=./dist/openhands-agent-server
 
                   wait_for_log() {
                       local log_file=$1
@@ -143,10 +132,6 @@ jobs:
 
                   # Create a temporary directory with an external tool module
                   TOOL_DIR=$(mktemp -d)
-                  EXTRA_TOOL_DIR=$TOOL_DIR
-                  if [[ "${RUNNER_OS:-}" == "Windows" ]]; then
-                      EXTRA_TOOL_DIR=$(cygpath -w "$TOOL_DIR")
-                  fi
 
                   cat > "$TOOL_DIR/ci_test_tool.py" << 'TOOL_EOF'
                   """CI smoke-test tool: NOT bundled in the binary.
@@ -176,7 +161,7 @@ jobs:
                   rm -f neg_test.log
 
                   echo "=== Positive test: import WITH OH_EXTRA_PYTHON_PATH ==="
-                  OH_EXTRA_PYTHON_PATH="$EXTRA_TOOL_DIR" \
+                  OH_EXTRA_PYTHON_PATH="$TOOL_DIR" \
                       "$BIN" --import-modules ci_test_tool --port 8004 \
                       > pos_test.log 2>&1 &
                   POS_PID=$!
@@ -204,7 +189,7 @@ jobs:
                   stop_process "$POS_PID"
 
                   echo "=== Positive test: import WITH --extra-python-path CLI flag ==="
-                  "$BIN" --extra-python-path "$EXTRA_TOOL_DIR" \
+                  "$BIN" --extra-python-path "$TOOL_DIR" \
                       --import-modules ci_test_tool --port 8005 \
                       > cli_test.log 2>&1 &
                   CLI_PID=$!
@@ -278,47 +263,25 @@ jobs:
         strategy:
             fail-fast: false
             matrix:
-                # Explicit matrix: 3 variants × 2 architectures = 6 jobs
-                # Each job specifies exactly what it builds and where it runs
+                # Explicit matrix: 3 variants x linux/amd64 = 3 jobs
                 include:
-                    # Python variant
                     - variant: python
                       arch: amd64
                       base_image: nikolaik/python-nodejs:python3.13-nodejs22-slim
                       runner: ubuntu-24.04
                       platform: linux/amd64
 
-                    - variant: python
-                      arch: arm64
-                      base_image: nikolaik/python-nodejs:python3.13-nodejs22-slim
-                      runner: ubuntu-24.04-arm
-                      platform: linux/arm64
-
-                    # Java variant
                     - variant: java
                       arch: amd64
                       base_image: eclipse-temurin:17-jdk
                       runner: ubuntu-24.04
                       platform: linux/amd64
 
-                    - variant: java
-                      arch: arm64
-                      base_image: eclipse-temurin:17-jdk
-                      runner: ubuntu-24.04-arm
-                      platform: linux/arm64
-
-                    # Golang variant
                     - variant: golang
                       arch: amd64
                       base_image: golang:1.21-bookworm
                       runner: ubuntu-24.04
                       platform: linux/amd64
-
-                    - variant: golang
-                      arch: arm64
-                      base_image: golang:1.21-bookworm
-                      runner: ubuntu-24.04-arm
-                      platform: linux/arm64
 
         runs-on: ${{ matrix.runner }}
 
@@ -529,7 +492,7 @@ jobs:
                   username: ${{ github.actor }}
                   password: ${{ secrets.GITHUB_TOKEN }}
 
-            - name: Create and push multi-arch manifest for ${{ matrix.variant }}
+            - name: Create and push amd64 manifest tags for ${{ matrix.variant }}
               id: create_manifest
               env:
                   GIT_REF: ${{ github.ref }}
@@ -544,14 +507,13 @@ jobs:
                       local manifest_tag=$1
                       local source_tag=${2:-$1}
 
-                      echo "Creating multi-arch manifest: ${IMAGE}:${manifest_tag}"
+                      echo "Creating arch-less manifest tag: ${IMAGE}:${manifest_tag}"
                       docker buildx imagetools create -t ${IMAGE}:${manifest_tag} \
-                        ${IMAGE}:${source_tag}-amd64 \
-                        ${IMAGE}:${source_tag}-arm64
+                        ${IMAGE}:${source_tag}-amd64
 
-                      echo "Inspecting multi-arch manifest:"
+                      echo "Inspecting manifest:"
                       docker buildx imagetools inspect ${IMAGE}:${manifest_tag}
-                      echo "✓ Multi-arch manifest created: ${IMAGE}:${manifest_tag}"
+                      echo "✓ Manifest created: ${IMAGE}:${manifest_tag}"
                   }
 
                   IFS=',' read -ra AMD64_TAGS <<< "$AMD64_TAGS_CSV"
@@ -815,7 +777,7 @@ jobs:
                       echo "DEBUG: Processing build JSON: $VARIANT_JSON"
                       CUSTOM_TAGS=$(echo "$VARIANT_JSON" | jq -r '.custom_tags')
                       BASE_IMAGE=$(echo "$VARIANT_JSON" | jq -r '.base_image')
-                      ARCHS=$(echo "$VARIANT_JSON" | jq -r '.architectures // "amd64, arm64"')
+                      ARCHS=$(echo "$VARIANT_JSON" | jq -r '.architectures // "amd64"')
                       
                       echo "DEBUG: Adding variant $CUSTOM_TAGS with base image $BASE_IMAGE (archs: $ARCHS)"
                       # Add to variants table with architecture info
@@ -840,9 +802,9 @@ jobs:
                   |---|---|---|---|
                   ${VARIANTS_TABLE}
 
-                  **Pull (multi-arch manifest)**
+                  **Pull (linux/amd64)**
                   \`\`\`bash
-                  # Each variant is a multi-arch manifest supporting both amd64 and arm64
+                  # Each variant tag is a linux/amd64 image
                   docker pull ${IMAGE}:${SHORT_SHA}-python
                   \`\`\`
 
@@ -859,10 +821,9 @@ jobs:
                   ${ALL_TAGS}
                   \`\`\`
 
-                  **About Multi-Architecture Support**
-                  - Each variant tag (e.g., \`${SHORT_SHA}-python\`) is a **multi-arch manifest** supporting both **amd64** and **arm64**
-                  - Docker automatically pulls the correct architecture for your platform
-                  - Individual architecture tags (e.g., \`${SHORT_SHA}-python-amd64\`) are also available if needed
+                  **About Architecture Support**
+                  - Each variant tag (e.g., \`${SHORT_SHA}-python\`) is a **linux/amd64** image; arm64 images are not published
+                  - The architecture-suffixed tag (e.g., \`${SHORT_SHA}-python-amd64\`) is also available
                   </details>
                   <!-- AGENT_SERVER_IMAGES_END -->
                   EOF
