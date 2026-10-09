@@ -1,6 +1,18 @@
 ---
 # .github/workflows/validate.yml
 # Job name `validate` is the check name the ai-dev merge coordinator looks for.
+# `make validate` prints `SUITE name=... status=... seconds=... tests="..."`
+# lines (scripts/validate-suite.sh). They are copied to the step summary here,
+# outside the env -i allowlist, also when the job fails or is cancelled; a
+# `status=start` line without a result line names the suite that hung.
+# timeout-minutes stays at 31. Baseline (2026-10-09, host, origin/main
+# b8db61451): `make validate` rc 0 in 1034s (17m14s); an earlier run took
+# about 18 minutes with the tools suite at 437.78s (916 passed, 44 skipped).
+# The pyright step is kept apart from the pre-commit pyright hook: `uv run
+# pyright` checks the pyproject `include` paths, the hook is given every
+# tracked *.py file (also .github/ and .agents/), so they are not the same
+# check (about 43s bare vs 40s with the file list, same venv-less scratch
+# checkout).
 name: Validate
 
 on:
@@ -25,4 +37,16 @@ jobs:
                   python-version: '3.13'
 
             - name: Run make validate
-              run: make validate
+              run: |
+                  set -o pipefail
+                  make validate 2>&1 | tee "$RUNNER_TEMP/validate.log"
+
+            - name: Suite timing summary
+              if: always()
+              run: |
+                  {
+                    echo '### make validate suites'
+                    echo '```'
+                    grep '^SUITE ' "$RUNNER_TEMP/validate.log" || echo 'no SUITE lines'
+                    echo '```'
+                  } >> "$GITHUB_STEP_SUMMARY"
