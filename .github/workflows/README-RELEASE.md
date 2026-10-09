@@ -8,7 +8,7 @@ The release process has been automated with three GitHub Actions workflows:
 
 1. **prepare-release.yml** - Prepares a release PR with version updates
 2. **pypi-release.yml** - Automatically publishes packages to PyPI when a release is created
-3. **release-binaries.yml** - Builds and smoke-tests multi-arch agent-server binaries
+3. **release-binaries.yml** - Builds and smoke-tests the linux x86_64 agent-server binary
    on releases and main pushes; release runs also attach binaries to the release
 
 ## How to Create a New Release
@@ -63,17 +63,17 @@ You can monitor the progress in the [Actions tab](https://github.com/OpenHands/s
 In parallel with the PyPI workflow, **release-binaries.yml** also fires on `release: published`.
 It also runs on every push to `main` as ongoing smoke coverage. It:
 
-- ✅ Builds the agent-server PyInstaller binary on a 5-runner matrix
-  (linux x86_64/arm64, macOS x86_64/arm64, windows x86_64) and smoke-tests each
+- ✅ Builds the agent-server PyInstaller binary on `ubuntu-24.04` (linux x86_64
+  only; macOS, Windows and arm64 builds were removed) and smoke-tests it
 - ✅ Exports and validates the deterministic public Agent Server contract as
   `openapi.json`, with `info.version` matching the release version
 - ✅ Generates a combined `SHA256SUMS` and attaches the binaries and
   `openapi.json` to the GitHub release on release/manual runs
-- ✅ Verifies that the multi-arch Docker manifest
+- ✅ Verifies that the Docker manifest
   `ghcr.io/openhands/agent-server:<image-tag>-<variant>` published by
-  `server.yml` covers both `linux/amd64` and `linux/arm64` for every variant
+  `server.yml` covers `linux/amd64` for every variant
   (`python`, `java`, `golang`)
-- ✅ Pulls each variant on each architecture with `--platform=linux/<arch>`,
+- ✅ Pulls each variant with `--platform=linux/amd64`,
   boots the container, and asserts `/health` responds
 
 On `push` events, `<image-tag>` is the 7-character commit SHA and binaries plus
@@ -85,18 +85,17 @@ uploaded to the GitHub release.
 
 | Stage | Runtime (typical) | Runners |
 |---|---|---|
-| Binary builds (5-way matrix, parallel) | ~10–15 min on Linux, ~12–18 min on macOS | `ubuntu-24.04`, `ubuntu-24.04-arm`, `macos-15-intel`, `macos-14`, `windows-2022` |
+| Binary build (single linux x86_64 leg) | ~10–15 min | `ubuntu-24.04` |
 | `publish-binaries` (download + checksum + upload) | ~1–2 min | `ubuntu-24.04` |
-| `docker-smoke-test` (6-way matrix, parallel) | Up to 45 min (mostly polling for the docker images) | `ubuntu-24.04` for amd64, `ubuntu-24.04-arm` for arm64 |
+| `docker-smoke-test` (3-way matrix, parallel) | Up to 45 min (mostly polling for the docker images) | `ubuntu-24.04` (amd64) |
 
 #### QEMU / buildx requirements
 
-The smoke test does **not** require QEMU: each (variant, arch) job runs on a
-runner whose architecture matches `--platform=linux/<arch>`, so containers run
-natively. We do still set up Docker Buildx so we can call
-`docker buildx imagetools inspect` on the multi-arch manifest list.
+The smoke test does **not** require QEMU: every job runs on an `ubuntu-24.04`
+(x86_64) runner and pulls `--platform=linux/amd64`, so containers run natively. We do still set up Docker Buildx so we can call
+`docker buildx imagetools inspect` on the manifest.
 
-The wait window for the multi-arch manifest is 45 min — long enough to absorb
+The wait window for the manifest is 45 min — long enough to absorb
 the full `server.yml` matrix runtime (~25–30 min for `build-and-push-image` +
 `merge-manifests`) when this workflow races the corresponding `server.yml` run
 for a release tag or main-branch push.
@@ -134,11 +133,15 @@ If you need to manually trigger the PyPI release workflow:
 4. Select the branch/tag you want to publish from
 5. Click **"Run workflow"**
 
+## CI scope and required checks
+
+CI targets Ubuntu linux/amd64 only (sdk#82). Removed checks: `windows-tests` (`tests.yml`); `build-binary-and-test (macos-latest)` and `(windows-latest)`, `Build & Push (<variant>-arm64)` (`server.yml`); `Build (linux-arm64)`, `Build (macos-x86_64)`, `Build (macos-arm64)`, `Build (windows-x86_64)`, `Docker (<variant>-arm64)` (`release-binaries.yml`). Remaining check names are unchanged. Main branch protection could not be read with the available token (403; rulesets API returns `[]`), so an operator must confirm in the GitHub UI that no removed check is a required status check and drop it if so; this was not changed from the repository.
+
 ## Workflow Files
 
 - `.github/workflows/prepare-release.yml` - Automated release preparation
 - `.github/workflows/pypi-release.yml` - PyPI package publication
-- `.github/workflows/release-binaries.yml` - Multi-arch binary publishing and
+- `.github/workflows/release-binaries.yml` - Linux x86_64 binary publishing and
   docker manifest smoke test on releases and main pushes
 
 ## Troubleshooting
@@ -167,7 +170,7 @@ If `release-binaries.yml` fails:
 - **Binary build failure**: re-run the failed matrix job; PyInstaller flakes are
   rare but possible. If it persists, the issue is likely in `agent-server.spec`.
 - **`docker-smoke-test` timed out waiting for the manifest**: `server.yml` did
-  not publish multi-arch images for the matching release tag or commit SHA.
+  not publish images for the matching release tag or commit SHA.
   Check that workflow's corresponding run and re-trigger if needed.
 - **`/health` never responded**: open the failing job; the cleanup trap dumps
   the last 100 lines of `docker logs` for the container.
