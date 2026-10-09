@@ -277,10 +277,12 @@ in `.github/release-please/typescript-client-config.json` and
 `.github/release-please/typescript-client-manifest.json`.
 
 Release-please maintains the client release PR and creates component tags named
-`typescript-client-vX.Y.Z`. Publishing that GitHub release triggers
+`typescript-client-vX.Y.Z`. In this fork, publishing a GitHub release does not publish the package:
 `.github/workflows/typescript-client-npm-publish.yml` and
-`.github/workflows/typescript-client-github-packages-publish.yml`; both workflows
-also accept a `workflow_dispatch` version for manual recovery. The npm package
+`.github/workflows/typescript-client-github-packages-publish.yml` run only from
+`workflow_dispatch` with a `version` and an exact `confirm` input
+(`publish-npm` / `publish-github-packages`; see
+`.github/workflows/README-RELEASE.md`). The npm package
 version is independent of the Python SDK release and the tracked Agent Server
 image version.
 
@@ -293,13 +295,12 @@ SDK release `vX.Y.Z`). The **source of truth** is `package.json` →
 `config.agentServerImage`; `AGENTS.md`, `README.md`, and the generated schema
 mirror the same version.
 
-After an SDK release, the root `.github/workflows/version-bump-prs.yml` workflow
-opens a `bump-typescript-agent-server-X.Y.Z` PR in this repository. It updates
-the pinned image and mirrors, regenerates the transport contract from the
-release's `openapi.json`, and includes an API-change summary. The client CI and
-integration workflows validate that PR against the new image. This is
-independent of the npm package version — bumping the tracked server does **not**
-cut a client release.
+In this fork there is no automatic bump PR (the upstream root
+`version-bump-prs.yml` workflow was deleted). After adopting a new SDK release,
+update the pin and its mirrors by hand, regenerate the transport contract from
+the release's `openapi.json`, and let the client CI and integration workflows
+validate the change against the new image. This is independent of the npm
+package version — bumping the tracked server does **not** cut a client release.
 
 The generated transport contract in
 `src/generated/agent-server-schema.ts` comes from that same exact pin. Run

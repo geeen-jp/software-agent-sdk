@@ -4,8 +4,9 @@ run-name: >-
     Run Integration Tests ${{ inputs.reason || github.event.label.name || 'manual' }}
 
 on:
-    # Use pull_request_target to access secrets even on fork PRs.
-    # Labeled PR runs are gated per job to integration-test and behavior-test.
+    # Labeled PR runs are gated per job to integration-test and behavior-test
+    # and to same-repository PRs: fork PRs never reach the secrets or the
+    # write permissions below. Manual runs use workflow_dispatch.
     pull_request_target:
         types:
             - labeled
@@ -54,8 +55,9 @@ jobs:
     setup-matrix:
         if: >-
             github.event_name != 'pull_request_target' ||
-            github.event.label.name == 'integration-test' ||
-            github.event.label.name == 'behavior-test'
+            (github.event.pull_request.head.repo.full_name == github.repository &&
+             (github.event.label.name == 'integration-test' ||
+              github.event.label.name == 'behavior-test'))
         runs-on: ubuntu-latest
         outputs:
             matrix: ${{ steps.resolve-models.outputs.matrix }}
@@ -171,7 +173,8 @@ jobs:
     # Post initial comment for label triggers (no dependencies - runs immediately)
     post-label-comment:
         if: >
-            github.event_name == 'pull_request_target' && (
+            github.event_name == 'pull_request_target' &&
+            github.event.pull_request.head.repo.full_name == github.repository && (
                 github.event.label.name == 'integration-test' ||
                 github.event.label.name == 'behavior-test'
             )
@@ -228,13 +231,14 @@ jobs:
                   printf '%s' "$COMMENT_BODY" | gh issue comment "$ISSUE_NUMBER" --body-file -
 
     run-integration-tests:
-        # Security: Only run when integration-related labels are present or via workflow_dispatch
-        # This prevents automatic execution on fork PRs without maintainer approval
+        # Security: Only run when integration-related labels are present on a
+        # same-repository PR, or via workflow_dispatch. Fork PRs never run.
         # Note: uses always() to run even when comment jobs are skipped
         if: |
             always() && (
                 (
-                    github.event_name == 'pull_request_target' && (
+                    github.event_name == 'pull_request_target' &&
+                    github.event.pull_request.head.repo.full_name == github.repository && (
                         github.event.label.name == 'integration-test' ||
                         github.event.label.name == 'behavior-test'
                     )
@@ -246,7 +250,6 @@ jobs:
         timeout-minutes: 180
         permissions:
             contents: read
-            id-token: write
             pull-requests: write
             issues: write
         strategy:
@@ -258,7 +261,7 @@ jobs:
             - name: Checkout repository
               uses: actions/checkout@v7
               with:
-                  # For pull_request_target: checkout fork PR code (requires explicit repository)
+                  # For pull_request_target: checkout the same-repository PR head
                   # For other events: fallback to current repository and ref
                   repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
                   ref: ${{ github.event.pull_request.head.sha || github.ref }}
@@ -395,7 +398,8 @@ jobs:
         if: |
             always() && (
                 (
-                    github.event_name == 'pull_request_target' && (
+                    github.event_name == 'pull_request_target' &&
+                    github.event.pull_request.head.repo.full_name == github.repository && (
                         github.event.label.name == 'integration-test' ||
                         github.event.label.name == 'behavior-test'
                     )

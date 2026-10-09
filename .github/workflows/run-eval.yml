@@ -1,12 +1,32 @@
 ---
 name: Run Eval
-run-name: Run Eval (${{ github.event.label.name || 'release' }})
+run-name: Run Eval (${{ github.event.label.name || inputs.reason || 'manual' }})
+
+# Dispatches OpenHands/evaluation (EVAL_REPO below) with the secret
+# OPENHANDS_BOT_GITHUB_PAT_EVAL_DISPATCH; the job fails closed when that secret
+# is missing. Starts only from a manual dispatch or a run-eval-* label on a
+# same-repository PR (never fork PRs, never a release event). See
+# README-RELEASE.md.
 
 on:
     pull_request_target:
         types: [labeled]
-    release:
-        types: [published]
+    workflow_dispatch:
+        inputs:
+            reason:
+                description: Reason for manual trigger
+                required: true
+                default: ''
+            eval_limit:
+                description: Number of instances to evaluate
+                required: false
+                default: '1'
+                type: choice
+                options:
+                    - '1'
+                    - '50'
+                    - '200'
+                    - '500'
 
 env:
     EVAL_REPO: OpenHands/evaluation
@@ -15,14 +35,13 @@ env:
 jobs:
     print-parameters:
         if: >
-            github.repository == 'OpenHands/software-agent-sdk' &&
-            ((github.event_name == 'release' &&
-              startsWith(github.event.release.tag_name, 'v')) ||
-             (github.event_name == 'pull_request_target' &&
-              (github.event.label.name == 'run-eval-1' ||
-               github.event.label.name == 'run-eval-50' ||
-               github.event.label.name == 'run-eval-200' ||
-               github.event.label.name == 'run-eval-500')))
+            github.event_name == 'workflow_dispatch' ||
+            (github.event_name == 'pull_request_target' &&
+             github.event.pull_request.head.repo.full_name == github.repository &&
+             (github.event.label.name == 'run-eval-1' ||
+              github.event.label.name == 'run-eval-50' ||
+              github.event.label.name == 'run-eval-200' ||
+              github.event.label.name == 'run-eval-500'))
         runs-on: ubuntu-latest
         steps:
             - name: Print all parameters
@@ -31,7 +50,7 @@ jobs:
                   ACTOR: ${{ github.actor }}
                   REF: ${{ github.ref }}
                   BENCHMARK: swebench
-                  EVAL_LIMIT: ${{ github.event_name == 'release' && '50' || '' }}
+                  EVAL_LIMIT: ${{ inputs.eval_limit || '' }}
                   MODEL_IDS: (default)
                   EVAL_BRANCH: main
                   BENCHMARKS_BRANCH: main
@@ -79,9 +98,6 @@ jobs:
         runs-on: ubuntu-latest
         permissions:
             contents: read
-            packages: write
-            actions: write
-            issues: write
             pull-requests: write
 
         steps:
@@ -100,7 +116,7 @@ jobs:
                   LABEL_NAME: ${{ github.event.label.name }}
                   PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
                   PR_NUMBER_VALUE: ${{ github.event.pull_request.number }}
-                  RELEASE_TAG: ${{ github.event.release.tag_name }}
+                  DISPATCH_EVAL_LIMIT: ${{ inputs.eval_limit }}
               run: |
                   set -euo pipefail
 
@@ -125,18 +141,17 @@ jobs:
                     SDK_SHA="$PR_HEAD_SHA"
                     PR_NUMBER="$PR_NUMBER_VALUE"
                     TRIGGER_DESCRIPTION="Label '${LABEL}' on PR #${PR_NUMBER}"
-                  elif [ "$EVENT_NAME" = "release" ]; then
-                    EVAL_LIMIT=50
-                    # Use tag instead of target_commitish because release branches are automatically deleted after merge
-                    SDK_SHA=$(git rev-parse "$RELEASE_TAG")
+                  elif [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+                    EVAL_LIMIT="$DISPATCH_EVAL_LIMIT"
+                    SDK_SHA=$(git rev-parse HEAD)
                     PR_NUMBER=""
-                    TRIGGER_DESCRIPTION="Release $RELEASE_TAG"
+                    TRIGGER_DESCRIPTION="Manual dispatch on ${GITHUB_REF_NAME}"
                   else
                     echo "Unsupported event: $EVENT_NAME" >&2
                     exit 1
                   fi
 
-                  # Use the default model for label/release triggers. Manual model
+                  # Use the default model for label/dispatch triggers. Manual model
                   # selection and model resolution now live in the eval repo's
                   # eval-job.yml workflow_dispatch (see OpenHands/evaluation#589).
                   MODELS=$(printf '%s' "$DEFAULT_MODEL" | tr ', ' '\n' | sed '/^$/d' | paste -sd, -)
@@ -224,20 +239,10 @@ jobs:
                   EVAL_LIMIT: ${{ steps.params.outputs.eval_limit }}
                   MODELS: ${{ steps.params.outputs.models }}
                   TRIGGER_DESC: ${{ steps.params.outputs.trigger_desc }}
-                  EVENT_NAME: ${{ github.event_name }}
                   PR_NUMBER_INPUT: ${{ steps.params.outputs.pr_number }}
               run: |
                   set -euo pipefail
                   PR_NUMBER="$PR_NUMBER_INPUT"
-                  if [ "$EVENT_NAME" = "release" ] && [ -z "$PR_NUMBER" ]; then
-                    # Attempt to find the merged PR for this commit
-                    PR_NUMBER=$(curl -sS \
-                      -H "Authorization: Bearer $GITHUB_TOKEN" \
-                      -H "Accept: application/vnd.github+json" \
-                      "https://api.github.com/repos/${{ github.repository }}/commits/${SDK_SHA}/pulls" \
-                      | jq -r '.[0].number // ""')
-                  fi
-
                   if [ -z "$PR_NUMBER" ]; then
                     echo "No PR found to comment on; skipping comment"
                     exit 0
