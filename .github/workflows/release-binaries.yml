@@ -2,14 +2,18 @@
 name: Publish agent-server release artifacts
 
 # On release published or push to main:
-#   1. Build the agent-server PyInstaller binary on Linux + macOS for both
-#      x86_64 and arm64, smoke-test it, and upload workflow artifacts.
-#   2. On release events/manual runs, attach those binaries plus a combined
+#   1. Build the agent-server PyInstaller binary on Linux x86_64, smoke-test
+#      it, and upload workflow artifacts.
+#   2. On release events/manual runs, attach that binary plus a combined
 #      SHA256SUMS file to the GitHub release.
-#   3. Smoke-test the multi-arch Docker images pushed by `server.yml`,
-#      verifying that every published variant has a manifest covering both
-#      linux/amd64 and linux/arm64 and that the container actually boots
-#      and answers /health on each architecture.
+#
+# Docker is not part of this workflow (sdk#83). The image build -> push ->
+# pull -> /health smoke now lives in `server.yml` and runs only on an explicit
+# `workflow_dispatch` of that workflow, so nothing here waits for another
+# workflow's images. Removed check: `Docker (<variant>-amd64)`.
+#
+# CI scope: Ubuntu linux/amd64 only. macOS, Windows and linux/arm64 legs were
+# removed (sdk#82); the single-entry matrices keep the remaining check names.
 
 on:
     push:
@@ -25,7 +29,6 @@ on:
 
 permissions:
     contents: write
-    packages: read
 
 jobs:
     resolve-tag:
@@ -37,7 +40,6 @@ jobs:
         outputs:
             tag: ${{ steps.resolve.outputs.tag }}
             version: ${{ steps.resolve.outputs.version }}
-            image_tag: ${{ steps.resolve.outputs.image_tag }}
         steps:
             - id: resolve
               shell: bash
@@ -67,8 +69,7 @@ jobs:
 
                   echo "tag=$TAG" >> "$GITHUB_OUTPUT"
                   echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-                  echo "image_tag=$VERSION" >> "$GITHUB_OUTPUT"
-                  echo "📦 Tag: ${TAG:-<push>}  Image tag: $VERSION"
+                  echo "📦 Tag: ${TAG:-<push>}  Version: $VERSION"
 
     build-binary:
         name: Build (${{ matrix.os_label }}-${{ matrix.arch }})
@@ -80,20 +81,6 @@ jobs:
                 include:
                     - runner: ubuntu-24.04
                       os_label: linux
-                      arch: x86_64
-                    - runner: ubuntu-24.04-arm
-                      os_label: linux
-                      arch: arm64
-                    # macos-13 (Intel) was retired by GitHub on 2025-12-04;
-                    # macos-15-intel is the last x86_64 macOS image (until ~2027).
-                    - runner: macos-15-intel
-                      os_label: macos
-                      arch: x86_64
-                    - runner: macos-14
-                      os_label: macos
-                      arch: arm64
-                    - runner: windows-2022
-                      os_label: windows
                       arch: x86_64
         steps:
             - name: Checkout
@@ -108,25 +95,15 @@ jobs:
             - name: Install dependencies
               run: uv sync --dev
 
-            - name: Build binary (Unix)
-              if: runner.os != 'Windows'
+            - name: Build binary
               run: make build-server
-
-            - name: Build binary (Windows)
-              if: runner.os == 'Windows'
-              shell: bash
-              run: uv run pyinstaller openhands-agent-server/openhands/agent_server/agent-server.spec
 
             - name: Smoke-test binary
               shell: bash
               run: |
                   set -euo pipefail
 
-                  if [[ "${RUNNER_OS:-}" == "Windows" ]]; then
-                      BIN=./dist/openhands-agent-server.exe
-                  else
-                      BIN=./dist/openhands-agent-server
-                  fi
+                  BIN=./dist/openhands-agent-server
 
                   "$BIN" --help
 
@@ -173,11 +150,7 @@ jobs:
               run: |
                   set -euo pipefail
                   mkdir -p release-assets
-                  if [[ "${RUNNER_OS:-}" == "Windows" ]]; then
-                      cp dist/openhands-agent-server.exe "release-assets/${ASSET}.exe"
-                  else
-                      cp dist/openhands-agent-server "release-assets/${ASSET}"
-                  fi
+                  cp dist/openhands-agent-server "release-assets/${ASSET}"
                   ls -la release-assets/
 
             - name: Upload binary as workflow artifact
@@ -285,115 +258,3 @@ jobs:
                       SHA256SUMS \
                       --clobber \
                       --repo "${{ github.repository }}"
-
-    docker-smoke-test:
-        name: Docker (${{ matrix.variant }}-${{ matrix.arch }})
-        needs: resolve-tag
-        runs-on: ${{ matrix.runner }}
-        strategy:
-            fail-fast: false
-            matrix:
-                include:
-                    - variant: python
-                      arch: amd64
-                      runner: ubuntu-24.04
-                    - variant: python
-                      arch: arm64
-                      runner: ubuntu-24.04-arm
-                    - variant: java
-                      arch: amd64
-                      runner: ubuntu-24.04
-                    - variant: java
-                      arch: arm64
-                      runner: ubuntu-24.04-arm
-                    - variant: golang
-                      arch: amd64
-                      runner: ubuntu-24.04
-                    - variant: golang
-                      arch: arm64
-                      runner: ubuntu-24.04-arm
-        env:
-            IMAGE: ${{ format('ghcr.io/{0}/agent-server', github.repository_owner) }}
-            IMAGE_TAG: ${{ needs.resolve-tag.outputs.image_tag }}
-            VARIANT: ${{ matrix.variant }}
-            ARCH: ${{ matrix.arch }}
-        steps:
-            - name: Lowercase GHCR image
-              run: echo "IMAGE=${IMAGE,,}" >> "$GITHUB_ENV"
-
-            - name: Set up Docker Buildx
-              uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
-
-            - name: Log in to GHCR
-              uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4
-              with:
-                  registry: ghcr.io
-                  username: ${{ github.actor }}
-                  password: ${{ secrets.GITHUB_TOKEN }}
-
-            - name: Wait for multi-arch manifest
-              shell: bash
-              run: |
-                  set -euo pipefail
-                  TAG_FQN="${IMAGE}:${IMAGE_TAG}-${VARIANT}"
-                  DEADLINE=$(( $(date +%s) + 2700 ))  # 45 minutes
-                  while ! docker buildx imagetools inspect "$TAG_FQN" >/dev/null 2>&1; do
-                      if [ "$(date +%s)" -ge "$DEADLINE" ]; then
-                          echo "ERROR: timed out waiting for $TAG_FQN"
-                          exit 1
-                      fi
-                      echo "Waiting for $TAG_FQN ..."
-                      sleep 30
-                  done
-                  echo "✓ Manifest available: $TAG_FQN"
-
-            - name: Verify manifest covers linux/amd64 + linux/arm64
-              shell: bash
-              run: |
-                  set -euo pipefail
-                  TAG_FQN="${IMAGE}:${IMAGE_TAG}-${VARIANT}"
-                  PLATFORMS=$(docker buildx imagetools inspect "$TAG_FQN" --raw \
-                      | jq -r '.manifests[]?.platform | "\(.os)/\(.architecture)"' \
-                      | sort -u)
-                  echo "Platforms in $TAG_FQN:"
-                  echo "$PLATFORMS"
-                  for required in linux/amd64 linux/arm64; do
-                      if ! echo "$PLATFORMS" | grep -qx "$required"; then
-                          echo "ERROR: $required missing from $TAG_FQN manifest"
-                          exit 1
-                      fi
-                  done
-                  echo "✓ Both linux/amd64 and linux/arm64 are present"
-
-            - name: Pull and run on linux/${{ matrix.arch }}
-              shell: bash
-              run: |
-                  set -euo pipefail
-                  TAG_FQN="${IMAGE}:${IMAGE_TAG}-${VARIANT}"
-                  CONTAINER="agent-server-smoke-${VARIANT}-${ARCH}"
-
-                  echo "Pulling $TAG_FQN for linux/${ARCH} ..."
-                  docker pull --platform="linux/${ARCH}" "$TAG_FQN"
-
-                  echo "Starting container ..."
-                  docker run --platform="linux/${ARCH}" -d --rm \
-                      --name "$CONTAINER" \
-                      -p 127.0.0.1:8000:8000 \
-                      "$TAG_FQN" --host 0.0.0.0
-
-                  cleanup() {
-                      docker logs "$CONTAINER" 2>&1 | tail -100 || true
-                      docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
-                  }
-                  trap cleanup EXIT
-
-                  for i in $(seq 1 40); do
-                      if curl -f -s http://localhost:8000/health >/dev/null 2>&1; then
-                          echo "✓ /health responded for $TAG_FQN on linux/${ARCH}"
-                          exit 0
-                      fi
-                      sleep 3
-                  done
-
-                  echo "ERROR: /health never responded for $TAG_FQN on linux/${ARCH}"
-                  exit 1

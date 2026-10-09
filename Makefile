@@ -62,21 +62,26 @@ pre-commit:
 # so no inherited credential or agent-server variable reaches the suites.
 # Scope: tests/sdk, tools, workspace, agent_server and cross, as in tests.yml.
 # tests/examples and tests/integration need a live LLM and are excluded.
+# Every step runs through scripts/validate-suite.sh, which prints one
+# `SUITE name=... status=... seconds=... tests="..."` line per step (and a
+# `status=start` line before it, so a hang names the suite in progress).
+# The `validate` workflow copies those lines into the Actions step summary.
 validate:
 	@sh scripts/validate-env.sh make --no-print-directory validate-steps
 
 .PHONY: validate-steps
+SUITE := sh scripts/validate-suite.sh
 validate-steps:
-	uv sync --dev --frozen && \
-	CI=true uv run python -m pytest -n auto -p no:cacheprovider tests/sdk && \
-	CI=true uv run python -m pytest -n auto -p no:cacheprovider tests/agent_server && \
-	CI=true uv run python -m pytest -n auto -p no:cacheprovider tests/workspace && \
-	CI=true uv run python -m pytest -p no:cacheprovider --basetemp="$${TMPDIR:-/tmp}/oh-validate-pytest" -o tmp_path_retention_count=0 tests/cross --deselect tests/cross/test_remote_conversation_live_server.py::test_openai_chat_completions_gateway_over_real_server && \
-	CI=true uv run python -m pytest --forked -p no:cacheprovider tests/tools && \
-	uv run pyright && \
-	uv run pre-commit run --all-files --show-diff-on-failure && \
-	git diff --check && \
-	git diff --exit-code
+	$(SUITE) sync uv sync --dev --frozen && \
+	$(SUITE) sdk env CI=true uv run python -m pytest -n auto -p no:cacheprovider tests/sdk && \
+	$(SUITE) agent_server env CI=true uv run python -m pytest -n auto -p no:cacheprovider tests/agent_server && \
+	$(SUITE) workspace env CI=true uv run python -m pytest -n auto -p no:cacheprovider tests/workspace && \
+	$(SUITE) cross env CI=true uv run python -m pytest -p no:cacheprovider --basetemp="$${TMPDIR:-/tmp}/oh-validate-pytest" -o tmp_path_retention_count=0 tests/cross --deselect tests/cross/test_remote_conversation_live_server.py::test_openai_chat_completions_gateway_over_real_server && \
+	$(SUITE) tools env CI=true uv run python -m pytest --forked -p no:cacheprovider tests/tools && \
+	$(SUITE) pyright uv run pyright && \
+	$(SUITE) pre-commit uv run pre-commit run --all-files --show-diff-on-failure && \
+	$(SUITE) git-diff-check git diff --check && \
+	$(SUITE) git-diff-exit-code git diff --exit-code
 
 clean:
 	@$(ECHO) "$(YELLOW)Cleaning up cache files...$(RESET)"

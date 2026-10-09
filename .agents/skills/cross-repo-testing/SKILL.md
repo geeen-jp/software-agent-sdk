@@ -73,11 +73,10 @@ Use this when the Cloud server depends on SDK changes that haven't been released
 
 ### B1. Get the SDK PR merged (or identify the commit)
 
-The SDK PR must have CI pass so its agent-server Docker image is built. The image is tagged with the **merge-commit SHA** from GitHub Actions — NOT the head-commit SHA shown in the PR.
+The agent-server Docker image is no longer built by PR or main CI. Dispatch the **Agent Server** workflow (`server.yml`) on the branch or commit with `publish=true`; the published image is tagged `<short-sha>-<variant>` for the commit that was dispatched.
 
 Find the correct image tag:
-- Check the SDK PR description for an `AGENT_SERVER_IMAGES` section
-- Or check the "Consolidate Build Information" CI job for `"short_sha": "<tag>"`
+- Check the `Publish GHCR tags` job log of that run for the `Published ... as:` line
 
 ### B2. Pin SDK packages to the commit in the OpenHands PR
 
@@ -96,9 +95,9 @@ openhands-agent-server = { git = "https://github.com/OpenHands/software-agent-sd
 openhands-tools = { git = "https://github.com/OpenHands/software-agent-sdk.git", rev = "<COMMIT>", subdirectory = "openhands-tools" }
 ```
 
-**`openhands/app_server/sandbox/sandbox_spec_service.py`** — use the SDK's merge-commit SHA:
+**`openhands/app_server/sandbox/sandbox_spec_service.py`** — use the short SHA of the commit you dispatched in B1 (from the `Publish GHCR tags` log):
 ```python
-AGENT_SERVER_IMAGE = 'ghcr.io/openhands/agent-server:<merge-commit-sha>-python'
+AGENT_SERVER_IMAGE = 'ghcr.io/openhands/agent-server:<short-sha>-python'
 ```
 
 **Regenerate lock files:**
@@ -202,7 +201,7 @@ Comment on **both PRs** with pass/fail summary and link to logs.
 | **Two SHAs in deploy.yaml** | `OPENHANDS_SHA` and `OPENHANDS_RUNTIME_IMAGE_TAG` must both be updated. The runtime tag is `<sha>-nikolaik`. |
 | **Enterprise image must exist** | The Docker CI job on the OpenHands PR must succeed before you can deploy. If it hasn't run, push an empty commit to trigger it. |
 | **DNS propagation** | First deployment of a new branch takes 1-2 min for DNS. Subsequent deploys are instant. |
-| **Merge-commit SHA ≠ head SHA** | SDK CI tags Docker images with GitHub Actions' merge-commit SHA, not the PR head SHA. Check the SDK PR description or CI logs for the correct tag. |
+| **Image tag = dispatched commit** | PR CI builds no agent-server image. The image you dispatch in B1 is tagged with that commit's short SHA; take the exact tag from the `Publish GHCR tags` log of that run. |
 | **SDK pin blocks merge** | `check-package-versions.yml` prevents merging an OpenHands PR that has `rev` fields in `[tool.poetry.dependencies]`. The SDK must be released to PyPI first. |
 | **Flow A: stock agent-server is fine** | When only the Cloud API changes, `OpenHandsCloudWorkspace` talks to the Cloud server, not the agent-server. No custom image needed. |
 | **Flow B: agent-server image is required** | When the server needs new SDK code inside runtime containers, you must pin to the SDK PR's agent-server image. |

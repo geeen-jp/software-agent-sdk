@@ -1,12 +1,15 @@
 ---
 # .github/workflows/precommit.yml
+# On pull requests `make validate` (workflow Validate) already runs the same
+# `pre-commit run --all-files --show-diff-on-failure`, so this workflow no
+# longer triggers on pull_request. It remains for pushes to main, the only run
+# of the hook outside `make validate`, and can be started manually.
 name: Pre-commit checks
 
 on:
     push:
         branches: [main]
-    pull_request:
-        branches: ['**']
+    workflow_dispatch:
 
 jobs:
     pre-commit:
