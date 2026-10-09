@@ -191,6 +191,11 @@ MAX_ACP_CONTENT_CHARS: int = 30_000
 # receives the JSON blob.
 _CLAUDE_OAUTH_CONFLICTING_ENV: frozenset[str] = CLAUDE_PAYG_CONFLICTING_ENV
 
+# Claude Code auto-compaction window, applied only to the exact Sonnet 5.5 model.
+_CLAUDE_SONNET_5_5_MODEL: Final[str] = "claude-sonnet-5-5"
+_CLAUDE_AUTO_COMPACT_WINDOW_ENV: Final[str] = "CLAUDE_CODE_AUTO_COMPACT_WINDOW"
+_CLAUDE_SONNET_5_5_AUTO_COMPACT_WINDOW: Final[str] = "400000"
+
 # Limit for asyncio.StreamReader buffers used by the ACP subprocess pipes.
 # The default (64 KiB) is too small for session_update notifications that
 # carry large tool-call outputs (e.g. file contents, test results).  When
@@ -3713,6 +3718,7 @@ class ACPAgent(AgentBase):
         self._bind_file_credential_masking()
 
         # Build environment: inherit current env + conversation secrets + ACP extras
+        requested_model = self._requested_model_for_turn()
         env = default_environment()
         env.update(os.environ)
         env.update(self.acp_env)
@@ -3772,6 +3778,11 @@ class ACPAgent(AgentBase):
             if claude_oauth_file_channel:
                 env.pop(CLAUDE_OAUTH_TOKEN_ENV, None)
 
+        if command_is_claude and requested_model == _CLAUDE_SONNET_5_5_MODEL:
+            env[_CLAUDE_AUTO_COMPACT_WINDOW_ENV] = (
+                _CLAUDE_SONNET_5_5_AUTO_COMPACT_WINDOW
+            )
+
         env.update(
             initial_agent_mode_env_for_policy(
                 self.acp_permission_policy,
@@ -3819,7 +3830,6 @@ class ACPAgent(AgentBase):
             _has_usable_env_value(env, name)
             for name in ("CODEX_API_KEY", "OPENAI_API_KEY")
         )
-        requested_model = self._requested_model_for_turn()
 
         async def _init() -> tuple[
             Any,
