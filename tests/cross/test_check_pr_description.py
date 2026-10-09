@@ -144,6 +144,7 @@ def test_validate_linked_issue_ready_requires_a_number():
         "## Issue Number\n\nN/A\n", "org/repo", "token"
     )
     assert errors and "Link an issue" in errors[0]
+    assert "ready-for-dev" not in errors[0]
 
 
 def test_validate_linked_issue_ready_no_token_skips_network(monkeypatch):

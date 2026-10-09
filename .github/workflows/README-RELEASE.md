@@ -9,8 +9,10 @@ upstream docs, upstream downstream-release bumps, registry publishing).
 ## Fork workflow inventory (sdk#84)
 
 "Auto" means a `push`, `pull_request`, `issues`, `issue_comment`, `schedule` or
-`release` event starts the workflow. No workflow in the "removed" or "manual"
-groups starts automatically.
+`release` event starts the workflow. No workflow in the "removed" or "publish"
+groups starts automatically. The "evaluation" workflows start only from
+`workflow_dispatch` or from a `labeled` pull-request event; a PR that nobody
+labels starts none of them.
 
 ### Removed (upstream-only; the file is deleted)
 
@@ -28,24 +30,35 @@ groups starts automatically.
 | `issue-readiness-check.yml` | `issues` events (`issues: write`, `actions: write`) | auto-labels `ready-for-dev`; no label policy is established for this fork, so unknown automatic issue writes fail closed |
 | `pr-artifacts.yml` | `pull_request_target`, `pull_request_review` (`pull-requests: write`, `contents: write`) | auto-commits removal of `.pr/` and comments on PRs; the `.pr/` directory is now removed by hand before merge |
 
-### Manual only (dispatch with a confirmation input)
+### Publish (dispatch only, with a confirmation input)
 
 | Workflow | How to run | Guard |
 |---|---|---|
 | `pypi-release.yml` | Actions > "Publish all OpenHands packages (uv)" > Run workflow, set `confirm` to `publish-pypi` | job `if: inputs.confirm == 'publish-pypi'`; fails when secret `PYPI_TOKEN_OPENHANDS` is missing; no token fallback; `contents: read` only |
 | `typescript-client-npm-publish.yml` | Run workflow with `version` and `confirm` = `publish-npm` | job `if: inputs.confirm == 'publish-npm'`; npm trusted publishing (OIDC) only |
 | `typescript-client-github-packages-publish.yml` | Run workflow with `version` and `confirm` = `publish-github-packages` | job `if: inputs.confirm == 'publish-github-packages'`; uses `GITHUB_TOKEN` |
-| `run-eval.yml` | Run workflow with `reason` and `eval_limit`; or add `run-eval-1/50/200/500` to a same-repository PR | same-repository PRs only; no `release` trigger; needs secret `OPENHANDS_BOT_GITHUB_PAT_EVAL_DISPATCH` (fails when missing); it dispatches `OpenHands/evaluation`, so only run it when that is intended; permissions `contents: read`, `pull-requests: write` |
-| `integration-runner.yml` | Run workflow, or add `integration-test` / `behavior-test` to a same-repository PR | fork PRs never run; `id-token` removed |
-| `run-examples.yml` | Run workflow, or add `test-examples` to a PR (unchanged) | label or dispatch only |
-| `security-scan.yml` | Run workflow, or add `security-scan` to a PR, or any label on a `rel-*` PR (unchanged) | plain `pull_request` (read-only token on forks) |
+
+### Evaluation (dispatch or label; no `confirm` input)
+
+These start from `workflow_dispatch` or when a label is added to a PR. They take
+no `confirm` input, so the guard is the label name and the repository checks
+listed per workflow.
+
+| Workflow | How to run | Guard |
+|---|---|---|
+| `run-eval.yml` | Run workflow with `reason` and `eval_limit`; or add `run-eval-1/50/200/500` to a PR | `pull_request_target: labeled`; job skipped unless head repo == this repo and label in `run-eval-1/50/200/500`; needs secret `OPENHANDS_BOT_GITHUB_PAT_EVAL_DISPATCH` (fails when missing); dispatches `OpenHands/evaluation`; permissions `contents: read`, `pull-requests: write` |
+| `integration-runner.yml` | Run workflow, or add `integration-test` / `behavior-test` to a PR | `pull_request_target: labeled`; `setup-matrix` skipped unless head repo == this repo and label is `integration-test` / `behavior-test`; `id-token` removed |
+| `run-examples.yml` | Run workflow, or add `test-examples` to a PR | `pull_request: labeled`; job skipped for other labels; no repository check, read-only fork token; permissions `contents: read`, `pull-requests: write` |
+| `security-scan.yml` | Run workflow, or add `security-scan` to a PR or any label on a `rel-*` PR | `pull_request: labeled`; skipped for other labels and non-`rel-*` branches; no repository check; permissions `contents: read`, `pull-requests: write`, `issues: write` |
 
 ### Kept (automatic, local rules)
 
 | Workflow | Trigger | Permissions |
 |---|---|---|
 | `validate.yml` (job `validate`) | `pull_request` | read |
-| `tests.yml`, `precommit.yml`, `check-docstrings.yml`, `deprecation-check.yml`, `check-documented-examples.yml`, `check-duplicate-examples.yml` | push / pull_request | read |
+| `tests.yml` | push to main / `pull_request` | `contents: write`, `pull-requests: write` (unchanged) |
+| `precommit.yml` | push to main / dispatch (no `pull_request`; `validate` runs pre-commit on PRs) | unchanged |
+| `check-docstrings.yml`, `deprecation-check.yml`, `check-documented-examples.yml`, `check-duplicate-examples.yml` | push / `pull_request` | read |
 | `api-breakage.yml`, `agent-server-rest-api-breakage.yml`, `persisted-settings-compat.yml` | push / pull_request | unchanged |
 | `typescript-client-ci.yml`, `typescript-client-integration-tests.yml`, `typescript-client-endpoint-audit.yml` | push / pull_request | unchanged |
 | `server.yml` | binary and OpenAPI jobs on push/PR; Docker jobs on dispatch only (sdk#83) | unchanged |
@@ -82,11 +95,12 @@ groups starts automatically.
 - `pr-artifacts.yml` was removed instead of reduced to a read-only check: its
   only valuable part was the automatic `.pr/` cleanup, which needs write
   access. Delete `.pr/` yourself before merging (see AGENTS.md "PR_ARTIFACTS").
-- `run-eval.yml`, `integration-runner.yml`, `run-examples.yml` and
-  `security-scan.yml` stay as the evaluation path. They start only from
-  dispatch, a label on a same-repository PR, or (security-scan) a `rel-*` PR;
-  an unlabeled PR starts none of them. Unchanged and still correct:
-  `run-examples.yml` and `security-scan.yml`.
+- Each evaluation workflow starts from dispatch or a `labeled` PR event, and
+  an unlabeled PR starts none of them. `run-eval.yml` and
+  `integration-runner.yml` (`pull_request_target`) additionally skip fork PRs;
+  `run-examples.yml` and `security-scan.yml` (plain `pull_request`) have no
+  repository check and rely on the read-only fork token. `security-scan.yml`
+  also runs for any label on a `rel-*` PR.
 - Out of scope and kept as is: `validate`, Python/REST/OpenAPI compatibility
   checks, and the TypeScript CI / integration / endpoint-audit workflows.
 

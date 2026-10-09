@@ -8,7 +8,7 @@ The workflow consists of three main components:
 
 1. **Scanner** (`scanner.py`) - Scans the codebase for configurable TODO comments
 2. **Agent** (`agent.py`) - Uses OpenHands to implement individual TODOs
-3. **GitHub Actions Workflow** - Orchestrates the automation (see `.github/workflows/todo-management.yml`)
+3. **GitHub Actions Workflow** - Orchestrates the automation (see the example `workflow.yml` in this directory; this fork does not install it, see Setup)
 
 ## Features
 
@@ -58,7 +58,7 @@ Add these secrets to your GitHub repository:
 
 ### 2. Install Workflow
 
-The GitHub Actions workflow is already installed at `.github/workflows/todo-management.yml` in this repository.
+This fork has deliberately disabled TODO automation: `.github/workflows/todo-management.yml` was removed (sdk#84). Install it only if you decide to adopt it, by copying the example `workflow.yml` from this directory to `.github/workflows/todo-management.yml`.
 
 ### 3. Configure Permissions
 
@@ -97,6 +97,8 @@ You can use custom TODO identifiers like `TODO(myteam)`, `TODO[urgent]`, etc. Co
 ## Usage
 
 ### Manual runs
+
+These steps apply only after you have installed the workflow as described in Setup.
 
 1. Go to Actions → "Automated TODO Management"
 2. Click "Run workflow"

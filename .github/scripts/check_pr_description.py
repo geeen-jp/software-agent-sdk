@@ -93,10 +93,7 @@ def validate_linked_issue_ready(
 ) -> list[str]:
     numbers = extract_linked_issue_numbers(body)
     if not numbers:
-        return [
-            "Link an issue in the `## Issue Number` section (e.g. `Fixes #123`). "
-            "Newly opened issues must carry the `ready-for-dev` label."
-        ]
+        return ["Link an issue in the `## Issue Number` section (e.g. `Fixes #123`)."]
     if not repo or not token:
         return []
 
