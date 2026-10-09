@@ -30,14 +30,44 @@ on:
                 description: Comma-separated capability keys to bake into the image
                 type: string
                 default: vscode,browser,docker
+            publish:
+                description: >-
+                    After the smoke test passes, also apply the published GHCR
+                    tags (sha, branch, latest-<variant>, release version) to
+                    the verified digest. Default false keeps only the
+                    run-scoped verification image.
+                type: boolean
+                default: false
 
 permissions:
     contents: read
-    packages: write
+    packages: read
 
 # CI scope: Ubuntu linux/amd64 only. Windows, macOS and linux/arm64 jobs were
 # removed (sdk#82); the single-entry matrices below are kept so the existing
 # check names (e.g. `build-binary-and-test (ubuntu-latest)`) do not change.
+#
+# Docker images are on-demand (sdk#83). push (main/tags) and pull_request run
+# only the code/test/schema jobs (`build-binary-and-test`,
+# `check-openapi-schema`); they build and push no GHCR image, for fork and
+# same-repo PRs alike. One explicit `workflow_dispatch` runs the whole chain
+# in this run, linked by `needs` and artifacts, with no cross-workflow wait:
+#   build-and-push-image -> docker-smoke-test -> publish-images (publish=true)
+#
+# Verification image vs published image:
+#   - Verification image: <image>:verify-<run_id>-<run_attempt>-<variant>,
+#     pushed by build-and-push-image and smoke-tested by its digest. Unique per
+#     run, never reused. It is not a release artifact; delete the GHCR package
+#     versions manually when no longer needed (GitHub Actions does not expire
+#     them; only the artifact carrying the digest expires after 1 day).
+#   - Published image: the same digest re-tagged by publish-images
+#     (<sha7>-<variant>, <long-sha>-<variant>, <branch>-<variant>,
+#     <sha7>-<base-slug>, <X.Y.Z>-<variant> on a tag ref, and
+#     latest-<variant> on main). These tags are mutable aliases and exist only
+#     after an explicit dispatch with publish=true.
+# Consumers of the old main/SHA/release tags keep working for images already
+# pushed; no new tag moves unless someone dispatches with publish=true. The
+# `*-amd64` suffixed tags are no longer pushed.
 
 jobs:
     build-binary-and-test:
@@ -253,13 +283,12 @@ jobs:
 
     build-and-push-image:
         name: Build & Push (${{ matrix.variant }}-${{ matrix.arch }})
-        # Run on push events, pull requests from the same repository (not forks), and manual workflow_dispatch
-        # Fork PRs cannot push to GHCR and would fail authentication
-        if: >
-            github.event_name == 'push' ||
-            github.event_name == 'workflow_dispatch' ||
-            (github.event_name == 'pull_request' &&
-             !github.event.pull_request.head.repo.fork)
+        # Explicit workflow_dispatch only. push, tag and pull_request events
+        # (fork or same-repo) never build or push a GHCR image.
+        if: github.event_name == 'workflow_dispatch'
+        permissions:
+            contents: read
+            packages: write
         strategy:
             fail-fast: false
             matrix:
@@ -304,11 +333,12 @@ jobs:
             ARCH: ${{ matrix.arch }}
             TARGET: binary
             PLATFORM: ${{ matrix.platform }}
-            # Use SDK_SHA/SDK_REF so build.py tags PR images with the head commit and branch.
-            # GITHUB_SHA/GITHUB_REF point at the synthetic merge ref on pull_request events.
-            SDK_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
-            SDK_REF: ${{ github.head_ref != '' && format('refs/heads/{0}', github.head_ref) || github.ref }}
-            GITHUB_REF: ${{ github.ref }}
+            SDK_SHA: ${{ github.sha }}
+            SDK_REF: ${{ github.ref }}
+            # Verification tag: unique per run and attempt, so concurrent
+            # dispatches never share or overwrite it. It is the only tag this
+            # job pushes; the smoke job pulls the digest, not the tag.
+            VERIFY_TAG: verify-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.variant }}
             CI: 'true'
 
         steps:
@@ -341,34 +371,22 @@ jobs:
               run: |
                   uv sync --frozen
 
-                  # Generate build context and tags with arch suffix
-                  # build.py now handles architecture tagging internally via --arch flag
-                  # Add --versioned-tag when triggered by a git tag (e.g., v1.0.0)
-                  BUILD_CMD="uv run ./openhands-agent-server/openhands/agent_server/docker/build.py --build-ctx-only --arch ${{ matrix.arch }}"
+                  # `--arch ""` makes build.py emit the final arch-less tags
+                  # (e.g. <sha7>-python); they are applied by publish-images
+                  # only, never by this job.
+                  BUILD_CMD="uv run ./openhands-agent-server/openhands/agent_server/docker/build.py --build-ctx-only --arch ''"
                   if [[ "$GITHUB_REF" == refs/tags/* ]]; then
                       BUILD_CMD="$BUILD_CMD --versioned-tag"
                   fi
                   eval "$BUILD_CMD"
 
-                  # Alias tags_csv output to tags for the build action
-                  TAGS=$(grep '^tags_csv=' $GITHUB_OUTPUT | cut -d= -f2-)
-                  echo "tags=$TAGS" >> $GITHUB_OUTPUT
+                  PUBLISH_TAGS=$(grep '^tags_csv=' "$GITHUB_OUTPUT" | cut -d= -f2-)
+                  echo "publish_tags=$PUBLISH_TAGS" >> "$GITHUB_OUTPUT"
 
-                  # Extract short SHA for consolidation
-                  # Use SDK_SHA env var (set above to PR head SHA for PRs)
-                  SHORT_SHA=$(echo $SDK_SHA | cut -c1-7)
-                  echo "short_sha=$SHORT_SHA" >> $GITHUB_OUTPUT
-
-                  # Extract versioned tags CSV for consolidation
-                  VERSIONED_TAGS_CSV=$(grep '^versioned_tags_csv=' $GITHUB_OUTPUT | cut -d= -f2- || echo "")
-                  echo "versioned_tags_csv=$VERSIONED_TAGS_CSV" >> $GITHUB_OUTPUT
-
-                  # Verify outputs
                   echo "=== Build outputs ==="
-                  echo "Build context: $(grep '^build_context=' $GITHUB_OUTPUT | cut -d= -f2-)"
-                  echo "Tags: $TAGS"
-                  echo "Short SHA: $SHORT_SHA"
-                  echo "Versioned tags: $VERSIONED_TAGS_CSV"
+                  echo "Build context: $(grep '^build_context=' "$GITHUB_OUTPUT" | cut -d= -f2-)"
+                  echo "Verification tag: ${IMAGE}:${VERIFY_TAG}"
+                  echo "Tags applied only by publish-images: $PUBLISH_TAGS"
                   echo "===================="
 
             - name: Build & Push (${{ matrix.variant }}-${{ matrix.arch }})
@@ -380,7 +398,7 @@ jobs:
                   target: ${{ env.TARGET }}
                   platforms: ${{ env.PLATFORM }}
                   push: true
-                  tags: ${{ steps.prep.outputs.tags }}
+                  tags: ${{ env.IMAGE }}:${{ env.VERIFY_TAG }}
                   cache-from: type=gha
                   cache-to: type=gha,mode=max
                   build-args: |
@@ -400,87 +418,171 @@ jobs:
                       rm -rf "$BUILD_CONTEXT"
                   fi
 
-            - name: Summary (${{ matrix.variant }}-${{ matrix.arch }}) - outputs
+            - name: Record verified image reference
               env:
-                  SHORT_SHA: ${{ steps.prep.outputs.short_sha }}
-                  TAGS: ${{ steps.prep.outputs.tags }}
                   BUILD_DIGEST: ${{ steps.build.outputs.digest }}
+                  PUBLISH_TAGS: ${{ steps.prep.outputs.publish_tags }}
               run: |
-                  echo "Image: $IMAGE"
-                  echo "Variant: $VARIANT"
-                  echo "Architecture: $ARCH"
-                  echo "Platform: $PLATFORM"
-                  echo "Short SHA: $SHORT_SHA"
-                  echo "Tags: $TAGS"
-                  echo "Build digest: $BUILD_DIGEST"
-
-            - name: Save build info for consolidation
-              env:
-                  SHORT_SHA: ${{ steps.prep.outputs.short_sha }}
-                  TAGS: ${{ steps.prep.outputs.tags }}
-                  VERSIONED_TAGS_CSV: ${{ steps.prep.outputs.versioned_tags_csv }}
-              run: |
-                  mkdir -p build-info
+                  set -euo pipefail
+                  if [[ ! "$BUILD_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+                      echo "ERROR: build produced no valid image digest: '$BUILD_DIGEST'"
+                      exit 1
+                  fi
+                  mkdir -p image-ref
                   jq -n \
                     --arg variant "$VARIANT" \
-                    --arg arch "$ARCH" \
-                    --arg base_image "$BASE_IMAGE" \
                     --arg image "$IMAGE" \
-                    --arg short_sha "$SHORT_SHA" \
-                    --arg tags "$TAGS" \
-                    --arg versioned_tags_csv "$VERSIONED_TAGS_CSV" \
-                    --arg platform "$PLATFORM" \
+                    --arg verify_tag "$VERIFY_TAG" \
+                    --arg digest "$BUILD_DIGEST" \
+                    --arg publish_tags "$PUBLISH_TAGS" \
                     '{
                       variant: $variant,
-                      arch: $arch,
-                      base_image: $base_image,
                       image: $image,
-                      short_sha: $short_sha,
-                      tags: $tags,
-                      versioned_tags_csv: $versioned_tags_csv,
-                      platform: $platform
-                    }' > "build-info/${{ matrix.variant }}-${{ matrix.arch }}.json"
+                      verify_tag: $verify_tag,
+                      digest: $digest,
+                      publish_tags: $publish_tags
+                    }' > "image-ref/${VARIANT}.json"
+                  echo "Image: ${IMAGE}@${BUILD_DIGEST} (tag ${VERIFY_TAG})"
 
-            - name: Upload build info artifact
+            - name: Upload image reference artifact
               uses: actions/upload-artifact@v7
               with:
-                  name: build-info-${{ matrix.variant }}-${{ matrix.arch }}
-                  path: build-info/${{ matrix.variant }}-${{ matrix.arch }}.json
+                  name: image-ref-${{ matrix.variant }}
+                  path: image-ref/${{ matrix.variant }}.json
                   retention-days: 1
+                  if-no-files-found: error
 
-    merge-manifests:
-        name: Merge Multi-Arch Manifests
+    docker-smoke-test:
+        name: Docker smoke (${{ matrix.variant }}-${{ matrix.arch }})
+        # Skipped automatically when build-and-push-image is skipped, i.e. on
+        # every event other than workflow_dispatch. Not a required check.
         needs: build-and-push-image
-        if: >
-            github.event_name == 'push' ||
-            github.event_name == 'workflow_dispatch' ||
-            (github.event_name == 'pull_request' &&
-             !github.event.pull_request.head.repo.fork)
-        runs-on: ubuntu-24.04
+        permissions:
+            contents: read
+            packages: read
+        runs-on: ${{ matrix.runner }}
         strategy:
+            fail-fast: false
             matrix:
-                variant: [python, java, golang]
+                include:
+                    - variant: python
+                      arch: amd64
+                      runner: ubuntu-24.04
+                    - variant: java
+                      arch: amd64
+                      runner: ubuntu-24.04
+                    - variant: golang
+                      arch: amd64
+                      runner: ubuntu-24.04
         env:
-            IMAGE: ${{ inputs.image != '' && inputs.image || format('ghcr.io/{0}/agent-server', github.repository_owner) }}
-
+            VARIANT: ${{ matrix.variant }}
+            ARCH: ${{ matrix.arch }}
         steps:
-            - name: Lowercase GHCR image
-              run: echo "IMAGE=${IMAGE,,}" >> "$GITHUB_ENV"
-
-            - name: Download build info to extract SHORT_SHA
+            - name: Download image reference
               uses: actions/download-artifact@v8
               with:
-                  pattern: build-info-${{ matrix.variant }}-*
-                  merge-multiple: true
-                  path: build-info
+                  name: image-ref-${{ matrix.variant }}
+                  path: image-ref
 
-            - name: Extract SHORT_SHA from build info
-              id: get_sha
+            - name: Log in to GHCR
+              uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4
+              with:
+                  registry: ghcr.io
+                  username: ${{ github.actor }}
+                  password: ${{ secrets.GITHUB_TOKEN }}
+
+            - name: Pull the built digest (fails immediately if absent)
+              shell: bash
               run: |
-                  # Get SHORT_SHA from any build info artifact for this variant
-                  SHORT_SHA=$(jq -r '.short_sha' build-info/${{ matrix.variant }}-amd64.json)
-                  echo "short_sha=$SHORT_SHA" >> $GITHUB_OUTPUT
-                  echo "Using SHORT_SHA: $SHORT_SHA"
+                  set -euo pipefail
+                  IMAGE=$(jq -r '.image' "image-ref/${VARIANT}.json")
+                  DIGEST=$(jq -r '.digest' "image-ref/${VARIANT}.json")
+                  VERIFY_TAG=$(jq -r '.verify_tag' "image-ref/${VARIANT}.json")
+                  {
+                      echo "REF=${IMAGE}@${DIGEST}"
+                      echo "DIGEST=${DIGEST}"
+                      echo "TAG_REF=${IMAGE}:${VERIFY_TAG}"
+                  } >> "$GITHUB_ENV"
+
+                  echo "Pulling ${IMAGE}@${DIGEST} for linux/${ARCH} ..."
+                  docker pull --platform="linux/${ARCH}" "${IMAGE}@${DIGEST}"
+
+            - name: Verify tag and digest match and image is linux/amd64
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  TAG_DIGEST=$(docker buildx imagetools inspect "$TAG_REF" \
+                      --format '{{.Manifest.Digest}}')
+                  if [ "$TAG_DIGEST" != "$DIGEST" ]; then
+                      echo "ERROR: $TAG_REF resolves to $TAG_DIGEST, expected $DIGEST"
+                      exit 1
+                  fi
+                  PLATFORM=$(docker image inspect "$REF" \
+                      --format '{{.Os}}/{{.Architecture}}')
+                  if [ "$PLATFORM" != "linux/${ARCH}" ]; then
+                      echo "ERROR: $REF is $PLATFORM, expected linux/${ARCH}"
+                      exit 1
+                  fi
+                  echo "✓ $TAG_REF == $DIGEST ($PLATFORM)"
+
+            - name: Run container and check /health
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  CONTAINER="agent-server-smoke-${VARIANT}-${ARCH}"
+
+                  docker run --platform="linux/${ARCH}" -d --rm \
+                      --name "$CONTAINER" \
+                      -p 127.0.0.1:8000:8000 \
+                      "$REF" --host 0.0.0.0
+
+                  cleanup() {
+                      docker logs "$CONTAINER" 2>&1 | tail -100 || true
+                      docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
+                  }
+                  trap cleanup EXIT
+
+                  for i in $(seq 1 40); do
+                      if curl -f -s http://localhost:8000/health >/dev/null 2>&1; then
+                          echo "✓ /health responded for $REF"
+                          exit 0
+                      fi
+                      sleep 3
+                  done
+
+                  echo "ERROR: /health never responded for $REF"
+                  exit 1
+
+    publish-images:
+        name: Publish GHCR tags (${{ matrix.variant }})
+        # Opt-in: only when the dispatch sets publish=true. Runs after every
+        # smoke leg passed (needs on a matrix job waits for all legs). Retags
+        # the already-verified digest with `imagetools create`, so published
+        # tags point at exactly the image that passed /health. A single-arch
+        # (linux/amd64) manifest step is kept here because existing consumers
+        # pull the arch-less tags (<sha7>-<variant>, <branch>-<variant>,
+        # latest-<variant>, <X.Y.Z>-<variant>).
+        needs: [build-and-push-image, docker-smoke-test]
+        if: github.event_name == 'workflow_dispatch' && inputs.publish
+        permissions:
+            contents: read
+            packages: write
+        runs-on: ubuntu-24.04
+        # Published tags such as <branch>-<variant> are mutable aliases;
+        # serialize publishes per ref and variant so they cannot interleave.
+        concurrency:
+            group: agent-server-publish-${{ github.ref }}-${{ matrix.variant }}
+            cancel-in-progress: false
+        strategy:
+            fail-fast: false
+            matrix:
+                variant: [python, java, golang]
+        steps:
+            - name: Download image reference
+              uses: actions/download-artifact@v8
+              with:
+                  name: image-ref-${{ matrix.variant }}
+                  path: image-ref
 
             - name: Set up Docker Buildx
               uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
@@ -492,354 +594,33 @@ jobs:
                   username: ${{ github.actor }}
                   password: ${{ secrets.GITHUB_TOKEN }}
 
-            - name: Create and push amd64 manifest tags for ${{ matrix.variant }}
-              id: create_manifest
+            - name: Apply published tags to the verified digest
+              shell: bash
               env:
                   GIT_REF: ${{ github.ref }}
-                  SHORT_SHA: ${{ steps.get_sha.outputs.short_sha }}
                   VARIANT: ${{ matrix.variant }}
               run: |
-                  AMD64_TAGS_CSV=$(jq -r '.tags' build-info/${VARIANT}-amd64.json)
-                  declare -A SEEN_MANIFEST_TAGS=()
-                  MANIFEST_TAGS=()
+                  set -euo pipefail
+                  IMAGE=$(jq -r '.image' "image-ref/${VARIANT}.json")
+                  DIGEST=$(jq -r '.digest' "image-ref/${VARIANT}.json")
+                  PUBLISH_TAGS=$(jq -r '.publish_tags' "image-ref/${VARIANT}.json")
 
-                  create_manifest() {
-                      local manifest_tag=$1
-                      local source_tag=${2:-$1}
-
-                      echo "Creating arch-less manifest tag: ${IMAGE}:${manifest_tag}"
-                      docker buildx imagetools create -t ${IMAGE}:${manifest_tag} \
-                        ${IMAGE}:${source_tag}-amd64
-
-                      echo "Inspecting manifest:"
-                      docker buildx imagetools inspect ${IMAGE}:${manifest_tag}
-                      echo "✓ Manifest created: ${IMAGE}:${manifest_tag}"
-                  }
-
-                  IFS=',' read -ra AMD64_TAGS <<< "$AMD64_TAGS_CSV"
-                  for AMD64_IMAGE_TAG in "${AMD64_TAGS[@]}"; do
-                      if [ -z "$AMD64_IMAGE_TAG" ]; then
-                          continue
+                  TAG_ARGS=()
+                  IFS=',' read -ra TAGS <<< "$PUBLISH_TAGS"
+                  for TAG in "${TAGS[@]}"; do
+                      if [ -n "$TAG" ]; then
+                          TAG_ARGS+=(-t "$TAG")
                       fi
-
-                      TAG_NAME=${AMD64_IMAGE_TAG#${IMAGE}:}
-                      if [ "$TAG_NAME" = "$AMD64_IMAGE_TAG" ] || [[ ! "$TAG_NAME" == *-amd64 ]]; then
-                          echo "Skipping unexpected architecture tag: $AMD64_IMAGE_TAG"
-                          continue
-                      fi
-
-                      MANIFEST_TAG=${TAG_NAME%-amd64}
-                      if [ -n "${SEEN_MANIFEST_TAGS[$MANIFEST_TAG]+x}" ]; then
-                          continue
-                      fi
-
-                      SEEN_MANIFEST_TAGS[$MANIFEST_TAG]=1
-                      MANIFEST_TAGS+=("$MANIFEST_TAG")
-                      create_manifest "$MANIFEST_TAG"
                   done
-
                   # Preserve the latest-<variant> alias used by the workspace defaults.
                   if [ "$GIT_REF" == "refs/heads/main" ]; then
-                      LATEST_TAG="latest-${VARIANT}"
-                      create_manifest "$LATEST_TAG" "main-${VARIANT}"
-                      MANIFEST_TAGS+=("$LATEST_TAG")
+                      TAG_ARGS+=(-t "${IMAGE}:latest-${VARIANT}")
+                  fi
+                  if [ "${#TAG_ARGS[@]}" -eq 0 ]; then
+                      echo "ERROR: no tags to publish for ${VARIANT}"
+                      exit 1
                   fi
 
-                  MANIFEST_TAG_CSV=$(IFS=,; echo "${MANIFEST_TAGS[*]}")
-
-                  # Save manifest info for consolidation
-                  mkdir -p manifest-info
-                  jq -n \
-                    --arg variant "$VARIANT" \
-                    --arg image "$IMAGE" \
-                    --arg short_sha "$SHORT_SHA" \
-                    --arg manifest_tag "$MANIFEST_TAG_CSV" \
-                    '{
-                      variant: $variant,
-                      image: $image,
-                      short_sha: $short_sha,
-                      manifest_tag: $manifest_tag
-                    }' > "manifest-info/${VARIANT}.json"
-
-            - name: Upload manifest info artifact
-              uses: actions/upload-artifact@v7
-              with:
-                  name: manifest-info-${{ matrix.variant }}
-                  path: manifest-info/${{ matrix.variant }}.json
-                  retention-days: 1
-
-    consolidate-build-info:
-        name: Consolidate Build Information
-        needs: [build-and-push-image, merge-manifests]
-        # Run if it's a PR and the matrix job completed (even if some variants failed)
-        if: github.event_name == 'pull_request' && always() && (needs.build-and-push-image.result == 'success' || needs.build-and-push-image.result ==
-            'failure')
-        runs-on: ubuntu-24.04
-        outputs:
-            build_summary: ${{ steps.consolidate.outputs.build_summary }}
-        steps:
-            - name: Download build info artifacts
-              uses: actions/download-artifact@v8
-              with:
-                  pattern: build-info-*
-                  merge-multiple: true
-                  path: build-info
-
-            - name: Download manifest info artifacts
-              uses: actions/download-artifact@v8
-              with:
-                  pattern: manifest-info-*
-                  merge-multiple: true
-                  path: manifest-info
-
-            - name: Consolidate build information from artifacts
-              id: consolidate
-              run: |
-                  echo "Processing build info artifacts..."
-                  ls -la build-info/
-                  echo "Found $(ls build-info/*.json 2>/dev/null | wc -l) JSON files"
-
-                  # Initialize variables
-                  IMAGE=""
-                  SHORT_SHA=""
-                  ALL_TAGS=""
-
-                  # Use associative arrays to track variants (bash 4+)
-                  declare -A VARIANT_BASE_IMAGE
-                  declare -A VARIANT_ARCHS
-
-                  # Process each build info
-                  for info_file in build-info/*.json; do
-                      if [[ ! -f "$info_file" ]]; then
-                          echo "Skipping $info_file - not a file"
-                          continue
-                      fi
-                      
-                      echo "=== Processing $info_file ==="
-                      cat "$info_file"
-                      echo "=== End of $info_file ==="
-                      
-                      # Extract information from JSON
-                      VARIANT=$(jq -r '.variant' "$info_file")
-                      ARCH=$(jq -r '.arch' "$info_file")
-                      BASE_IMAGE=$(jq -r '.base_image' "$info_file")
-                      VARIANT_IMAGE=$(jq -r '.image' "$info_file")
-                      VARIANT_SHA=$(jq -r '.short_sha' "$info_file")
-                      VARIANT_TAGS=$(jq -r '.tags' "$info_file")
-                      
-                      # Set common values (same across all builds)
-                      if [[ -z "$IMAGE" ]]; then
-                          IMAGE="$VARIANT_IMAGE"
-                          SHORT_SHA="$VARIANT_SHA"
-                      fi
-                      
-                      # Store variant information
-                      VARIANT_BASE_IMAGE[$VARIANT]=$BASE_IMAGE
-                      if [[ -z "${VARIANT_ARCHS[$VARIANT]}" ]]; then
-                          VARIANT_ARCHS[$VARIANT]=$ARCH
-                      else
-                          VARIANT_ARCHS[$VARIANT]="${VARIANT_ARCHS[$VARIANT]}, $ARCH"
-                      fi
-                      
-                      # Collect tags (comma-separated to newline-separated)
-                      if [[ -n "$VARIANT_TAGS" ]]; then
-                          VARIANT_TAG_LIST=$(echo "$VARIANT_TAGS" | tr ',' '\n')
-                          if [[ -n "$ALL_TAGS" ]]; then
-                              ALL_TAGS="${ALL_TAGS}"$'\n'"${VARIANT_TAG_LIST}"
-                          else
-                              ALL_TAGS="$VARIANT_TAG_LIST"
-                          fi
-                      fi
-                  done
-
-                  # Build variants JSON array from collected data
-                  VARIANTS_JSON="[]"
-                  for VARIANT in "${!VARIANT_BASE_IMAGE[@]}"; do
-                      BASE_IMG="${VARIANT_BASE_IMAGE[$VARIANT]}"
-                      ARCHS="${VARIANT_ARCHS[$VARIANT]}"
-                      VARIANTS_JSON=$(echo "$VARIANTS_JSON" | jq \
-                          --arg variant "$VARIANT" \
-                          --arg base_image "$BASE_IMG" \
-                          --arg archs "$ARCHS" \
-                          '. += [{custom_tags: $variant, base_image: $base_image, architectures: $archs}]')
-                      
-                      echo "Added variant $VARIANT ($ARCHS), current variants JSON:"
-                      echo "$VARIANTS_JSON" | jq .
-                  done
-
-                  # Process manifest info artifacts
-                  echo "Processing manifest info artifacts..."
-                  if [[ -d "manifest-info" ]]; then
-                      ls -la manifest-info/
-                      
-                      MANIFEST_TAGS=""
-                      for manifest_file in manifest-info/*.json; do
-                          if [[ -f "$manifest_file" ]]; then
-                              echo "=== Processing $manifest_file ==="
-                              cat "$manifest_file"
-                              
-                              MANIFEST_TAG_CSV=$(jq -r '.manifest_tag' "$manifest_file")
-                              # Convert comma-separated tags to newline-separated
-                              MANIFEST_TAG_LIST=$(echo "$MANIFEST_TAG_CSV" | tr ',' '\n' | sed "s|^|${IMAGE}:|")
-                              
-                              if [[ -n "$MANIFEST_TAGS" ]]; then
-                                  MANIFEST_TAGS="${MANIFEST_TAGS}"$'\n'"${MANIFEST_TAG_LIST}"
-                              else
-                                  MANIFEST_TAGS="$MANIFEST_TAG_LIST"
-                              fi
-                          fi
-                      done
-
-                      # Add manifest tags to ALL_TAGS
-                      if [[ -n "$MANIFEST_TAGS" ]]; then
-                          echo "Adding manifest tags to output"
-                          if [[ -n "$ALL_TAGS" ]]; then
-                              ALL_TAGS="${ALL_TAGS}"$'\n'"${MANIFEST_TAGS}"
-                          else
-                              ALL_TAGS="$MANIFEST_TAGS"
-                          fi
-                      fi
-                  else
-                      echo "No manifest-info directory found (merge-manifests may not have run)"
-                  fi
-
-                  # Create consolidated build summary
-                  BUILD_SUMMARY=$(jq -n \
-                      --arg image "$IMAGE" \
-                      --arg short_sha "$SHORT_SHA" \
-                      --arg ghcr_url "https://github.com/${GITHUB_REPOSITORY}/pkgs/container/agent-server" \
-                      --arg all_tags "$ALL_TAGS" \
-                      --argjson variants "$VARIANTS_JSON" \
-                      '{
-                          image: $image,
-                          short_sha: $short_sha,
-                          ghcr_package_url: $ghcr_url,
-                          all_tags: $all_tags,
-                          variants: $variants
-                      }')
-
-                  echo "Consolidated build summary:"
-                  echo "$BUILD_SUMMARY" | jq .
-
-                  echo "DEBUG: Final variants count: $(echo "$VARIANTS_JSON" | jq 'length')"
-                  echo "DEBUG: Final variants: $(echo "$VARIANTS_JSON" | jq -c '.')"
-
-                  # Set output
-                  {
-                      echo 'build_summary<<EOF'
-                      echo "$BUILD_SUMMARY"
-                      echo 'EOF'
-                  } >> $GITHUB_OUTPUT
-
-    update-pr-description:
-        name: Update PR description with agent server image
-        needs: consolidate-build-info
-        # Only on PRs, and only if the consolidation succeeded
-        if: github.event_name == 'pull_request' && needs.consolidate-build-info.result == 'success'
-        runs-on: ubuntu-24.04
-        permissions:
-            contents: read
-            pull-requests: write
-
-        steps:
-            - name: Generate PR description from build summary
-              id: generate_description
-              env:
-                  BUILD_SUMMARY_JSON: ${{ needs.consolidate-build-info.outputs.build_summary }}
-              run: |
-                  echo "Event: ${{ github.event_name }}"
-                  echo "PR number: ${{ github.event.number }}"
-                  echo "Run attempt: ${{ github.run_attempt }}"
-
-                  # Parse the build summary JSON
-                  BUILD_SUMMARY="$BUILD_SUMMARY_JSON"
-                  echo "Build summary received:"
-                  echo "$BUILD_SUMMARY" | jq .
-
-                  # Extract basic information
-                  IMAGE=$(echo "$BUILD_SUMMARY" | jq -r '.image')
-                  SHORT_SHA=$(echo "$BUILD_SUMMARY" | jq -r '.short_sha')
-                  GHCR_URL=$(echo "$BUILD_SUMMARY" | jq -r '.ghcr_package_url')
-                  ALL_TAGS=$(echo "$BUILD_SUMMARY" | jq -r '.all_tags')
-
-                  # Build the variants table dynamically
-                  VARIANTS_TABLE=""
-
-                  # Process each build
-                  VARIANTS=$(echo "$BUILD_SUMMARY" | jq -r '.variants[] | @base64')
-                  echo "DEBUG: Found builds (base64 encoded):"
-                  echo "$VARIANTS"
-                  echo "DEBUG: Number of builds: $(echo "$VARIANTS" | wc -l)"
-
-                  for variant_data in $VARIANTS; do
-                      # Decode base64 and extract build info
-                      VARIANT_JSON=$(echo "$variant_data" | base64 --decode)
-                      echo "DEBUG: Processing build JSON: $VARIANT_JSON"
-                      CUSTOM_TAGS=$(echo "$VARIANT_JSON" | jq -r '.custom_tags')
-                      BASE_IMAGE=$(echo "$VARIANT_JSON" | jq -r '.base_image')
-                      ARCHS=$(echo "$VARIANT_JSON" | jq -r '.architectures // "amd64"')
-                      
-                      echo "DEBUG: Adding variant $CUSTOM_TAGS with base image $BASE_IMAGE (archs: $ARCHS)"
-                      # Add to variants table with architecture info
-                      VARIANTS_TABLE="${VARIANTS_TABLE}| ${CUSTOM_TAGS} | ${ARCHS} | \`${BASE_IMAGE}\` | [Link](https://hub.docker.com/_/${BASE_IMAGE}) |"$'\n'
-                  done
-
-                  echo "DEBUG: Final variants table:"
-                  echo "$VARIANTS_TABLE"
-
-                  # Create the complete PR description with the requested format
-                  PR_CONTENT=$(cat << EOF
-
-                  <!-- AGENT_SERVER_IMAGES_START -->
-                  ---
-                  <details>
-                  <summary><b>🐳 Agent Server images for this PR</b> — GHCR package, pull/run commands, and all pushed tags (click to expand)</summary>
-
-                  • **GHCR package:** ${GHCR_URL}
-
-                  **Variants & Base Images**
-                  | Variant | Architectures | Base Image | Docs / Tags |
-                  |---|---|---|---|
-                  ${VARIANTS_TABLE}
-
-                  **Pull (linux/amd64)**
-                  \`\`\`bash
-                  # Each variant tag is a linux/amd64 image
-                  docker pull ${IMAGE}:${SHORT_SHA}-python
-                  \`\`\`
-
-                  **Run**
-                  \`\`\`bash
-                  docker run -it --rm \\
-                    -p 8000:8000 \\
-                    --name agent-server-${SHORT_SHA}-python \\
-                    ${IMAGE}:${SHORT_SHA}-python
-                  \`\`\`
-
-                  **All tags pushed for this build**
-                  \`\`\`
-                  ${ALL_TAGS}
-                  \`\`\`
-
-                  **About Architecture Support**
-                  - Each variant tag (e.g., \`${SHORT_SHA}-python\`) is a **linux/amd64** image; arm64 images are not published
-                  - The architecture-suffixed tag (e.g., \`${SHORT_SHA}-python-amd64\`) is also available
-                  </details>
-                  <!-- AGENT_SERVER_IMAGES_END -->
-                  EOF
-                  )
-
-                  # Set output for the next step
-                  {
-                      echo 'pr_content<<EOF'
-                      echo "$PR_CONTENT"
-                      echo 'EOF'
-                  } >> $GITHUB_OUTPUT
-
-            - name: Update PR description with docker image details
-              uses: nefrob/pr-description@4dcc9f3ad5ec06b2a197c5f8f93db5e69d2fdca7 # v1.2.0
-              with:
-                  content: ${{ steps.generate_description.outputs.pr_content }}
-                  regex: <!-- AGENT_SERVER_IMAGES_START -->.*?<!-- AGENT_SERVER_IMAGES_END -->
-                  regexFlags: s
-                  token: ${{ secrets.GITHUB_TOKEN }}
+                  docker buildx imagetools create "${TAG_ARGS[@]}" "${IMAGE}@${DIGEST}"
+                  docker buildx imagetools inspect "${IMAGE}@${DIGEST}"
+                  echo "✓ Published ${IMAGE}@${DIGEST} as: ${PUBLISH_TAGS}"

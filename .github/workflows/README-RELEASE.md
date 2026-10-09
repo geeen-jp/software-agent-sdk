@@ -10,6 +10,7 @@ The release process has been automated with three GitHub Actions workflows:
 2. **pypi-release.yml** - Automatically publishes packages to PyPI when a release is created
 3. **release-binaries.yml** - Builds and smoke-tests the linux x86_64 agent-server binary
    on releases and main pushes; release runs also attach binaries to the release
+   (no Docker; see Step 4c)
 
 ## How to Create a New Release
 
@@ -58,7 +59,7 @@ Once the release is published, the **pypi-release.yml** workflow will automatica
 
 You can monitor the progress in the [Actions tab](https://github.com/OpenHands/software-agent-sdk/actions/workflows/pypi-release.yml).
 
-### Step 4b: Release Binaries + Docker Smoke Test (Automated)
+### Step 4b: Release Binaries (Automated)
 
 In parallel with the PyPI workflow, **release-binaries.yml** also fires on `release: published`.
 It also runs on every push to `main` as ongoing smoke coverage. It:
@@ -69,17 +70,72 @@ It also runs on every push to `main` as ongoing smoke coverage. It:
   `openapi.json`, with `info.version` matching the release version
 - ✅ Generates a combined `SHA256SUMS` and attaches the binaries and
   `openapi.json` to the GitHub release on release/manual runs
-- ✅ Verifies that the Docker manifest
-  `ghcr.io/openhands/agent-server:<image-tag>-<variant>` published by
-  `server.yml` covers `linux/amd64` for every variant
-  (`python`, `java`, `golang`)
-- ✅ Pulls each variant with `--platform=linux/amd64`,
-  boots the container, and asserts `/health` responds
 
-On `push` events, `<image-tag>` is the 7-character commit SHA and binaries plus
-`openapi.json` remain as workflow artifacts only. On release/manual runs,
-`<image-tag>` is the release version and the binaries plus `openapi.json` are
-uploaded to the GitHub release.
+It does **not** build, push, pull or smoke-test Docker images. On `push` events
+the binaries plus `openapi.json` remain as workflow artifacts only. On
+release/manual runs they are uploaded to the GitHub release.
+
+### Step 4c: Agent Server Docker images (on demand)
+
+Docker images are never built by `push`, tag, `pull_request` or `release`
+events (sdk#83). Run **Agent Server** (`server.yml`) via "Run workflow" on the
+branch or tag you want. One run chains, with `needs` and artifacts and no wait
+on any other workflow:
+
+1. `Build & Push (<variant>-amd64)` builds `linux/amd64` for `python`, `java`
+   and `golang` and pushes only `ghcr.io/<owner>/agent-server:verify-<run_id>-<run_attempt>-<variant>`.
+   The job fails if no image digest is produced.
+2. `Docker smoke (<variant>-amd64)` downloads the digest artifact, pulls
+   `<image>@<digest>`, checks that the verify tag still resolves to that digest
+   and that the image is `linux/amd64`, starts it and asserts `/health`
+   (about 2 minutes). A missing image fails at the first `docker pull`.
+3. `Publish GHCR tags (<variant>)` runs only if the dispatch sets `publish=true`
+   and all three smoke jobs passed. It re-tags the verified digest with
+   `docker buildx imagetools create` as `<sha7>-<variant>`, `<long-sha>-<variant>`,
+   `<branch>-<variant>`, `<sha7>-<base-slug>`, `<X.Y.Z>-<variant>` (when run on a
+   tag ref such as `v1.2.3`) and `latest-<variant>` (when run on `main`). This
+   single-arch manifest step is kept because existing consumers pull the
+   arch-less tags.
+
+**Verification image vs published image.** The `verify-...` image is only
+evidence for that run: unique per run and attempt, never overwritten, and not a
+supported tag for consumers. The published image is the same digest under the
+tags in step 3, and exists only after an explicit `publish=true` dispatch.
+
+**Retention.** GHCR package versions are not deleted automatically; remove
+`verify-...` versions in the GHCR package UI when they are no longer needed. The
+`image-ref-<variant>` workflow artifact (digest and tag list) is kept for 1 day.
+
+**Impact on existing tag users.** Tags already in GHCR (`main-*`, `latest-*`,
+`<sha7>-*`, `<X.Y.Z>-*`, `*-amd64`) are not removed and keep pointing at the
+images they point at now. They no longer move automatically: `latest-<variant>`
+and `<branch>-<variant>` change only when someone dispatches with
+`publish=true`, `*-amd64` tags are no longer pushed, and PR descriptions no
+longer get an "Agent Server images for this PR" section. To test a PR build,
+dispatch `server.yml` on the PR branch and use the `verify-...` digest from the
+run summary or logs. Pinning consumers (for example
+`clients/typescript/package.json` `config.agentServerImage`) must use a tag
+that was published with `publish=true`.
+
+**Acceptance decisions (sdk#83).**
+- Ordinary PRs and main pushes build and push 0 Docker images; fork PRs never
+  write to the registry because every registry-writing job is
+  `workflow_dispatch`-only and holds `packages: write` only at job level.
+- GHCR is the only registry. Only `linux/amd64` runs; no arm64, QEMU, Windows
+  or macOS job exists. The `python`, `java` and `golang` variants are kept.
+- The 45-minute manifest poll is removed; the smoke test sits in the same run as
+  the build. No retry loop longer than the 2 minute `/health` wait remains in
+  the Docker path.
+- Concurrent dispatches cannot collide: the verification tag contains the run
+  id and attempt, and the smoke test uses the digest. Published tags are
+  mutable aliases by design and are serialized per ref and variant.
+- Credentials: only `secrets.GITHUB_TOKEN` through `docker/login-action`; it is
+  never echoed. Auth failures, tag conflicts, pull failures, an unreachable
+  `/health` and cancellations show as failed or cancelled jobs.
+- Not changed: `version-bump-prs.yml` `bump-typescript-client` still waits up to
+  45 minutes for `ghcr.io/openhands/agent-server:<X.Y.Z>-python`; it runs only
+  in `OpenHands/software-agent-sdk` (never in this fork), so it is out of scope.
+  A release there needs a `server.yml` dispatch with `publish=true` first.
 
 #### Build time / runner expectations
 
@@ -87,20 +143,12 @@ uploaded to the GitHub release.
 |---|---|---|
 | Binary build (single linux x86_64 leg) | ~10–15 min | `ubuntu-24.04` |
 | `publish-binaries` (download + checksum + upload) | ~1–2 min | `ubuntu-24.04` |
-| `docker-smoke-test` (3-way matrix, parallel) | Up to 45 min (mostly polling for the docker images) | `ubuntu-24.04` (amd64) |
 
 #### QEMU / buildx requirements
 
-The smoke test does **not** require QEMU: every job runs on an `ubuntu-24.04`
-(x86_64) runner and pulls `--platform=linux/amd64`, so containers run natively. We do still set up Docker Buildx so we can call
-`docker buildx imagetools inspect` on the manifest.
-
-The wait window for the manifest is 45 min — long enough to absorb
-the full `server.yml` matrix runtime (~25–30 min for `build-and-push-image` +
-`merge-manifests`) when this workflow races the corresponding `server.yml` run
-for a release tag or main-branch push.
-
-If the matching manifest is already in GHCR, the wait step exits immediately.
+No QEMU is needed: every job runs on an `ubuntu-24.04` (x86_64) runner and runs
+`linux/amd64` images natively. The Docker jobs in `server.yml` set up Docker
+Buildx for `docker/build-push-action` and `docker buildx imagetools`.
 
 ### Step 5: Version Bump PRs (Automated)
 
@@ -137,12 +185,38 @@ If you need to manually trigger the PyPI release workflow:
 
 CI targets Ubuntu linux/amd64 only (sdk#82). Removed checks: `windows-tests` (`tests.yml`); `build-binary-and-test (macos-latest)` and `(windows-latest)`, `Build & Push (<variant>-arm64)` (`server.yml`); `Build (linux-arm64)`, `Build (macos-x86_64)`, `Build (macos-arm64)`, `Build (windows-x86_64)`, `Docker (<variant>-arm64)` (`release-binaries.yml`). Remaining check names are unchanged. Main branch protection could not be read with the available token (403; rulesets API returns `[]`), so an operator must confirm in the GitHub UI that no removed check is a required status check and drop it if so; this was not changed from the repository.
 
+### Required checks 移行
+
+sdk#83 stops Docker work on ordinary PRs and pushes. Main branch protection is
+unconfirmed (403 with the available token, rulesets API returns `[]`): the
+operator must check the GitHub UI and remove any of the following that is
+required, and must not require an image smoke check on PRs that do not run
+Docker. Nothing was changed in repository settings.
+
+| Check / job | Workflow | Change |
+|---|---|---|
+| `Build & Push (<variant>-amd64)` | `server.yml` | kept, now `workflow_dispatch` only (skipped on push/PR) |
+| `Merge Multi-Arch Manifests` | `server.yml` | deleted (single-arch; tags applied by `Publish GHCR tags`) |
+| `Consolidate Build Information` | `server.yml` | deleted (build-info aggregation) |
+| `Update PR description with agent server image` | `server.yml` | deleted (PR image blurb) |
+| `Docker (<variant>-amd64)` | `release-binaries.yml` | deleted (45 min poll) |
+| `Docker smoke (<variant>-amd64)` | `server.yml` | new, `workflow_dispatch` only |
+| `Publish GHCR tags (<variant>)` | `server.yml` | new, `workflow_dispatch` with `publish=true` only |
+| `Dispatch Agent Server image build` step | `create-release.yml` | deleted (no implicit release image build) |
+
+Unchanged and still run on ordinary PRs: `validate`, `build-binary-and-test (ubuntu-latest)`,
+`check-openapi-schema` (`Check OpenAPI Schema`), the TypeScript client and API
+checks. In `release-binaries.yml`, `resolve-tag`, `build-binary`,
+`build-openapi` and `publish-binaries` are unchanged.
+
 ## Workflow Files
 
 - `.github/workflows/prepare-release.yml` - Automated release preparation
 - `.github/workflows/pypi-release.yml` - PyPI package publication
-- `.github/workflows/release-binaries.yml` - Linux x86_64 binary publishing and
-  docker manifest smoke test on releases and main pushes
+- `.github/workflows/release-binaries.yml` - Linux x86_64 binary and OpenAPI
+  publishing on releases and main pushes
+- `.github/workflows/server.yml` - binary/OpenAPI checks on push and PR; on
+  demand (`workflow_dispatch`) Docker build, smoke test and optional publish
 
 ## Troubleshooting
 
@@ -169,14 +243,20 @@ If PyPI publication fails:
 If `release-binaries.yml` fails:
 - **Binary build failure**: re-run the failed matrix job; PyInstaller flakes are
   rare but possible. If it persists, the issue is likely in `agent-server.spec`.
-- **`docker-smoke-test` timed out waiting for the manifest**: `server.yml` did
-  not publish images for the matching release tag or commit SHA.
-  Check that workflow's corresponding run and re-trigger if needed.
-- **`/health` never responded**: open the failing job; the cleanup trap dumps
-  the last 100 lines of `docker logs` for the container.
 - Release/manual runs can be re-run against an existing tag via
   `workflow_dispatch` with the `release_tag` input (e.g. `v1.20.1`);
   `gh release upload --clobber` makes this safe.
+
+### Agent Server Docker Failed
+
+If a `server.yml` dispatch fails:
+- **Login or push failed** (`Build & Push`): check the dispatching actor's
+  `packages: write` permission; the job fails at once.
+- **`Docker smoke` pull failed**: the digest in the `image-ref-<variant>`
+  artifact is not in GHCR; the job fails at the first `docker pull`, so re-run
+  the dispatch.
+- **`/health` never responded**: open the failing job; the cleanup trap dumps
+  the last 100 lines of `docker logs` for the container.
 
 ## Previous Manual Process
 
