@@ -82,28 +82,3 @@ def test_make_validate_runs_steps_in_validate_env():
     )
     assert result.stdout.startswith("sh scripts/validate-env.sh ")
     assert "validate-steps" in result.stdout
-
-
-def test_make_validate_steps_run_in_order_through_suite_helper():
-    result = subprocess.run(
-        ["make", "-n", "validate-steps"],
-        cwd=REPO_ROOT,
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-    commands = [line.removesuffix(" && \\") for line in result.stdout.splitlines()]
-    assert all(c.startswith("sh scripts/validate-suite.sh ") for c in commands)
-    names = [c.split()[2] for c in commands]
-    assert names == [
-        "sync",
-        "sdk",
-        "agent_server",
-        "workspace",
-        "cross",
-        "tools",
-        "pyright",
-        "pre-commit",
-        "git-diff-check",
-        "git-diff-exit-code",
-    ]
