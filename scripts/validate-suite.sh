@@ -40,7 +40,10 @@ trap 'on_signal 130' INT
 trap 'on_signal 143' TERM HUP
 
 echo "SUITE name=$name status=start"
-{ "$@" 2>&1; echo $? >"$rc_file"; } | tee "$log" &
+# A background job of a non-interactive shell has SIGINT/SIGQUIT ignored and
+# `trap -` cannot undo that in dash; without this the suite inherits it and
+# Ctrl+C tests fail.
+{ env --default-signal=INT,QUIT "$@" 2>&1; echo $? >"$rc_file"; } | tee "$log" &
 wait $!
 rc="$(cat "$rc_file" 2>/dev/null || echo 1)"
 if [ "$rc" -eq 0 ]; then

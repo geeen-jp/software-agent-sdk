@@ -42,6 +42,16 @@ def test_validate_suite_keeps_exit_status_and_reports_failure():
     )
 
 
+def test_validate_suite_does_not_start_the_command_with_sigint_ignored():
+    result = run_suite(
+        sys.executable,
+        "-c",
+        "import signal; print(signal.getsignal(signal.SIGINT) is signal.SIG_IGN)",
+    )
+    assert result.returncode == 0
+    assert "False" in result.stdout.splitlines()
+
+
 def test_validate_suite_names_the_suite_when_terminated():
     hang = (
         "import faulthandler, time; faulthandler.enable(); "
