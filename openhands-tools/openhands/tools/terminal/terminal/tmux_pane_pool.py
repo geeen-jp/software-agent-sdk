@@ -28,6 +28,7 @@ from openhands.tools.terminal.env import (
     build_terminal_env,
     normalize_terminal_env,
 )
+from openhands.tools.terminal.terminal.process_groups import terminate_process_groups
 from openhands.tools.terminal.terminal.tmux_terminal import TmuxTerminal
 
 
@@ -48,8 +49,10 @@ class PooledTmuxTerminal(TmuxTerminal):
 
     def close(self) -> None:
         if not self._closed:
+            job_groups = self.pane_job_groups()
             with suppress(Exception):
                 self.window.kill()
+            terminate_process_groups(job_groups)
             self._closed = True
 
 

@@ -2,7 +2,11 @@
 
 import os
 import subprocess
+import sys
+import time
 from pathlib import Path
+
+import psutil
 
 from tests.conftest import REPO_ROOT
 
@@ -82,3 +86,44 @@ def test_make_validate_runs_steps_in_validate_env():
     )
     assert result.stdout.startswith("sh scripts/validate-env.sh ")
     assert "validate-steps" in result.stdout
+
+
+def test_validate_env_reaps_orphaned_sandbox_processes(tmp_path: Path):
+    """Orphans (here: one ignoring SIGTERM) must be gone before the sandbox is."""
+    pid_file = tmp_path / "orphan.pid"
+    orphan = (
+        "import signal, time; "
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)"
+    )
+    spawn = (
+        "import pathlib, subprocess, sys; "
+        f"p = subprocess.Popen([sys.executable, '-c', {orphan!r}], "
+        "start_new_session=True, stdin=subprocess.DEVNULL, "
+        "stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL); "
+        f"pathlib.Path({str(pid_file)!r}).write_text(str(p.pid))"
+    )
+    result = run_in_validate_env(tmp_path, sys.executable, "-c", spawn)
+    assert result.returncode == 0
+
+    orphan_pid = int(pid_file.read_text())
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and _is_running(orphan_pid):
+        time.sleep(0.1)
+    assert not _is_running(orphan_pid)
+    assert not list(tmp_path.glob("oh-validate.*"))
+
+
+def test_validate_env_keeps_command_exit_status(tmp_path: Path):
+    result = subprocess.run(
+        ["sh", "scripts/validate-env.sh", "sh", "-c", "exit 3"],
+        cwd=REPO_ROOT,
+        env={**os.environ, "TMPDIR": str(tmp_path)},
+    )
+    assert result.returncode == 3
+
+
+def _is_running(pid: int) -> bool:
+    try:
+        return psutil.Process(pid).status() != psutil.STATUS_ZOMBIE
+    except psutil.NoSuchProcess:
+        return False
