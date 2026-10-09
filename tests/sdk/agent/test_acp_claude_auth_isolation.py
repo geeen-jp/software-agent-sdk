@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import threading
 import uuid
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -746,7 +747,11 @@ def test_durable_leftover_credentials_are_removed_on_isolate(
 
 
 def _capture_start_env(
-    agent: ACPAgent, tmp_path: Path, *, ignore_startup_error: bool = False
+    agent: ACPAgent,
+    tmp_path: Path,
+    *,
+    ignore_startup_error: bool = False,
+    while_running: Callable[[], None] | None = None,
 ) -> dict[str, str]:
     from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -825,6 +830,8 @@ def _capture_start_env(
             except Exception:
                 if not ignore_startup_error:
                     raise
+            if while_running is not None:
+                while_running()
     finally:
         agent._executor.close(timeout=1.0)
         agent._cleanup_claude_config_runtime(discard=True)
@@ -1089,35 +1096,65 @@ def test_sonnet_5_5_auto_compact_window_is_independent_of_permission_policy(
     assert captured[_AUTO_COMPACT_ENV] == "400000"
 
 
-def test_sonnet_5_5_auto_compact_window_overrides_acp_env_and_survives_restart(
+def test_sonnet_5_5_auto_compact_window_overrides_acp_env(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.delenv(_AUTO_COMPACT_ENV, raising=False)
     agent = _claude_agent_with_token(
         "claude-sonnet-5-5", acp_env={_AUTO_COMPACT_ENV: "123456"}
     )
-    first = _capture_start_env(agent, tmp_path / "first", ignore_startup_error=True)
-    second = _capture_start_env(agent, tmp_path / "second", ignore_startup_error=True)
-    assert first[_AUTO_COMPACT_ENV] == second[_AUTO_COMPACT_ENV] == "400000"
+    captured = _capture_start_env(agent, tmp_path, ignore_startup_error=True)
+    assert captured[_AUTO_COMPACT_ENV] == "400000"
+
+
+def test_live_model_switch_updates_auto_compact_window_on_respawn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv(_AUTO_COMPACT_ENV, raising=False)
+    agent = _claude_agent_with_token("claude-sonnet-5-5")
+
+    def _respawn_env(name: str) -> dict[str, str]:
+        return _capture_start_env(agent, tmp_path / name, ignore_startup_error=True)
+
+    assert _respawn_env("initial")[_AUTO_COMPACT_ENV] == "400000"
+
+    agent._requested_model_id = "claude-opus-5-5"
+    agent._runtime_model_override_active = True
+    assert _AUTO_COMPACT_ENV not in _respawn_env("opus")
+
+    agent._requested_model_id = "claude-sonnet-5-5"
+    assert _respawn_env("sonnet")[_AUTO_COMPACT_ENV] == "400000"
 
 
 def test_auto_compact_window_does_not_leak_between_concurrent_conversations(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.delenv(_AUTO_COMPACT_ENV, raising=False)
+    sonnet_agent = _claude_agent_with_token("claude-sonnet-5-5")
+    haiku_agent = _claude_agent_with_token("claude-haiku-5-5")
+    haiku: dict[str, str] = {}
+    sonnet_dir_alive_during_haiku: list[bool] = []
+
+    def _start_haiku_while_sonnet_runs() -> None:
+        sonnet_dir = sonnet_agent._claude_config_runtime_dir
+        assert sonnet_dir is not None
+        haiku.update(
+            _capture_start_env(
+                haiku_agent, tmp_path / "haiku", ignore_startup_error=True
+            )
+        )
+        sonnet_dir_alive_during_haiku.append(sonnet_dir.exists())
+
     sonnet = _capture_start_env(
-        _claude_agent_with_token("claude-sonnet-5-5"),
+        sonnet_agent,
         tmp_path / "sonnet",
         ignore_startup_error=True,
-    )
-    haiku = _capture_start_env(
-        _claude_agent_with_token("claude-haiku-5-5"),
-        tmp_path / "haiku",
-        ignore_startup_error=True,
+        while_running=_start_haiku_while_sonnet_runs,
     )
     assert sonnet[_AUTO_COMPACT_ENV] == "400000"
     assert _AUTO_COMPACT_ENV not in haiku
     assert sonnet["CLAUDE_CONFIG_DIR"] != haiku["CLAUDE_CONFIG_DIR"]
+    assert sonnet_dir_alive_during_haiku == [True]
     assert not Path(sonnet["CLAUDE_CONFIG_DIR"]).exists()
     assert not Path(haiku["CLAUDE_CONFIG_DIR"]).exists()
 

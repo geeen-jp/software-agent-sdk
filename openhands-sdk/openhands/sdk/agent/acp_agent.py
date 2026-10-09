@@ -5515,6 +5515,7 @@ class ACPAgent(AgentBase):
                 "Qualified Claude exact-model execution requires a proven "
                 "read_only session before prompting."
             )
+        previous_requested_model = self._requested_model_for_turn()
         assert self._conn is not None
         assert self._session_id is not None
         conn = self._conn
@@ -5617,6 +5618,14 @@ class ACPAgent(AgentBase):
         # next turn's served-model evidence on the qualified Claude path.
         self._requested_model_id = model
         self._runtime_model_override_active = True
+        if (
+            provider is not None
+            and provider.key == "claude-code"
+            and (previous_requested_model == _CLAUDE_SONNET_5_5_MODEL)
+            != (model == _CLAUDE_SONNET_5_5_MODEL)
+        ):
+            # The compaction env is fixed at spawn; respawn re-evaluates it.
+            self._restart_session_on_next_turn = True
         self._post_turn_model_verification_required = qualified_exact_model
         self._served_model_id = None
         published_model = model if qualified_exact_model else effective_model

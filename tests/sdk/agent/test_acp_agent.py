@@ -4306,6 +4306,52 @@ class TestSetACPModel:
         agent._verify_served_model_for_turn()
         assert agent._served_model_id == model
 
+    @pytest.mark.parametrize(
+        ("old_model", "new_model", "restarts"),
+        [
+            ("claude-sonnet-5-5", "opus", True),
+            ("claude-opus-5-5", "claude-sonnet-5-5", True),
+            ("claude-haiku-5-5", "opus", False),
+            ("claude-sonnet-5-5", "claude-sonnet-5-5", False),
+        ],
+    )
+    def test_claude_switch_across_sonnet_5_5_boundary_schedules_restart(
+        self, old_model, new_model, restarts
+    ):
+        agent = self._wire(
+            _make_agent(acp_permission_policy="read_only"),
+            "claude-agent-acp",
+            via_config_option=True,
+        )
+        agent._startup_adapter_version = CLAUDE_AGENT_ACP_VERSION
+        agent._requested_model_id = old_model
+        agent._runtime_model_override_active = True
+        _agent_conn(agent).set_config_option = AsyncMock(
+            return_value=SetSessionConfigOptionResponse(
+                config_options=[
+                    _config_option(
+                        "model",
+                        "sonnet" if new_model == "claude-sonnet-5-5" else "opus",
+                        ["default", "opus", "sonnet"],
+                    ),
+                ]
+            )
+        )
+
+        agent.set_acp_model(new_model)
+
+        assert agent._requested_model_id == new_model
+        assert agent._restart_session_on_next_turn is restarts
+
+    def test_non_claude_switch_never_schedules_restart(self):
+        agent = self._wire(_make_agent(), "codex-acp")
+        agent._requested_model_id = "claude-sonnet-5-5"
+        agent._runtime_model_override_active = True
+
+        agent.set_acp_model("gpt-5.5")
+
+        assert agent._restart_session_on_next_turn is False
+
     def test_qualified_claude_switch_rejects_writable_session(self):
         agent = self._wire(
             _make_agent(acp_permission_policy="writable"),
