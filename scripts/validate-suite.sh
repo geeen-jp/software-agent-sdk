@@ -30,8 +30,6 @@ descendants() {
 # descendants (pytest enables faulthandler) dump the stack of the stuck test.
 on_signal() {
     report interrupted "$1"
-    # Give a just-started Python command time to enable faulthandler.
-    sleep 1
     for pid in $(descendants $$); do
         case "$(ps -o comm= -p "$pid")" in python*) kill -ABRT "$pid" ;; esac
     done 2>/dev/null

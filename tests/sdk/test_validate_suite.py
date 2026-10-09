@@ -43,7 +43,10 @@ def test_validate_suite_keeps_exit_status_and_reports_failure():
 
 
 def test_validate_suite_names_the_suite_when_terminated():
-    hang = "import faulthandler, time; faulthandler.enable(); time.sleep(60)"
+    hang = (
+        "import faulthandler, time; faulthandler.enable(); "
+        "print('ready', flush=True); time.sleep(60)"
+    )
     proc = subprocess.Popen(
         ["sh", SCRIPT, "demo", sys.executable, "-c", hang],
         cwd=REPO_ROOT,
@@ -53,6 +56,7 @@ def test_validate_suite_names_the_suite_when_terminated():
     )
     assert proc.stdout is not None
     assert proc.stdout.readline().strip() == "SUITE name=demo status=start"
+    assert proc.stdout.readline().strip() == "ready"
     proc.send_signal(signal.SIGTERM)
     output, _ = proc.communicate(timeout=30)
     assert proc.returncode == 143
