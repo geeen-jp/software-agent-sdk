@@ -748,6 +748,7 @@ def _capture_start_env(
     while_running: Callable[[ConversationState], None] | None = None,
     state: ConversationState | None = None,
     spawn_envs: list[dict[str, str]] | None = None,
+    loaded_session_ids: list[str] | None = None,
 ) -> dict[str, str]:
     from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -797,7 +798,13 @@ def _capture_start_env(
     new_response = MagicMock()
     new_response.session_id = "sess-auth"
     conn.new_session = AsyncMock(return_value=new_response)
-    conn.load_session = AsyncMock(return_value=MagicMock())
+
+    async def _fake_load_session(*, session_id, **_kwargs):
+        if loaded_session_ids is not None:
+            loaded_session_ids.append(session_id)
+        return MagicMock()
+
+    conn.load_session = AsyncMock(side_effect=_fake_load_session)
     conn.set_session_mode = AsyncMock()
     conn.set_session_model = AsyncMock()
     conn.authenticate = AsyncMock()
@@ -1113,8 +1120,14 @@ def test_sonnet_5_5_auto_compact_window_survives_restart_of_same_conversation(
         "claude-sonnet-5-5", acp_permission_policy="read_only"
     )
     spawn_envs: list[dict[str, str]] = []
+    loaded_session_ids: list[str] = []
 
     def _restart_across_model_switches(state: ConversationState) -> None:
+        state.agent_state = {
+            **state.agent_state,
+            "acp_session_id": "prior-sess",
+            "acp_session_cwd": state.workspace.working_dir,
+        }
         for model in ("claude-opus-5-5", "claude-sonnet-5-5"):
             agent._requested_model_id = model
             agent._runtime_model_override_active = True
@@ -1128,10 +1141,12 @@ def test_sonnet_5_5_auto_compact_window_survives_restart_of_same_conversation(
         ignore_startup_error=True,
         while_running=_restart_across_model_switches,
         spawn_envs=spawn_envs,
+        loaded_session_ids=loaded_session_ids,
     )
 
     assert [_AUTO_COMPACT_ENV in env for env in spawn_envs] == [True, False, True]
     assert spawn_envs[2][_AUTO_COMPACT_ENV] == "400000"
+    assert loaded_session_ids == ["prior-sess", "prior-sess"]
 
 
 def test_auto_compact_window_does_not_leak_between_concurrent_conversations(
