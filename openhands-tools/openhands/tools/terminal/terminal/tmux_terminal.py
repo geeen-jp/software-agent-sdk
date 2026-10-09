@@ -3,6 +3,7 @@
 import time
 import uuid
 from collections.abc import Mapping
+from contextlib import suppress
 
 import libtmux
 
@@ -20,6 +21,10 @@ from openhands.tools.terminal.env import (
 from openhands.tools.terminal.metadata import CmdOutputMetadata
 from openhands.tools.terminal.terminal import TerminalInterface
 from openhands.tools.terminal.terminal.interface import parse_ctrl_key
+from openhands.tools.terminal.terminal.process_groups import (
+    descendant_process_groups,
+    terminate_process_groups,
+)
 
 
 logger = get_logger(__name__)
@@ -127,10 +132,19 @@ class TmuxTerminal(TerminalInterface):
         self._initialized: bool = True
         self.clear_screen()
 
+    def pane_job_groups(self) -> set[int]:
+        """Process groups of the jobs running under this pane's shell."""
+        with suppress(Exception):
+            pane_pid = self.pane.pane_pid
+            assert pane_pid is not None
+            return descendant_process_groups(int(pane_pid))
+        return set()
+
     def close(self) -> None:
         """Clean up the tmux session."""
         if self._closed:
             return
+        job_groups = self.pane_job_groups()
         try:
             if hasattr(self, "session"):
                 self.session.kill()
@@ -139,6 +153,7 @@ class TmuxTerminal(TerminalInterface):
             # (e.g., "can't find session" error from tmux)
             # Also handles ImportError during Python shutdown
             logger.debug(f"Error closing tmux session (may already be dead): {e}")
+        terminate_process_groups(job_groups)
         self._closed: bool = True
 
     def send_keys(self, text: str, enter: bool = True) -> None:

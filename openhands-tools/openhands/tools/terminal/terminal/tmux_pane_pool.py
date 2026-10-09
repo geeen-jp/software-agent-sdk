@@ -28,6 +28,7 @@ from openhands.tools.terminal.env import (
     build_terminal_env,
     normalize_terminal_env,
 )
+from openhands.tools.terminal.terminal.process_groups import terminate_process_groups
 from openhands.tools.terminal.terminal.tmux_terminal import TmuxTerminal
 
 
@@ -48,8 +49,10 @@ class PooledTmuxTerminal(TmuxTerminal):
 
     def close(self) -> None:
         if not self._closed:
+            job_groups = self.pane_job_groups()
             with suppress(Exception):
                 self.window.kill()
+            terminate_process_groups(job_groups)
             self._closed = True
 
 
@@ -149,19 +152,22 @@ class TmuxPanePool:
         self._closed = True
 
         with self._lock:
+            job_groups: set[int] = set()
             for terminal in self._all_panes:
+                job_groups |= terminal.pane_job_groups()
                 terminal._closed = True
             self._all_panes.clear()
             self._available.clear()
 
-        # Kill the entire tmux session (destroys all windows/panes at once).
-        # We deliberately skip per-terminal close() because that also calls
-        # session.kill() and would fail on the second pane.
+        # Kill the entire tmux session (destroys all windows/panes at once)
+        # rather than each pane's window; the job groups were snapshotted
+        # above because they are orphaned once the shells die.
         try:
             if self._session is not None:
                 self._session.kill()
         except Exception as e:
             logger.warning(f"Error killing pool session: {e}")
+        terminate_process_groups(job_groups)
 
     def _create_pane(self) -> PooledTmuxTerminal:
         """Create a new PooledTmuxTerminal within the shared session."""

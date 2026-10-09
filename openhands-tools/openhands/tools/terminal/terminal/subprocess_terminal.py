@@ -35,6 +35,10 @@ from openhands.tools.terminal.env import (
 from openhands.tools.terminal.metadata import CmdOutputMetadata
 from openhands.tools.terminal.terminal import TerminalInterface
 from openhands.tools.terminal.terminal.interface import parse_ctrl_key
+from openhands.tools.terminal.terminal.process_groups import (
+    descendant_process_groups,
+    terminate_process_groups,
+)
 
 
 logger = get_logger(__name__)
@@ -207,8 +211,15 @@ class SubprocessTerminal(TerminalInterface):
         if self._closed:
             return
 
+        job_groups: set[int] = set()
         try:
             if self.process:
+                # Jobs run in their own process groups; find them before they
+                # are orphaned by the shell exiting.
+                try:
+                    job_groups = descendant_process_groups(self.process.pid)
+                except Exception:
+                    pass
                 # Try a graceful exit
                 try:
                     self._write_pty(b"exit\n")
@@ -226,6 +237,7 @@ class SubprocessTerminal(TerminalInterface):
         except Exception as e:
             logger.error(f"Error closing PTY terminal: {e}", exc_info=True)
         finally:
+            terminate_process_groups(job_groups)
             # Reader thread stop: close master FD; thread exits on read error/EOF
             try:
                 if self._pty_master_fd is not None:

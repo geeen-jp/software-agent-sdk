@@ -19,6 +19,8 @@ from openhands.tools.terminal.definition import (
 )
 from openhands.tools.terminal.impl import TerminalExecutor
 
+from .conftest import free_port, server_pids, wait_server_gone
+
 
 @pytest.fixture
 def pool_executor():
@@ -31,6 +33,26 @@ def pool_executor():
         )
         yield executor
         executor.close()
+
+
+def test_executor_close_reaps_pool_server_process_group(tmp_path):
+    port = free_port()
+    executor = TerminalExecutor(
+        working_dir=str(tmp_path), terminal_type="tmux", max_panes=2
+    )
+    try:
+        executor(
+            TerminalAction(
+                command=f"nohup python3 -m http.server {port} &", timeout=1.0
+            )
+        )
+        deadline = time.monotonic() + 5
+        while not server_pids(port) and time.monotonic() < deadline:
+            time.sleep(0.1)
+        assert server_pids(port)
+    finally:
+        executor.close()
+    assert wait_server_gone(port)
 
 
 class TestDeclaredResources:

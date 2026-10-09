@@ -6,7 +6,40 @@ set -eu
 cache_home="${XDG_CACHE_HOME:-$HOME/.cache}"
 data_home="${XDG_DATA_HOME:-$HOME/.local/share}"
 sandbox="$(mktemp -d "${TMPDIR:-/tmp}/oh-validate.XXXXXX")"
-trap 'rm -rf "$sandbox"' EXIT
+
+# Everything the run starts inherits TMPDIR=$sandbox/tmp (see env -i below), also
+# after being re-parented away from this shell; `ps e` shows each environment.
+sandbox_pids() {
+    snapshot="$(ps -A eww -o pid= -o command= 2>/dev/null || true)"
+    printf '%s\n' "$snapshot" |
+        awk -v marker="TMPDIR=$sandbox/tmp" -v self="$$" \
+            'index($0, marker) && $1 != self { print $1 }'
+}
+
+# TERM, then KILL. Returns non-zero while a process of the run is still alive.
+reap_sandbox() {
+    for signal in TERM KILL; do
+        pids="$(sandbox_pids)"
+        [ -n "$pids" ] || return 0
+        # shellcheck disable=SC2086
+        kill -"$signal" $pids 2>/dev/null || true
+        tries=0
+        while [ "$tries" -lt 20 ] && [ -n "$(sandbox_pids)" ]; do
+            sleep 0.1
+            tries=$((tries + 1))
+        done
+    done
+    [ -z "$(sandbox_pids)" ]
+}
+
+cleanup() {
+    if reap_sandbox; then
+        rm -rf "$sandbox"
+    else
+        echo "validate-env: processes still alive; keeping $sandbox" >&2
+    fi
+}
+trap cleanup EXIT
 mkdir "$sandbox/home" "$sandbox/tmp"
 
 # LANG and LC_* are the only allowlisted names matched by prefix.
