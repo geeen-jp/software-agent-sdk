@@ -1036,15 +1036,22 @@ def test_read_only_claude_uses_complete_mode_config_without_update(tmp_path) -> 
     )
 
 
-@pytest.mark.parametrize("model", ["claude-opus-5-5", "claude-sonnet-5-5"])
+@pytest.mark.parametrize(
+    ("model", "effort"),
+    [
+        ("claude-opus-5-5", "medium"),
+        ("claude-sonnet-5-5", "medium"),
+        ("claude-haiku-5-5", "high"),
+    ],
+)
 def test_read_only_claude_model_and_effort_keep_mode_proof_independent(
-    tmp_path, model: str
+    tmp_path, model: str, effort: str
 ) -> None:
     agent = ACPAgent(
         acp_command=_CLAUDE_COMMAND,
         acp_model=model,
         acp_permission_policy="read_only",
-        acp_config_options={"effort": "medium"},
+        acp_config_options={"effort": effort},
     )
     conn = _start_acp_server_with_session_config(
         agent,
@@ -1072,7 +1079,7 @@ def test_read_only_claude_model_and_effort_keep_mode_proof_independent(
         {
             "config_id": "effort",
             "session_id": "sess-1",
-            "value": "medium",
+            "value": effort,
         }
     ]
 
