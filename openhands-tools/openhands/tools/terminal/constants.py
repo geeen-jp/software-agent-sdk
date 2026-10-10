@@ -35,6 +35,9 @@ POLL_INTERVAL: Final[float] = 0.5
 HISTORY_LIMIT: Final[int] = 10_000
 
 TMUX_SOCKET_NAME: Final[str] = "openhands"
+TMUX_COMMAND_TIMEOUT_SECONDS: Final[float] = 5.0
+TMUX_INITIALIZE_TIMEOUT_SECONDS: Final[float] = 30.0
+TMUX_READ_SCREEN_TIMEOUT_SECONDS: Final[float] = 5.0
 
 # Tmux session dimensions (columns x rows). Keep the viewport wide enough for
 # common command output while leaving scrollback retention to HISTORY_LIMIT.

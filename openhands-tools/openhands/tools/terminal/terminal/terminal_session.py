@@ -375,6 +375,16 @@ class TerminalSession(TerminalSessionBase):
         # Clear the current content
         self.terminal.clear_screen()
 
+    @staticmethod
+    def _set_command_duration(
+        observation: TerminalObservation,
+        started_at: float,
+        finished_at: float | None = None,
+    ) -> TerminalObservation:
+        ended_at = time.monotonic() if finished_at is None else finished_at
+        observation.metadata.duration_seconds = max(0.0, ended_at - started_at)
+        return observation
+
     def _combine_outputs_between_matches(
         self,
         terminal_content: str,
@@ -479,9 +489,11 @@ class TerminalSession(TerminalSessionBase):
             len(initial_terminal_output),
         )
 
-        start_time = time.time()
-        last_change_time = start_time
+        started_at = time.monotonic()
+        deadline = started_at + action.timeout if action.timeout is not None else None
+        last_change_time = started_at
         last_terminal_output = initial_terminal_output
+        last_ps1_matches = initial_ps1_matches
 
         # When prev command is still running, and we are trying to send a new command
         if (
@@ -558,25 +570,52 @@ class TerminalSession(TerminalSessionBase):
 
         # Loop until the command completes or times out
         while True:
-            _start_time = time.time()
-            logger.debug(f"GETTING TERMINAL CONTENT at {_start_time}")
+            if deadline is not None and time.monotonic() >= deadline:
+                observation = self._handle_hard_timeout_command(
+                    command,
+                    terminal_content=last_terminal_output,
+                    ps1_matches=last_ps1_matches,
+                    timeout=deadline - started_at,
+                )
+                return self._set_command_duration(observation, started_at)
+
+            read_started_at = time.monotonic()
             cur_terminal_output = self.terminal.read_screen()
             logger.debug(
-                f"TERMINAL CONTENT GOT after {time.time() - _start_time:.2f} seconds"
+                "Terminal screen read duration_seconds=%.3f",
+                time.monotonic() - read_started_at,
             )
             logger.debug(
                 "Terminal content read (content_length=%s)", len(cur_terminal_output)
             )
             ps1_matches = CmdOutputMetadata.matches_ps1_metadata(cur_terminal_output)
             current_ps1_count = len(ps1_matches)
+            previous_terminal_output = last_terminal_output
+            last_terminal_output = cur_terminal_output
+            last_ps1_matches = ps1_matches
             output_changed_since_command = (
                 cur_terminal_output != initial_terminal_output
             )
 
-            if cur_terminal_output != last_terminal_output:
-                last_terminal_output = cur_terminal_output
-                last_change_time = time.time()
-                logger.debug(f"CONTENT UPDATED DETECTED at {last_change_time}")
+            read_finished_at = time.monotonic()
+            if cur_terminal_output != previous_terminal_output:
+                last_change_time = read_finished_at
+                logger.debug(
+                    "Terminal output changed at elapsed_seconds=%.3f",
+                    read_finished_at - started_at,
+                )
+
+            # libtmux invokes synchronous tmux client commands without a per-call
+            # timeout. This deadline bounds polling between calls; an in-flight call
+            # can still overrun it.
+            if deadline is not None and read_finished_at >= deadline:
+                observation = self._handle_hard_timeout_command(
+                    command,
+                    terminal_content=cur_terminal_output,
+                    ps1_matches=ps1_matches,
+                    timeout=deadline - started_at,
+                )
+                return self._set_command_duration(observation, started_at)
 
             # 1) Execution completed:
             # Condition 1: A new prompt has appeared since the command started.
@@ -592,14 +631,16 @@ class TerminalSession(TerminalSessionBase):
                     terminal_content=cur_terminal_output,
                     ps1_matches=ps1_matches,
                 )
-                return obs
+                return self._set_command_duration(
+                    obs, started_at, finished_at=read_finished_at
+                )
 
             # Timeout checks should only trigger if a new prompt hasn't appeared yet.
 
             # 2) Execution timed out since there's no change in output
             # for a while (NO_CHANGE_TIMEOUT_SECONDS)
             # We ignore this if the command is *blocking*
-            time_since_last_change = time.time() - last_change_time
+            time_since_last_change = time.monotonic() - last_change_time
             is_blocking = action.timeout is not None
             logger.debug(
                 f"CHECKING NO CHANGE TIMEOUT ({self.no_change_timeout_seconds}s): "
@@ -615,24 +656,20 @@ class TerminalSession(TerminalSessionBase):
                     terminal_content=cur_terminal_output,
                     ps1_matches=ps1_matches,
                 )
-                return obs
+                return self._set_command_duration(obs, started_at)
 
             # 3) Execution timed out since the command has been running for too long
             # (hard timeout)
-            elapsed_time = time.time() - start_time
+            elapsed_time = time.monotonic() - started_at
             logger.debug(
-                f"CHECKING HARD TIMEOUT ({action.timeout}s): elapsed {elapsed_time:.2f}"
+                "Checking hard timeout timeout_seconds=%s elapsed_seconds=%.2f",
+                action.timeout,
+                elapsed_time,
             )
-            if action.timeout is not None:
-                time_since_start = time.time() - start_time
-                if time_since_start >= action.timeout:
-                    obs = self._handle_hard_timeout_command(
-                        command,
-                        terminal_content=cur_terminal_output,
-                        ps1_matches=ps1_matches,
-                        timeout=action.timeout,
-                    )
-                    return obs
+            if deadline is None:
+                time.sleep(POLL_INTERVAL)
+                continue
 
-            # Sleep before next check
-            time.sleep(POLL_INTERVAL)
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                time.sleep(min(POLL_INTERVAL, remaining))
