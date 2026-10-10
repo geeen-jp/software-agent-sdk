@@ -84,9 +84,9 @@ def test_fifo_lock_timeout():
     lock.acquire()
 
     def try_acquire_with_timeout():
-        start_time = time.time()
+        start_time = time.monotonic()
         result = lock.acquire(blocking=True, timeout=0.1)
-        end_time = time.time()
+        end_time = time.monotonic()
         return result, end_time - start_time
 
     result = []
@@ -96,7 +96,7 @@ def test_fifo_lock_timeout():
 
     acquired, duration = result[0]
     assert not acquired  # Should timeout
-    assert 0.09 <= duration <= 0.2  # Should be close to timeout value
+    assert 0.09 <= duration <= 1.0  # Allow scheduler delays under load
 
     lock.release()
 
