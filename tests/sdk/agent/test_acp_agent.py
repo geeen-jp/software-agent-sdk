@@ -112,6 +112,26 @@ def _structured_output_config() -> StructuredOutputConfig:
     )
 
 
+def _scope_judge_output_config() -> StructuredOutputConfig:
+    return StructuredOutputConfig(
+        mode="json_schema",
+        schema={
+            "type": "object",
+            "properties": {
+                "decision": {"type": "string", "enum": ["accept", "reject"]},
+                "rationale": {"type": "string", "minLength": 1},
+                "findings": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "maxItems": 5,
+                },
+            },
+            "required": ["decision", "rationale", "findings"],
+            "additionalProperties": False,
+        },
+    )
+
+
 def _message_chunk(text: str, message_id: str | None) -> AgentMessageChunk:
     return AgentMessageChunk(
         content=TextContentBlock(text=text, type="text"),
@@ -146,6 +166,12 @@ async def _verified_set_session_model(
 _CLAUDE_EXACT_MODEL_CASES = (
     pytest.param("claude-opus-5-5", "opus", "claude-opus-5-4", id="opus-5-5"),
     pytest.param("claude-sonnet-5-5", "sonnet", "claude-sonnet-5", id="sonnet-5-5"),
+    pytest.param(
+        "claude-haiku-5-5",
+        "haiku",
+        "claude-haiku-4-5-20251001",
+        id="haiku-5-5",
+    ),
 )
 
 
@@ -5085,6 +5111,24 @@ class TestServedModelGate:
         agent._verify_served_model_for_turn()
         assert agent._served_model_id == model
 
+    @pytest.mark.parametrize(
+        ("model", "selector"),
+        [
+            ("claude-haiku-5-5", "haiku"),
+            ("claude-sonnet-5-5", "sonnet"),
+        ],
+    )
+    def test_exact_request_rejects_alias_without_same_turn_model_evidence(
+        self, model, selector
+    ):
+        agent = self._agent(model=model, selector=selector)
+
+        with pytest.raises(ACPSessionModelError, match="served='UNKNOWN'"):
+            agent._verify_served_model_for_turn()
+
+        assert agent._served_model_id is None
+        assert agent.current_model_id == selector
+
     def test_passing_turn_publishes_model_and_failed_next_turn_restores_selector(
         self, tmp_path
     ):
@@ -5547,14 +5591,15 @@ class TestACPSessionIdPersistence:
         ]
 
     @pytest.mark.parametrize(
-        ("model", "selector"),
+        ("model", "selector", "effort"),
         [
-            ("claude-opus-5-5", "default"),
-            ("claude-sonnet-5-5", "default"),
+            ("claude-opus-5-5", "default", "medium"),
+            ("claude-sonnet-5-5", "default", "medium"),
+            ("claude-haiku-5-5", "default", "high"),
         ],
     )
     def test_qualified_claude_exact_model_defers_to_same_turn_evidence(
-        self, tmp_path, model, selector
+        self, tmp_path, model, selector, effort
     ):
         agent = _make_agent(
             acp_command=[
@@ -5564,7 +5609,7 @@ class TestACPSessionIdPersistence:
             ],
             acp_server="claude-code",
             acp_model=model,
-            acp_config_options={"effort": "medium"},
+            acp_config_options={"effort": effort},
             acp_permission_policy="read_only",
         )
         state = _make_state(tmp_path)
@@ -5588,16 +5633,66 @@ class TestACPSessionIdPersistence:
         assert agent._post_turn_model_verification_required is True
         assert agent.current_model_id == selector
         assert state.agent_state["acp_current_model_id"] == selector
+        conn.set_config_option.assert_awaited_once_with(
+            config_id="effort",
+            session_id="sess-new",
+            value=effort,
+        )
+
+    def test_haiku_high_effort_fails_when_config_response_reports_mismatch(
+        self, tmp_path
+    ):
+        agent = _make_agent(
+            acp_command=[
+                "npx",
+                "-y",
+                f"@agentclientprotocol/claude-agent-acp@{CLAUDE_AGENT_ACP_VERSION}",
+            ],
+            acp_server="claude-code",
+            acp_model="claude-haiku-5-5",
+            acp_config_options={"effort": "high"},
+            acp_permission_policy="read_only",
+        )
+        state = _make_state(tmp_path)
+        conn = _make_config_conn(
+            agent_name="claude-agent-acp",
+            agent_version=CLAUDE_AGENT_ACP_VERSION,
+            options=self._qualified_claude_options(),
+            modes=self._qualified_claude_modes(),
+        )
+        conn.set_config_option = AsyncMock(
+            return_value=SetSessionConfigOptionResponse(
+                config_options=[
+                    _config_option("model", "default", ["default", "opus", "sonnet"]),
+                    _config_option(
+                        "mode", "default", ["default", "plan", "bypassPermissions"]
+                    ),
+                    _config_option("effort", "medium", ["low", "medium", "high"]),
+                ]
+            )
+        )
+
+        with self._mocked_acp_runtime(agent, conn):
+            with pytest.raises(ACPSessionConfigError, match="after requesting 'high'"):
+                agent.init_state(state, on_event=lambda _: None)
+
+        conn.set_config_option.assert_awaited_once_with(
+            config_id="effort",
+            session_id="sess-new",
+            value="high",
+        )
+        conn.prompt.assert_not_called()
 
     @pytest.mark.parametrize(
-        ("model", "selector"),
+        ("model", "selector", "effort"),
         [
-            ("claude-opus-5-5", "default"),
-            ("claude-sonnet-5-5", "default"),
+            ("claude-opus-5-5", "default", "medium"),
+            ("claude-sonnet-5-5", "default", "medium"),
+            ("claude-haiku-5-5", "default", "high"),
         ],
     )
     def test_resume_preserves_historical_verified_model_until_fresh_turn(
-        self, tmp_path, model, selector
+        self, tmp_path, model, selector, effort
     ):
         agent = _make_agent(
             acp_command=[
@@ -5607,7 +5702,7 @@ class TestACPSessionIdPersistence:
             ],
             acp_server="claude-code",
             acp_model=model,
-            acp_config_options={"effort": "medium"},
+            acp_config_options={"effort": effort},
             acp_permission_policy="read_only",
         )
         state = _make_state(tmp_path)
@@ -5629,12 +5724,18 @@ class TestACPSessionIdPersistence:
         assert agent.current_model_id == model
         assert agent._selector_model_id == selector
         assert state.agent_state["acp_current_model_id"] == model
+        conn.set_config_option.assert_awaited_once_with(
+            config_id="effort",
+            session_id="sess-old",
+            value=effort,
+        )
 
         agent._reset_client_for_turn(None, lambda _: None, [], state=state)
         assert agent.current_model_id == selector
         assert state.agent_state["acp_current_model_id"] == selector
 
-    def test_claude_sonnet_alias_does_not_publish_exact_identity(self, tmp_path):
+    @pytest.mark.parametrize("alias", ["sonnet", "haiku"])
+    def test_claude_alias_does_not_publish_exact_identity(self, tmp_path, alias):
         agent = _make_agent(
             acp_command=[
                 "npx",
@@ -5642,21 +5743,21 @@ class TestACPSessionIdPersistence:
                 f"@agentclientprotocol/claude-agent-acp@{CLAUDE_AGENT_ACP_VERSION}",
             ],
             acp_server="claude-code",
-            acp_model="sonnet",
+            acp_model=alias,
             acp_permission_policy="read_only",
         )
         state = _make_state(tmp_path)
         conn = _make_config_conn(
             agent_name="claude-agent-acp",
             agent_version=CLAUDE_AGENT_ACP_VERSION,
-            options=self._qualified_claude_options("sonnet"),
+            options=self._qualified_claude_options(alias),
             modes=self._qualified_claude_modes(),
         )
 
         with self._mocked_acp_runtime(agent, conn):
             agent.init_state(state, on_event=lambda _: None)
 
-        assert agent.current_model_id == "sonnet"
+        assert agent.current_model_id == alias
         assert agent._post_turn_model_verification_required is False
         assert agent._served_model_id is None
 
@@ -5688,12 +5789,13 @@ class TestACPSessionIdPersistence:
         assert kwargs["claudeCode"]["emitRawSDKMessages"] is True
         assert agent._post_turn_model_verification_required is False
 
+    @pytest.mark.parametrize("model", ["claude-opus-5-5", "claude-haiku-5-5"])
     def test_qualified_claude_exact_model_requires_read_only_before_prompt(
-        self, tmp_path
+        self, tmp_path, model
     ):
         agent = _make_agent(
             acp_server="claude-code",
-            acp_model="claude-opus-5-5",
+            acp_model=model,
             acp_permission_policy="writable",
         )
         state = _make_state(tmp_path)
@@ -5741,7 +5843,10 @@ class TestACPSessionIdPersistence:
         conn.prompt.assert_not_called()
         assert agent._initialized is False
 
-    @pytest.mark.parametrize("model", ["claude-opus-5-5", "claude-sonnet-5-5"])
+    @pytest.mark.parametrize(
+        "model",
+        ["claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5"],
+    )
     def test_qualified_claude_exact_model_resumes_without_reusing_selector_as_proof(
         self, tmp_path, model
     ):
@@ -7003,9 +7108,12 @@ class TestACPSessionConfigOptions:
         )
         conn.set_config_option.assert_not_called()
 
-    @pytest.mark.parametrize("model", ["claude-opus-5-5", "claude-sonnet-5-5"])
+    @pytest.mark.parametrize(
+        "model",
+        ["claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5"],
+    )
     def test_claude_fresh_session_sends_structured_output_meta(self, tmp_path, model):
-        config = _structured_output_config()
+        config = _scope_judge_output_config()
         agent = _make_agent(
             acp_command=[
                 "npx",
@@ -7080,12 +7188,15 @@ class TestACPSessionConfigOptions:
         )
         conn.new_session.assert_not_awaited()
 
-    @pytest.mark.parametrize("model", ["claude-opus-5-5", "claude-sonnet-5-5"])
+    @pytest.mark.parametrize(
+        "model",
+        ["claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5"],
+    )
     def test_claude_resumed_session_combines_structured_output_and_model(
         self, tmp_path, model
     ):
         """Load carries output metadata and the requested model intent."""
-        config = _structured_output_config()
+        config = _scope_judge_output_config()
         agent = _make_agent(
             acp_command=[
                 "npx",
