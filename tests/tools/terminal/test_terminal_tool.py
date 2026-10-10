@@ -2,6 +2,7 @@
 
 import platform
 import tempfile
+from collections.abc import Sequence
 from uuid import uuid4
 
 import pytest
@@ -16,6 +17,13 @@ from openhands.tools.terminal import (
     TerminalObservation,
     TerminalTool,
 )
+from tests.tools.tmux_utils import _tmux_session_count
+
+
+def _close_tools(tools: Sequence[TerminalTool]) -> None:
+    for tool in tools:
+        if tool.executor is not None:
+            tool.executor.close()
 
 
 def _create_test_conv_state(temp_dir: str) -> ConversationState:
@@ -32,81 +40,110 @@ def _create_test_conv_state(temp_dir: str) -> ConversationState:
 def test_bash_tool_initialization():
     """Test that TerminalTool initializes correctly."""
     with tempfile.TemporaryDirectory() as temp_dir:
-        conv_state = _create_test_conv_state(temp_dir)
-        tools = TerminalTool.create(conv_state)
-        tool = tools[0]
+        session_count_before = _tmux_session_count()
+        tools: Sequence[TerminalTool] = ()
+        try:
+            conv_state = _create_test_conv_state(temp_dir)
+            tools = TerminalTool.create(conv_state)
+            tool = tools[0]
 
-        # Check that the tool has the correct name and properties
-        assert tool.name == "terminal"
-        assert tool.executor is not None
-        assert tool.action_type == TerminalAction
+            assert tool.name == "terminal"
+            assert tool.executor is not None
+            assert tool.action_type == TerminalAction
+            expected_session_count = session_count_before + int(
+                getattr(tool.executor, "is_pooled", False)
+            )
+            assert _tmux_session_count() == expected_session_count
+        finally:
+            _close_tools(tools)
+
+        assert _tmux_session_count() == session_count_before
 
 
 def test_bash_tool_with_username():
     """Test that TerminalTool initializes correctly with username."""
     with tempfile.TemporaryDirectory() as temp_dir:
-        conv_state = _create_test_conv_state(temp_dir)
-        tools = TerminalTool.create(conv_state, username="testuser")
-        tool = tools[0]
+        session_count_before = _tmux_session_count()
+        tools: Sequence[TerminalTool] = ()
+        try:
+            conv_state = _create_test_conv_state(temp_dir)
+            tools = TerminalTool.create(conv_state, username="testuser")
+            tool = tools[0]
 
-        # Check that the tool has the correct name and properties
-        assert tool.name == "terminal"
-        assert tool.executor is not None
-        assert tool.action_type == TerminalAction
+            assert tool.name == "terminal"
+            assert tool.executor is not None
+            assert tool.action_type == TerminalAction
+            expected_session_count = session_count_before + int(
+                getattr(tool.executor, "is_pooled", False)
+            )
+            assert _tmux_session_count() == expected_session_count
+        finally:
+            _close_tools(tools)
+
+        assert _tmux_session_count() == session_count_before
 
 
 def test_bash_tool_execution():
     """Test that TerminalTool can execute commands."""
     with tempfile.TemporaryDirectory() as temp_dir:
-        conv_state = _create_test_conv_state(temp_dir)
-        tools = TerminalTool.create(conv_state)
-        tool = tools[0]
+        tools: Sequence[TerminalTool] = ()
+        try:
+            conv_state = _create_test_conv_state(temp_dir)
+            tools = TerminalTool.create(conv_state)
+            tool = tools[0]
 
-        # Create an action
-        action = TerminalAction(command="echo 'Hello, World!'")
+            action = TerminalAction(command="echo 'Hello, World!'")
+            result = tool(action)
 
-        # Execute the action
-        result = tool(action)
-
-        # Check the result
-        assert result is not None
-        assert isinstance(result, TerminalObservation)
-        assert "Hello, World!" in result.text
+            assert result is not None
+            assert isinstance(result, TerminalObservation)
+            assert "Hello, World!" in result.text
+        finally:
+            _close_tools(tools)
 
 
 def test_bash_tool_working_directory():
     """Test that TerminalTool respects the working directory."""
     with tempfile.TemporaryDirectory() as temp_dir:
-        conv_state = _create_test_conv_state(temp_dir)
-        tools = TerminalTool.create(conv_state)
-        tool = tools[0]
+        tools: Sequence[TerminalTool] = ()
+        try:
+            conv_state = _create_test_conv_state(temp_dir)
+            tools = TerminalTool.create(conv_state)
+            tool = tools[0]
 
-        # Create an action to check current directory
-        action = TerminalAction(command="pwd")
+            action = TerminalAction(command="pwd")
+            result = tool(action)
 
-        # Execute the action
-        result = tool(action)
-
-        # Check that the working directory is correct
-        assert isinstance(result, TerminalObservation)
-        assert temp_dir in result.text
+            assert isinstance(result, TerminalObservation)
+            assert temp_dir in result.text
+        finally:
+            _close_tools(tools)
 
 
 def test_bash_tool_to_openai_tool():
     """Test that TerminalTool can be converted to OpenAI tool format."""
     with tempfile.TemporaryDirectory() as temp_dir:
-        conv_state = _create_test_conv_state(temp_dir)
-        tools = TerminalTool.create(conv_state)
-        tool = tools[0]
+        session_count_before = _tmux_session_count()
+        tools: Sequence[TerminalTool] = ()
+        try:
+            conv_state = _create_test_conv_state(temp_dir)
+            tools = TerminalTool.create(conv_state)
+            tool = tools[0]
 
-        # Convert to OpenAI tool format
-        openai_tool = tool.to_openai_tool()
+            openai_tool = tool.to_openai_tool()
 
-        # Check the format
-        assert openai_tool["type"] == "function"
-        assert openai_tool["function"]["name"] == "terminal"
-        assert "description" in openai_tool["function"]
-        assert "parameters" in openai_tool["function"]
+            assert openai_tool["type"] == "function"
+            assert openai_tool["function"]["name"] == "terminal"
+            assert "description" in openai_tool["function"]
+            assert "parameters" in openai_tool["function"]
+            expected_session_count = session_count_before + int(
+                getattr(tool.executor, "is_pooled", False)
+            )
+            assert _tmux_session_count() == expected_session_count
+        finally:
+            _close_tools(tools)
+
+        assert _tmux_session_count() == session_count_before
 
 
 @pytest.mark.skipif(
@@ -117,30 +154,32 @@ def test_terminal_tool_client_env_is_session_scoped_and_schema_hidden(monkeypatc
     """Test that client env config reaches the shell without becoming action input."""
     with tempfile.TemporaryDirectory() as temp_dir:
         monkeypatch.setenv("OH_CLIENT_ENV_TEST", "parent-value")
-        conv_state = _create_test_conv_state(temp_dir)
-        tools = TerminalTool.create(
-            conv_state,
-            terminal_type="subprocess",
-            env={"OH_CLIENT_ENV_TEST": "client-value"},
-        )
-        tool = tools[0]
-        assert tool.executor is not None
+        tools: Sequence[TerminalTool] = ()
+        try:
+            conv_state = _create_test_conv_state(temp_dir)
+            tools = TerminalTool.create(
+                conv_state,
+                terminal_type="subprocess",
+                env={"OH_CLIENT_ENV_TEST": "client-value"},
+            )
+            tool = tools[0]
+            assert tool.executor is not None
 
-        properties = tool.action_type.model_json_schema()["properties"]
-        assert "env" not in properties
+            properties = tool.action_type.model_json_schema()["properties"]
+            assert "env" not in properties
 
-        action = TerminalAction(command='printf "%s" "$OH_CLIENT_ENV_TEST"')
-        result = tool(action)
-        assert isinstance(result, TerminalObservation)
-        assert "client-value" in result.text
-        assert "parent-value" not in result.text
+            action = TerminalAction(command='printf "%s" "$OH_CLIENT_ENV_TEST"')
+            result = tool(action)
+            assert isinstance(result, TerminalObservation)
+            assert "client-value" in result.text
+            assert "parent-value" not in result.text
 
-        tool(TerminalAction(command="", reset=True))
-        result_after_reset = tool(action)
-        assert isinstance(result_after_reset, TerminalObservation)
-        assert "client-value" in result_after_reset.text
-
-        tool.executor.close()
+            tool(TerminalAction(command="", reset=True))
+            result_after_reset = tool(action)
+            assert isinstance(result_after_reset, TerminalObservation)
+            assert "client-value" in result_after_reset.text
+        finally:
+            _close_tools(tools)
 
 
 def test_terminal_tool_client_env_rejects_invalid_names():
