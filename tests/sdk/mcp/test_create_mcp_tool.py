@@ -17,6 +17,7 @@ from fastmcp import FastMCP
 from fastmcp.client.auth import OAuth
 from fastmcp.mcp_config import MCPConfig as FastMCPConfig, RemoteMCPServer
 from key_value.aio.stores.memory import MemoryStore
+from mcp.shared.exceptions import McpError
 from pydantic import SecretStr
 
 from openhands.sdk.mcp import create_mcp_tools
@@ -635,7 +636,7 @@ def test_create_mcp_tools_connection_to_nonexistent_server():
         "mcpServers": {
             "nonexistent": {
                 "transport": "http",
-                "url": "http://127.0.0.1:59999/mcp",
+                "url": f"http://127.0.0.1:{_find_free_port()}/mcp",
             }
         }
     }
@@ -645,7 +646,14 @@ def test_create_mcp_tools_connection_to_nonexistent_server():
     try:
         tools = create_mcp_tools(native_mcp_config(config), timeout=5.0)
         assert len(tools) == 0  # No tools from failed connection
-    except (ConnectionError, TimeoutError, MCPTimeoutError, OSError, MCPError):
+    except (
+        ConnectionError,
+        TimeoutError,
+        MCPTimeoutError,
+        OSError,
+        MCPError,
+        McpError,
+    ):
         pass  # Expected connection errors are acceptable
 
 
