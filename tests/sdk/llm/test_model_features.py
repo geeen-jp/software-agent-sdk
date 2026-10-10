@@ -1,3 +1,4 @@
+import litellm
 import pytest
 from litellm.utils import supports_vision
 
@@ -5,6 +6,7 @@ from openhands.sdk.llm.utils.model_features import (
     REASONING_EFFORT_MODEL_OVERRIDES,
     VISION_MODEL_OVERRIDES,
     _normalized_supported_openai_params,
+    _supported_openai_params,
     get_features,
     model_matches,
 )
@@ -59,7 +61,6 @@ def test_model_matches(name, pattern, expected):
         ("openrouter/moonshotai/kimi-k2.5", False),
         ("openrouter/moonshotai/kimi-k2-thinking", False),
         # OpenRouter reasoning-capable models per LiteLLM metadata
-        ("openrouter/deepseek/deepseek-r1", True),
         ("openrouter/anthropic/claude-opus-4.5", True),
         ("openrouter/openai/gpt-5", True),
         # Eval LiteLLM proxy wrapper should not affect capability detection.
@@ -92,6 +93,36 @@ def test_model_matches(name, pattern, expected):
 def test_reasoning_effort_support(model, expected_reasoning):
     features = get_features(model)
     assert features.supports_reasoning_effort == expected_reasoning
+
+
+@pytest.fixture
+def openrouter_deepseek_r1_in_cost_map(monkeypatch: pytest.MonkeyPatch):
+    """Pin the cost-map entry LiteLLM's reasoning_effort detection reads.
+
+    LiteLLM fetches its model cost map from GitHub at import, so the entry for
+    this model is not stable; the capability logic is tested against a fixed one.
+    """
+    monkeypatch.setitem(
+        litellm.model_cost,
+        "openrouter/deepseek/deepseek-r1",
+        {
+            "litellm_provider": "openrouter",
+            "mode": "chat",
+            "supports_reasoning": True,
+        },
+    )
+    caches = (_supported_openai_params, _normalized_supported_openai_params)
+    for cached in caches:
+        cached.cache_clear()
+    yield
+    for cached in caches:
+        cached.cache_clear()
+
+
+def test_reasoning_effort_support_openrouter_deepseek_r1(
+    openrouter_deepseek_r1_in_cost_map,
+):
+    assert get_features("openrouter/deepseek/deepseek-r1").supports_reasoning_effort
 
 
 @pytest.mark.parametrize(
