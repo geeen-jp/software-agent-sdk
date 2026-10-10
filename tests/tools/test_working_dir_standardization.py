@@ -9,6 +9,7 @@ the same source for working directory: conv_state.workspace.working_dir
 
 import os
 import tempfile
+from collections.abc import Sequence
 from uuid import uuid4
 
 import pytest
@@ -20,6 +21,7 @@ from openhands.sdk.llm import LLM
 from openhands.sdk.workspace import LocalWorkspace
 from openhands.tools.file_editor import FileEditorAction, FileEditorTool
 from openhands.tools.terminal import TerminalAction, TerminalTool
+from tests.tools.tmux_utils import _tmux_session_count
 
 
 pytestmark = pytest.mark.skipif(
@@ -84,6 +86,7 @@ def test_terminal_and_file_editor_use_same_working_dir():
         )
 
 
+@pytest.mark.usefixtures("isolated_tmux_server")
 def test_tools_do_not_require_params_for_working_dir():
     """Test that tools don't require params={'working_dir': ...} anymore.
 
@@ -91,17 +94,30 @@ def test_tools_do_not_require_params_for_working_dir():
     has been removed and tools now get it from conv_state.workspace.working_dir.
     """
     with tempfile.TemporaryDirectory() as temp_dir:
-        conv_state = _create_test_conv_state(temp_dir)
+        session_count_before = _tmux_session_count()
+        terminal_tools: Sequence[TerminalTool] = ()
+        try:
+            conv_state = _create_test_conv_state(temp_dir)
 
-        # Both tools should be creatable without any params for working_dir
-        # The create() method only takes conv_state (and optional tool-specific params)
-        terminal_tools = TerminalTool.create(conv_state)
-        file_editor_tools = FileEditorTool.create(conv_state)
+            # Both tools should be creatable without any params for working_dir
+            # create() only takes conv_state and optional tool-specific parameters.
+            terminal_tools = TerminalTool.create(conv_state)
+            file_editor_tools = FileEditorTool.create(conv_state)
 
-        # Verify tools were created successfully
-        assert len(terminal_tools) == 1
-        assert len(file_editor_tools) == 1
+            # Verify tools were created successfully
+            assert len(terminal_tools) == 1
+            assert len(file_editor_tools) == 1
 
-        # Verify tools have executors
-        assert terminal_tools[0].executor is not None
-        assert file_editor_tools[0].executor is not None
+            # Verify tools have executors
+            assert terminal_tools[0].executor is not None
+            assert file_editor_tools[0].executor is not None
+            expected_session_count = session_count_before + int(
+                getattr(terminal_tools[0].executor, "is_pooled", False)
+            )
+            assert _tmux_session_count() == expected_session_count
+        finally:
+            for tool in terminal_tools:
+                if tool.executor is not None:
+                    tool.executor.close()
+
+        assert _tmux_session_count() == session_count_before

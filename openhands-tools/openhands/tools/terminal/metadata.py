@@ -38,6 +38,11 @@ class CmdOutputMetadata(BaseModel):
     py_interpreter_path: str | None = Field(
         default=None, description="The path to the current Python interpreter, if any."
     )
+    duration_seconds: float | None = Field(
+        default=None,
+        ge=0,
+        description="Elapsed time spent executing the command, in seconds.",
+    )
     prefix: str = Field(default="", description="Prefix to add to command output")
     suffix: str = Field(default="", description="Suffix to add to command output")
 
