@@ -14,6 +14,8 @@ import os
 import subprocess
 import tempfile
 import time
+from contextlib import nullcontext
+from unittest.mock import Mock
 
 import pytest
 
@@ -98,6 +100,8 @@ def test_basic_command(terminal_type):
     assert obs.metadata.suffix == "\n[The command completed with exit code 0.]"
     # Note: prefix may vary between terminal implementations
     assert obs.metadata.exit_code == 0
+    assert obs.metadata.duration_seconds is not None
+    assert obs.metadata.duration_seconds >= 0
     assert session.prev_status == TerminalCommandStatus.COMPLETED
 
     # Test command with error
@@ -121,6 +125,46 @@ def test_basic_command(terminal_type):
     assert session.prev_status == TerminalCommandStatus.COMPLETED
 
     session.close()
+
+
+def test_zero_timeout_does_not_start_another_screen_read():
+    from openhands.tools.terminal.terminal.terminal_session import TerminalSession
+
+    terminal = Mock()
+    terminal.work_dir = "/tmp"
+    terminal.username = None
+    terminal.read_screen.return_value = "initial terminal state"
+    session = TerminalSession(terminal)
+    session._initialized = True
+
+    observation = session.execute(
+        TerminalAction(command="sleep 10", timeout=0, is_input=False)
+    )
+
+    assert terminal.read_screen.call_count == 1  # initial state only
+    assert observation.metadata.duration_seconds is not None
+    assert observation.metadata.duration_seconds >= 0
+
+
+def test_timeout_caps_poll_sleep_to_remaining_deadline(monkeypatch):
+    from openhands.tools.terminal.terminal import terminal_session as session_mod
+    from openhands.tools.terminal.terminal.terminal_session import TerminalSession
+
+    monkeypatch.setattr(session_mod, "POLL_INTERVAL", 1.0)
+    terminal = Mock()
+    terminal.work_dir = "/tmp"
+    terminal.username = None
+    terminal.read_screen.return_value = "initial terminal state"
+    session = TerminalSession(terminal)
+    session._initialized = True
+
+    observation = session.execute(
+        TerminalAction(command="sleep 10", timeout=0.02, is_input=False)
+    )
+
+    assert terminal.read_screen.call_count == 2  # initial state and one poll
+    assert observation.metadata.duration_seconds is not None
+    assert observation.metadata.duration_seconds < 0.2
 
 
 def test_subprocess_terminal_debug_logs_omit_command_and_output(caplog):
@@ -156,13 +200,35 @@ def test_session_truncates_large_command_output(monkeypatch, terminal_type):
     session = create_terminal_session(work_dir=os.getcwd(), terminal_type=terminal_type)
     session.initialize()
 
-    # Single-line output that exceeds our patched MAX.
-    obs = session.execute(TerminalAction(command="python3 -c 'print(\"A\" * 5000)'"))
+    # Exercise scrollback capture with output far beyond a single screenful.
+    command = 'python3 -c \'print("BEGIN"); print("A" * 1000000); print("END")\''
+    obs = session.execute(TerminalAction(command=command))
 
     assert "<response clipped>" in obs.text
     assert len(obs.text) <= small_max
+    assert "BEGIN" in obs.text
+    assert "END" in obs.text
 
     session.close()
+
+
+def test_tmux_initialize_rolls_back_created_session(monkeypatch, tmp_path):
+    from openhands.tools.terminal.terminal import tmux_terminal as tmux_terminal_mod
+    from openhands.tools.terminal.terminal.tmux_terminal import TmuxTerminal
+
+    session = Mock()
+    session.set_option.side_effect = RuntimeError("configuration failed")
+    server = Mock()
+    server.deadline_after.return_value = nullcontext()
+    server.new_session.return_value = session
+    monkeypatch.setattr(tmux_terminal_mod, "BoundedTmuxServer", lambda **_: server)
+
+    terminal = TmuxTerminal(work_dir=str(tmp_path))
+    with pytest.raises(RuntimeError, match="configuration failed"):
+        terminal.initialize()
+
+    session.kill.assert_called_once_with()
+    assert not terminal.initialized
 
 
 @parametrize_terminal_types
@@ -1061,35 +1127,27 @@ def test_pwd_property(terminal_type):
 
 
 @parametrize_terminal_types
-@pytest.mark.timeout(180)  # Add 3 minute timeout for this intensive test
-def test_long_output_from_nested_directories(terminal_type):
+def test_long_output_from_nested_directories(tmp_path, terminal_type):
     """Test long output from nested directory operations."""
-    with tempfile.TemporaryDirectory() as temp_dir:
-        session = create_terminal_session(
-            work_dir=temp_dir, terminal_type=terminal_type
-        )
-        session.initialize()
-        try:
-            # Create nested directories with many files
-            setup_cmd = (
-                "mkdir -p /tmp/test_dir && cd /tmp/test_dir && "
-                'for i in $(seq 1 100); do mkdir -p "folder_$i"; '
-                'for j in $(seq 1 100); do touch "folder_$i/file_$j.txt"; done; done'
-            )
-            obs = _run_bash_action(session, setup_cmd.strip(), timeout=60)
-            assert obs.metadata.exit_code == 0
+    test_dir = tmp_path / "test_dir"
+    for folder_index in range(1, 101):
+        folder = test_dir / f"folder_{folder_index}"
+        folder.mkdir(parents=True)
+        for file_index in range(1, 101):
+            (folder / f"file_{file_index}.txt").touch()
 
-            # List the directory structure recursively
-            obs = _run_bash_action(session, "ls -R /tmp/test_dir", timeout=60)
-            assert obs.metadata.exit_code == 0
+    session = create_terminal_session(work_dir=tmp_path, terminal_type=terminal_type)
+    session.initialize()
+    try:
+        obs = _run_bash_action(session, "ls -R test_dir", timeout=60)
+        assert obs.metadata.exit_code == 0
 
-            # Verify output contains expected files
-            assert "folder_1" in obs.text
-            assert "file_1.txt" in obs.text
-            assert "folder_100" in obs.text
-            assert "file_100.txt" in obs.text
-        finally:
-            session.close()
+        assert "folder_1" in obs.text
+        assert "file_1.txt" in obs.text
+        assert "folder_100" in obs.text
+        assert "file_100.txt" in obs.text
+    finally:
+        session.close()
 
 
 @parametrize_terminal_types

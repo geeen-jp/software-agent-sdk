@@ -10,6 +10,8 @@ import libtmux
 from openhands.sdk.logger import get_logger
 from openhands.tools.terminal.constants import (
     HISTORY_LIMIT,
+    TMUX_INITIALIZE_TIMEOUT_SECONDS,
+    TMUX_READ_SCREEN_TIMEOUT_SECONDS,
     TMUX_SESSION_HEIGHT,
     TMUX_SESSION_WIDTH,
     TMUX_SOCKET_NAME,
@@ -25,6 +27,7 @@ from openhands.tools.terminal.terminal.process_groups import (
     descendant_process_groups,
     terminate_process_groups,
 )
+from openhands.tools.terminal.terminal.tmux_server import BoundedTmuxServer
 
 
 logger = get_logger(__name__)
@@ -57,7 +60,7 @@ class TmuxTerminal(TerminalInterface):
     """
 
     PS1: str
-    server: libtmux.Server
+    server: BoundedTmuxServer
     session: libtmux.Session
     window: libtmux.Window
     pane: libtmux.Pane
@@ -77,60 +80,77 @@ class TmuxTerminal(TerminalInterface):
         if self._initialized:
             return
 
-        env = build_terminal_env(self._env)
-        # Disable interactive pagers (git, man, systemctl, ...) so commands that
-        # auto-launch `less` on a TTY don't capture the pane and wedge the session.
-        env.setdefault("GIT_PAGER", "cat")
-        env.setdefault("PAGER", "cat")
-        # Use a dedicated socket to isolate OpenHands sessions from the user's tmux
-        self.server = libtmux.Server(socket_name=TMUX_SOCKET_NAME, environment=env)
-        _shell_command = "/bin/bash"
-        if self.username in ["root", "openhands"]:
-            # This starts a non-login (new) shell for the given user
-            _shell_command = f"su {self.username} -"
+        session: libtmux.Session | None = None
+        try:
+            env = build_terminal_env(self._env)
+            # Disable interactive pagers (git, man, systemctl, ...) so commands that
+            # auto-launch `less` on a TTY don't capture the pane and wedge the session.
+            env.setdefault("GIT_PAGER", "cat")
+            env.setdefault("PAGER", "cat")
+            # Use a dedicated socket to isolate OpenHands sessions from the user's tmux
+            self.server = BoundedTmuxServer(
+                socket_name=TMUX_SOCKET_NAME,
+                environment=env,
+            )
+            _shell_command = "/bin/bash"
+            if self.username in ["root", "openhands"]:
+                # This starts a non-login (new) shell for the given user
+                _shell_command = f"su {self.username} -"
 
-        window_command = _shell_command
+            logger.debug("Initializing tmux terminal with command: %s", _shell_command)
+            session_name = f"openhands-{self.username}-{uuid.uuid4()}"
+            with self.server.deadline_after(TMUX_INITIALIZE_TIMEOUT_SECONDS):
+                session = self.server.new_session(
+                    session_name=session_name,
+                    start_directory=self.work_dir,
+                    kill_session=True,
+                    x=TMUX_SESSION_WIDTH,
+                    y=TMUX_SESSION_HEIGHT,
+                )
+                self.session = session
+                for k, v in env.items():
+                    session.set_environment(k, v)
 
-        logger.debug(f"Initializing tmux terminal with command: {window_command}")
-        session_name = f"openhands-{self.username}-{uuid.uuid4()}"
-        self.session = self.server.new_session(
-            session_name=session_name,
-            start_directory=self.work_dir,
-            kill_session=True,
-            x=TMUX_SESSION_WIDTH,
-            y=TMUX_SESSION_HEIGHT,
-        )
-        for k, v in env.items():
-            self.session.set_environment(k, v)
+                # Set history limit to a large number to avoid losing history
+                # https://unix.stackexchange.com/questions/43414/tmux-unlimited-history
+                session.set_option("history-limit", str(HISTORY_LIMIT))
+                session.history_limit = str(HISTORY_LIMIT)
 
-        # Set history limit to a large number to avoid losing history
-        # https://unix.stackexchange.com/questions/43414/unlimited-history-in-tmux
-        self.session.set_option("history-limit", str(HISTORY_LIMIT))
-        self.session.history_limit = str(HISTORY_LIMIT)
+                # Create a new pane because the initial pane's history limit is 2000.
+                initial_window = session.active_window
+                self.window = session.new_window(
+                    window_name="terminal",
+                    window_shell=_shell_command,
+                    start_directory=self.work_dir,
+                )
+                active_pane = self.window.active_pane
+                assert active_pane is not None, "Window should have an active pane"
+                self.pane = active_pane
+                logger.debug(
+                    "pane: %s; history_limit: %s", self.pane, session.history_limit
+                )
 
-        # Create a new pane because the initial pane's history limit is (default) 2000
-        _initial_window = self.session.active_window
-        self.window = self.session.new_window(
-            window_name="terminal",
-            window_shell=window_command,
-            start_directory=self.work_dir,
-        )
-        active_pane = self.window.active_pane
-        assert active_pane is not None, "Window should have an active pane"
-        self.pane = active_pane
-        logger.debug(f"pane: {self.pane}; history_limit: {self.session.history_limit}")
-        _initial_window.kill()
+                # Configure bash to use simple PS1 and disable PS2
+                # Disable history expansion to avoid ! mangling
+                prompt_setup = (
+                    f"set +H; export PROMPT_COMMAND='export PS1=\"{self.PS1}\"'; "
+                    'export PS2=""'
+                )
+                self.pane.send_keys(prompt_setup)
+                time.sleep(0.1)  # Wait for command to take effect
 
-        # Configure bash to use simple PS1 and disable PS2
-        # Disable history expansion to avoid ! mangling
-        self.pane.send_keys(
-            f'set +H; export PROMPT_COMMAND=\'export PS1="{self.PS1}"\'; export PS2=""'
-        )
-        time.sleep(0.1)  # Wait for command to take effect
-
-        logger.debug(f"Tmux terminal initialized with work dir: {self.work_dir}")
-        self._initialized: bool = True
-        self.clear_screen()
+                self._initialized = True
+                self.clear_screen()
+                initial_window.kill()
+                logger.debug(
+                    "Tmux terminal initialized with work dir: %s", self.work_dir
+                )
+        except Exception:
+            self._initialized = False
+            if session is not None:
+                with suppress(Exception):
+                    session.kill()
+            raise
 
     def pane_job_groups(self) -> set[int]:
         """Process groups of the jobs running under this pane's shell."""
@@ -202,13 +222,14 @@ class TmuxTerminal(TerminalInterface):
         if not self._initialized or not isinstance(self.pane, libtmux.Pane):
             raise RuntimeError("Tmux terminal is not initialized")
 
-        content = "\n".join(
-            map(
-                # avoid double newlines
-                lambda line: line.rstrip(),
-                self.pane.cmd("capture-pane", "-J", "-pS", "-").stdout,
+        with self.server.deadline_after(TMUX_READ_SCREEN_TIMEOUT_SECONDS):
+            content = "\n".join(
+                map(
+                    # avoid double newlines
+                    lambda line: line.rstrip(),
+                    self.pane.cmd("capture-pane", "-J", "-pS", "-").stdout,
+                )
             )
-        )
         return content
 
     def clear_screen(self) -> None:

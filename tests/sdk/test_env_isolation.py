@@ -31,6 +31,7 @@ ALLOWED_NAMES = {
     "LANG",
     "HOME",
     "TMPDIR",
+    "TMUX_TMPDIR",
     "UV_CACHE_DIR",
     "UV_PYTHON_INSTALL_DIR",
     "PRE_COMMIT_HOME",
@@ -63,16 +64,27 @@ def test_validate_env_contains_only_allowlisted_names(tmp_path: Path):
     names = {line.split("=", 1)[0] for line in result.stdout.splitlines()}
     locale_names = {name for name in names if name.startswith("LC_")}
     assert names <= ALLOWED_NAMES | locale_names
-    assert {"PATH", "HOME", "TMPDIR", "CI", "LC_ALL"} <= names
+    assert {"PATH", "HOME", "TMPDIR", "TMUX_TMPDIR", "CI", "LC_ALL"} <= names
     assert SENTINEL not in result.stdout + result.stderr
 
 
 def test_validate_env_uses_throwaway_home_and_tmpdir(tmp_path: Path):
-    result = run_in_validate_env(tmp_path, "sh", "-c", 'echo "$HOME" "$TMPDIR"')
-    home, tmpdir = (Path(p) for p in result.stdout.split())
+    inspect_environment = (
+        "import os, stat; "
+        "print(os.environ['HOME']); "
+        "print(os.environ['TMPDIR']); "
+        "print(os.environ['TMUX_TMPDIR']); "
+        "print(stat.S_IMODE(os.stat(os.environ['TMUX_TMPDIR']).st_mode))"
+    )
+    result = run_in_validate_env(tmp_path, sys.executable, "-c", inspect_environment)
+    home, tmpdir, tmux_tmpdir = (Path(p) for p in result.stdout.splitlines()[:3])
+    tmux_mode = int(result.stdout.splitlines()[3])
     assert home != tmp_path / "real-home"
     assert home.parent == tmpdir.parent
     assert home.parent.parent == tmp_path
+    assert tmux_tmpdir == home.parent / "tmux"
+    assert tmux_tmpdir != tmpdir
+    assert tmux_mode == 0o700
     assert not home.parent.exists()
 
 

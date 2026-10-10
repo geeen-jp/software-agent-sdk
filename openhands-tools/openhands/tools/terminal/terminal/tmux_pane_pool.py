@@ -20,6 +20,7 @@ import libtmux
 from openhands.sdk.logger import get_logger
 from openhands.tools.terminal.constants import (
     HISTORY_LIMIT,
+    TMUX_INITIALIZE_TIMEOUT_SECONDS,
     TMUX_SESSION_HEIGHT,
     TMUX_SESSION_WIDTH,
     TMUX_SOCKET_NAME,
@@ -29,6 +30,7 @@ from openhands.tools.terminal.env import (
     normalize_terminal_env,
 )
 from openhands.tools.terminal.terminal.process_groups import terminate_process_groups
+from openhands.tools.terminal.terminal.tmux_server import BoundedTmuxServer
 from openhands.tools.terminal.terminal.tmux_terminal import TmuxTerminal
 
 
@@ -90,7 +92,7 @@ class TmuxPanePool:
     max_panes: int = DEFAULT_MAX_PANES
 
     # tmux handles
-    _server: libtmux.Server | None = field(default=None, init=False, repr=False)
+    _server: BoundedTmuxServer | None = field(default=None, init=False, repr=False)
     _session: libtmux.Session | None = field(default=None, init=False, repr=False)
 
     # Pool state — guarded by _lock
@@ -120,30 +122,45 @@ class TmuxPanePool:
         if self._initialized:
             return
 
-        env = build_terminal_env(self.env)
-        self._server = libtmux.Server(socket_name=TMUX_SOCKET_NAME, environment=env)
-        session_name = f"openhands-pool-{self.username}-{uuid.uuid4()}"
-        self._session = self._server.new_session(
-            session_name=session_name,
-            start_directory=self.work_dir,
-            kill_session=True,
-            x=TMUX_SESSION_WIDTH,
-            y=TMUX_SESSION_HEIGHT,
-        )
-        for k, v in env.items():
-            self._session.set_environment(k, v)
-        self._session.set_option("history-limit", str(HISTORY_LIMIT))
+        session: libtmux.Session | None = None
+        try:
+            env = build_terminal_env(self.env)
+            self._server = BoundedTmuxServer(
+                socket_name=TMUX_SOCKET_NAME,
+                environment=env,
+            )
+            with self._server.deadline_after(TMUX_INITIALIZE_TIMEOUT_SECONDS):
+                session_name = f"openhands-pool-{self.username}-{uuid.uuid4()}"
+                session = self._server.new_session(
+                    session_name=session_name,
+                    start_directory=self.work_dir,
+                    kill_session=True,
+                    x=TMUX_SESSION_WIDTH,
+                    y=TMUX_SESSION_HEIGHT,
+                )
+                self._session = session
+                for k, v in env.items():
+                    session.set_environment(k, v)
+                session.set_option("history-limit", str(HISTORY_LIMIT))
 
-        # Keep a reference to the default window so we can kill it once
-        # the first real pane window is created (tmux requires at least
-        # one window to keep the session alive).
-        self._initial_window = self._session.active_window
-
-        self._initialized = True
-        logger.info(
-            "TmuxPanePool initialized: "
-            f"session={session_name}, max_panes={self.max_panes}"
-        )
+                # Keep a reference to the default window so we can kill it once
+                # the first real pane window is ready (tmux requires one window).
+                self._initial_window = session.active_window
+                self._initialized = True
+                logger.info(
+                    "TmuxPanePool initialized: session=%s, max_panes=%s",
+                    session_name,
+                    self.max_panes,
+                )
+        except Exception:
+            if session is not None:
+                with suppress(Exception):
+                    session.kill()
+            self._server = None
+            self._session = None
+            self._initial_window = None
+            self._initialized = False
+            raise
 
     def close(self) -> None:
         """Destroy all panes and the tmux session."""
@@ -171,49 +188,62 @@ class TmuxPanePool:
 
     def _create_pane(self) -> PooledTmuxTerminal:
         """Create a new PooledTmuxTerminal within the shared session."""
-        assert self._session is not None
+        server = self._server
+        session = self._session
+        assert server is not None
+        assert session is not None
 
         shell_command = "/bin/bash"
         if self.username in ["root", "openhands"]:
             shell_command = f"su {self.username} -"
 
-        window = self._session.new_window(
-            window_name=f"pane-{len(self._all_panes)}",
-            window_shell=shell_command,
-            start_directory=self.work_dir,
-        )
-        active_pane = window.active_pane
-        assert active_pane is not None
+        window: libtmux.Window | None = None
+        try:
+            with server.deadline_after(TMUX_INITIALIZE_TIMEOUT_SECONDS):
+                window = session.new_window(
+                    window_name=f"pane-{len(self._all_panes)}",
+                    window_shell=shell_command,
+                    start_directory=self.work_dir,
+                )
+                active_pane = window.active_pane
+                assert active_pane is not None
 
-        # Kill the default window now that a real window exists.
-        if self._initial_window is not None:
-            with suppress(Exception):
-                self._initial_window.kill()
-            self._initial_window = None
+                # Use PooledTmuxTerminal which only kills its own window on close.
+                terminal = PooledTmuxTerminal(
+                    work_dir=self.work_dir,
+                    username=self.username,
+                    env=self.env,
+                )
+                terminal.server = server
+                terminal.session = session
+                terminal.window = window
+                terminal.pane = active_pane
 
-        # Use PooledTmuxTerminal which overrides close() to only kill
-        # this terminal's window instead of the entire shared tmux session.
-        terminal = PooledTmuxTerminal(
-            work_dir=self.work_dir,
-            username=self.username,
-            env=self.env,
-        )
-        terminal.server = self._server  # type: ignore[assignment]
-        terminal.session = self._session
-        terminal.window = window
-        terminal.pane = active_pane
+                # Configure PS1 (same as TmuxTerminal.initialize)
+                prompt_setup = (
+                    f"set +H; export PROMPT_COMMAND='export PS1=\"{terminal.PS1}\"'; "
+                    'export PS2=""'
+                )
+                active_pane.send_keys(prompt_setup)
+                time.sleep(0.1)
+                terminal._initialized = True
+                terminal.clear_screen()
 
-        # Configure PS1 (same as TmuxTerminal.initialize)
-        ps1 = terminal.PS1
-        active_pane.send_keys(
-            f'set +H; export PROMPT_COMMAND=\'export PS1="{ps1}"\'; export PS2=""'
-        )
-        time.sleep(0.1)
-        terminal._initialized = True
-        terminal.clear_screen()
+                # The initial window must stay alive until the new pane is ready.
+                if self._initial_window is not None:
+                    with suppress(Exception):
+                        self._initial_window.kill()
+                    self._initial_window = None
 
-        logger.debug(f"Created pooled pane #{len(self._all_panes)}: {active_pane}")
-        return terminal
+                logger.debug(
+                    "Created pooled pane #%s: %s", len(self._all_panes), active_pane
+                )
+                return terminal
+        except Exception:
+            if window is not None:
+                with suppress(Exception):
+                    window.kill()
+            raise
 
     def checkout(self, timeout: float | None = None) -> PooledTmuxTerminal:
         """Check out a pane from the pool, blocking if all are busy.

@@ -40,7 +40,8 @@ cleanup() {
     fi
 }
 trap cleanup EXIT
-mkdir "$sandbox/home" "$sandbox/tmp"
+mkdir "$sandbox/home" "$sandbox/tmp" "$sandbox/tmux"
+chmod 700 "$sandbox/tmux"
 
 # LANG and LC_* are the only allowlisted names matched by prefix.
 locale_vars="$(env | sed -n 's/^\(LC_[A-Za-z_]*=.*\)$/\1/p' | tr '\n' ' ')"
@@ -53,6 +54,7 @@ env -i \
     $locale_vars \
     HOME="$sandbox/home" \
     TMPDIR="$sandbox/tmp" \
+    TMUX_TMPDIR="$sandbox/tmux" \
     UV_CACHE_DIR="${UV_CACHE_DIR:-$cache_home/uv}" \
     UV_PYTHON_INSTALL_DIR="${UV_PYTHON_INSTALL_DIR:-$data_home/uv/python}" \
     PRE_COMMIT_HOME="${PRE_COMMIT_HOME:-$cache_home/pre-commit}" \
