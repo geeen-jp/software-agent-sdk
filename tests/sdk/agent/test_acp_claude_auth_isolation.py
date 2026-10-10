@@ -1,13 +1,15 @@
 from __future__ import annotations
 
+import contextlib
 import json
 import threading
 import uuid
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
 
-from openhands.sdk.agent.acp_agent import ACPAgent
+from openhands.sdk.agent.acp_agent import ACPAgent, ACPSessionModelError
 from openhands.sdk.agent.acp_claude_auth import (
     CLAUDE_CREDENTIALS_FILENAME,
     CLAUDE_CREDENTIALS_SECRET_NAME,
@@ -20,6 +22,7 @@ from openhands.sdk.agent.acp_claude_auth import (
 )
 from openhands.sdk.agent.acp_file_credentials import write_secret_file
 from openhands.sdk.conversation.secret_registry import SecretRegistry
+from openhands.sdk.conversation.state import ConversationState
 from openhands.sdk.credential import CredentialNeedsReauthentication, ResolvedCredential
 from openhands.sdk.utils.async_executor import AsyncExecutor
 
@@ -348,7 +351,6 @@ def test_acp_agent_isolate_data_dir_seeds_claude_credentials(
 
     import uuid
 
-    from openhands.sdk.conversation.state import ConversationState
     from openhands.sdk.workspace.local import LocalWorkspace
 
     agent = ACPAgent(
@@ -395,7 +397,6 @@ def test_acp_agent_isolation_uses_versioned_claude_binding(
             assert is_valid_claude_oauth_credentials(value)
             return "v1"
 
-    from openhands.sdk.conversation.state import ConversationState
     from openhands.sdk.workspace.local import LocalWorkspace
 
     agent = ACPAgent(
@@ -436,7 +437,6 @@ def test_writable_isolate_without_oauth_keeps_isolated_dir(
 
     import uuid
 
-    from openhands.sdk.conversation.state import ConversationState
     from openhands.sdk.workspace.local import LocalWorkspace
 
     agent = ACPAgent(
@@ -467,7 +467,6 @@ def test_isolate_acp_data_dir_fails_closed_without_oauth_when_read_only(
 
     import uuid
 
-    from openhands.sdk.conversation.state import ConversationState
     from openhands.sdk.workspace.local import LocalWorkspace
 
     agent = ACPAgent(
@@ -492,7 +491,6 @@ def test_writable_start_without_oauth_uses_isolated_dir_and_env_auth(
 ) -> None:
     from unittest.mock import AsyncMock, MagicMock, patch
 
-    from openhands.sdk.conversation.state import ConversationState
     from openhands.sdk.utils.async_executor import AsyncExecutor
     from openhands.sdk.workspace.local import LocalWorkspace
 
@@ -574,7 +572,6 @@ def test_writable_start_without_oauth_uses_isolated_dir_and_env_auth(
 def test_read_only_start_without_oauth_fails_closed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from openhands.sdk.conversation.state import ConversationState
     from openhands.sdk.workspace.local import LocalWorkspace
 
     monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
@@ -666,7 +663,6 @@ def test_agent_resume_replaces_isolated_copy_on_updated_credentials(
         classmethod(lambda cls: tmp_path / "home"),
     )
 
-    from openhands.sdk.conversation.state import ConversationState
     from openhands.sdk.workspace.local import LocalWorkspace
 
     agent = ACPAgent(
@@ -718,7 +714,6 @@ def test_durable_leftover_credentials_are_removed_on_isolate(
         classmethod(lambda cls: tmp_path / "home"),
     )
 
-    from openhands.sdk.conversation.state import ConversationState
     from openhands.sdk.workspace.local import LocalWorkspace
 
     persist = tmp_path / "persist"
@@ -745,20 +740,29 @@ def test_durable_leftover_credentials_are_removed_on_isolate(
     agent._cleanup_claude_config_runtime(discard=True)
 
 
-def _capture_start_env(agent: ACPAgent, tmp_path: Path) -> dict[str, str]:
+def _capture_start_env(
+    agent: ACPAgent,
+    tmp_path: Path,
+    *,
+    ignore_startup_error: bool = False,
+    while_running: Callable[[ConversationState], None] | None = None,
+    state: ConversationState | None = None,
+    spawn_envs: list[dict[str, str]] | None = None,
+    loaded_session_ids: list[str] | None = None,
+) -> dict[str, str]:
     from unittest.mock import AsyncMock, MagicMock, patch
 
-    from openhands.sdk.conversation.state import ConversationState
     from openhands.sdk.secret import SecretSource
     from openhands.sdk.utils.async_executor import AsyncExecutor
     from openhands.sdk.workspace.local import LocalWorkspace
 
-    state = ConversationState.create(
-        id=uuid.uuid4(),
-        agent=agent,
-        workspace=LocalWorkspace(working_dir=str(tmp_path / "workspace")),
-        persistence_dir=str(tmp_path / "persist"),
-    )
+    if state is None:
+        state = ConversationState.create(
+            id=uuid.uuid4(),
+            agent=agent,
+            workspace=LocalWorkspace(working_dir=str(tmp_path / "workspace")),
+            persistence_dir=str(tmp_path / "persist"),
+        )
     if agent.agent_context and agent.agent_context.secrets:
         exported: dict[str, str] = {}
         for name, secret in agent.agent_context.secrets.items():
@@ -776,6 +780,8 @@ def _capture_start_env(agent: ACPAgent, tmp_path: Path) -> dict[str, str]:
 
     async def _fake_create_subprocess_exec(*_args, env=None, **_kwargs):
         captured.update(env or {})
+        if spawn_envs is not None:
+            spawn_envs.append(dict(env or {}))
         return mock_process
 
     async def _fake_filter(_src, _dst):
@@ -792,7 +798,13 @@ def _capture_start_env(agent: ACPAgent, tmp_path: Path) -> dict[str, str]:
     new_response = MagicMock()
     new_response.session_id = "sess-auth"
     conn.new_session = AsyncMock(return_value=new_response)
-    conn.load_session = AsyncMock(return_value=MagicMock())
+
+    async def _fake_load_session(*, session_id, **_kwargs):
+        if loaded_session_ids is not None:
+            loaded_session_ids.append(session_id)
+        return MagicMock()
+
+    conn.load_session = AsyncMock(side_effect=_fake_load_session)
     conn.set_session_mode = AsyncMock()
     conn.set_session_model = AsyncMock()
     conn.authenticate = AsyncMock()
@@ -818,9 +830,16 @@ def _capture_start_env(agent: ACPAgent, tmp_path: Path) -> dict[str, str]:
                 return_value=MagicMock(),
             ),
         ):
-            agent._start_acp_server(state)
+            try:
+                agent._start_acp_server(state)
+            except Exception:
+                if not ignore_startup_error:
+                    raise
+            if while_running is not None:
+                while_running(state)
     finally:
-        agent._executor.close(timeout=1.0)
+        if agent._executor is not None:
+            agent._executor.close(timeout=1.0)
         agent._cleanup_claude_config_runtime(discard=True)
     suffix = agent._render_suffix(state)
     captured["_suffix"] = suffix or ""
@@ -989,7 +1008,6 @@ def test_oauth_token_start_does_not_copy_host_credentials(
 def test_read_only_isolate_with_oauth_token_skips_host_credentials(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from openhands.sdk.conversation.state import ConversationState
     from openhands.sdk.workspace.local import LocalWorkspace
 
     source = _write_host_oauth(tmp_path, monkeypatch)
@@ -1013,3 +1031,179 @@ def test_read_only_isolate_with_oauth_token_skips_host_credentials(
         assert source.read_text() == before
     finally:
         agent._cleanup_claude_config_runtime(discard=True)
+
+
+_CLAUDE_COMMAND = ["npx", "-y", "@agentclientprotocol/claude-agent-acp"]
+_AUTO_COMPACT_ENV = "CLAUDE_CODE_AUTO_COMPACT_WINDOW"
+
+
+def _claude_agent_with_token(model: str | None, **kwargs) -> ACPAgent:
+    from pydantic import SecretStr
+
+    from openhands.sdk.context import AgentContext
+    from openhands.sdk.secret import StaticSecret
+
+    return ACPAgent(
+        acp_command=_CLAUDE_COMMAND,
+        acp_model=model,
+        acp_isolate_data_dir=True,
+        agent_context=AgentContext(
+            secrets={
+                CLAUDE_OAUTH_TOKEN_ENV: StaticSecret(value=SecretStr("fake-token"))
+            }
+        ),
+        **kwargs,
+    )
+
+
+def test_sonnet_5_5_exact_model_gets_400k_auto_compact_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv(_AUTO_COMPACT_ENV, raising=False)
+    agent = _claude_agent_with_token("claude-sonnet-5-5")
+    captured = _capture_start_env(agent, tmp_path, ignore_startup_error=True)
+    assert captured[_AUTO_COMPACT_ENV] == "400000"
+    assert captured["CLAUDE_CONFIG_DIR"]
+
+
+@pytest.mark.parametrize(
+    "model", [None, "claude-haiku-5-5", "claude-opus-5-5", "sonnet"]
+)
+def test_non_sonnet_5_5_models_get_no_auto_compact_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, model: str | None
+) -> None:
+    monkeypatch.delenv(_AUTO_COMPACT_ENV, raising=False)
+    agent = _claude_agent_with_token(model)
+    captured = _capture_start_env(agent, tmp_path, ignore_startup_error=True)
+    assert captured["CLAUDE_CONFIG_DIR"]
+    assert _AUTO_COMPACT_ENV not in captured
+
+
+def test_non_claude_provider_gets_no_auto_compact_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv(_AUTO_COMPACT_ENV, raising=False)
+    agent = ACPAgent(
+        acp_command=["npx", "-y", "@agentclientprotocol/codex-acp"],
+        acp_model="claude-sonnet-5-5",
+    )
+    captured = _capture_start_env(agent, tmp_path, ignore_startup_error=True)
+    assert _AUTO_COMPACT_ENV not in captured
+
+
+@pytest.mark.parametrize("policy", ["read_only", "writable"])
+def test_sonnet_5_5_auto_compact_window_is_independent_of_permission_policy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, policy: str
+) -> None:
+    monkeypatch.delenv(_AUTO_COMPACT_ENV, raising=False)
+    agent = _claude_agent_with_token("claude-sonnet-5-5", acp_permission_policy=policy)
+    captured = _capture_start_env(agent, tmp_path, ignore_startup_error=True)
+    assert captured[_AUTO_COMPACT_ENV] == "400000"
+
+
+def test_sonnet_5_5_auto_compact_window_overrides_acp_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv(_AUTO_COMPACT_ENV, raising=False)
+    agent = _claude_agent_with_token(
+        "claude-sonnet-5-5", acp_env={_AUTO_COMPACT_ENV: "123456"}
+    )
+    captured = _capture_start_env(agent, tmp_path, ignore_startup_error=True)
+    assert captured[_AUTO_COMPACT_ENV] == "400000"
+
+
+def test_sonnet_5_5_auto_compact_window_survives_restart_of_same_conversation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv(_AUTO_COMPACT_ENV, raising=False)
+    agent = _claude_agent_with_token(
+        "claude-sonnet-5-5", acp_permission_policy="read_only"
+    )
+    spawn_envs: list[dict[str, str]] = []
+    loaded_session_ids: list[str] = []
+
+    def _restart_across_model_switches(state: ConversationState) -> None:
+        state.agent_state = {
+            **state.agent_state,
+            "acp_session_id": "prior-sess",
+            "acp_session_cwd": state.workspace.working_dir,
+        }
+        for model in ("claude-opus-5-5", "claude-sonnet-5-5"):
+            agent._requested_model_id = model
+            agent._runtime_model_override_active = True
+            agent._restart_session_on_next_turn = True
+            with contextlib.suppress(ACPSessionModelError):
+                agent._restart_session_after_drain_timeout(state, lambda _event: None)
+
+    _capture_start_env(
+        agent,
+        tmp_path,
+        ignore_startup_error=True,
+        while_running=_restart_across_model_switches,
+        spawn_envs=spawn_envs,
+        loaded_session_ids=loaded_session_ids,
+    )
+
+    assert [_AUTO_COMPACT_ENV in env for env in spawn_envs] == [True, False, True]
+    assert spawn_envs[2][_AUTO_COMPACT_ENV] == "400000"
+    assert loaded_session_ids == ["prior-sess", "prior-sess"]
+
+
+def test_auto_compact_window_does_not_leak_between_concurrent_conversations(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv(_AUTO_COMPACT_ENV, raising=False)
+    sonnet_agent = _claude_agent_with_token("claude-sonnet-5-5")
+    haiku_agent = _claude_agent_with_token("claude-haiku-5-5")
+    haiku: dict[str, str] = {}
+    sonnet_dir_alive_during_haiku: list[bool] = []
+
+    def _start_haiku_while_sonnet_runs(_state: ConversationState) -> None:
+        sonnet_dir = sonnet_agent._claude_config_runtime_dir
+        assert sonnet_dir is not None
+        haiku.update(
+            _capture_start_env(
+                haiku_agent, tmp_path / "haiku", ignore_startup_error=True
+            )
+        )
+        sonnet_dir_alive_during_haiku.append(sonnet_dir.exists())
+
+    sonnet = _capture_start_env(
+        sonnet_agent,
+        tmp_path / "sonnet",
+        ignore_startup_error=True,
+        while_running=_start_haiku_while_sonnet_runs,
+    )
+    assert sonnet[_AUTO_COMPACT_ENV] == "400000"
+    assert _AUTO_COMPACT_ENV not in haiku
+    assert sonnet["CLAUDE_CONFIG_DIR"] != haiku["CLAUDE_CONFIG_DIR"]
+    assert sonnet_dir_alive_during_haiku == [True]
+    assert not Path(sonnet["CLAUDE_CONFIG_DIR"]).exists()
+    assert not Path(haiku["CLAUDE_CONFIG_DIR"]).exists()
+
+
+def test_sonnet_5_5_auto_compact_window_coexists_with_file_credentials(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from pydantic import SecretStr
+
+    from openhands.sdk.context import AgentContext
+    from openhands.sdk.secret import StaticSecret
+
+    monkeypatch.delenv(_AUTO_COMPACT_ENV, raising=False)
+    agent = ACPAgent(
+        acp_command=_CLAUDE_COMMAND,
+        acp_model="claude-sonnet-5-5",
+        acp_isolate_data_dir=True,
+        agent_context=AgentContext(
+            secrets={
+                CLAUDE_CREDENTIALS_SECRET_NAME: StaticSecret(
+                    value=SecretStr(_oauth_payload())
+                )
+            }
+        ),
+    )
+    captured = _capture_start_env(agent, tmp_path, ignore_startup_error=True)
+    assert captured[_AUTO_COMPACT_ENV] == "400000"
+    assert captured["CLAUDE_CONFIG_DIR"]
+    assert CLAUDE_CREDENTIALS_SECRET_NAME not in captured
