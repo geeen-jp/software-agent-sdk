@@ -3,6 +3,8 @@
 import tempfile
 import threading
 import time
+from contextlib import nullcontext
+from unittest.mock import Mock
 
 import pytest
 
@@ -43,6 +45,44 @@ def test_initialize_idempotent():
         p.initialize()
         p.initialize()  # should not raise
         p.close()
+
+
+def test_initialize_rolls_back_created_session(monkeypatch):
+    from openhands.tools.terminal.terminal import tmux_pane_pool as pool_mod
+
+    session = Mock()
+    session.set_environment.side_effect = RuntimeError("configuration failed")
+    server = Mock()
+    server.deadline_after.return_value = nullcontext()
+    server.new_session.return_value = session
+    monkeypatch.setattr(pool_mod, "BoundedTmuxServer", lambda **_: server)
+    pool = TmuxPanePool(work_dir="/tmp", max_panes=1)
+
+    with pytest.raises(RuntimeError, match="configuration failed"):
+        pool.initialize()
+
+    session.kill.assert_called_once_with()
+    assert not pool._initialized
+    assert pool._session is None
+
+
+def test_create_pane_rolls_back_window_without_killing_initial_window():
+    pool = TmuxPanePool(work_dir="/tmp", max_panes=1)
+    pool._initialized = True
+    pool._server = Mock()
+    pool._server.deadline_after.return_value = nullcontext()
+    pool._session = Mock()
+    pool._initial_window = Mock()
+    pane = Mock()
+    pane.send_keys.side_effect = RuntimeError("pane configuration failed")
+    window = Mock(active_pane=pane)
+    pool._session.new_window.return_value = window
+
+    with pytest.raises(RuntimeError, match="pane configuration failed"):
+        pool._create_pane()
+
+    window.kill.assert_called_once_with()
+    pool._initial_window.kill.assert_not_called()
 
 
 # -- Checkout / Checkin ------------------------------------------------------

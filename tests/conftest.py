@@ -1,5 +1,6 @@
 """Common test fixtures and utilities."""
 
+import os
 import uuid
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -13,6 +14,7 @@ from openhands.sdk.io import InMemoryFileStore
 from openhands.sdk.llm import LLM
 from openhands.sdk.tool import ToolExecutor
 from openhands.sdk.workspace import LocalWorkspace
+from tests.validate_timing import write_checkpoint
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -20,6 +22,34 @@ TOKENIZER_FIXTURES_DIR = REPO_ROOT / "tests" / "fixtures" / "tokenizers"
 QWEN3_TOKENIZER_CONFIG = (
     TOKENIZER_FIXTURES_DIR / "qwen3-4b-instruct-2507-tokenizer_config.json"
 )
+
+
+def _write_validate_checkpoint(event: str, status: str | None = None) -> None:
+    """Record pytest lifecycle checkpoints only for wrapped validation runs."""
+    timing_fd = os.environ.get("OH_VALIDATE_TIMING_FD")
+    suite_name = os.environ.get("OH_VALIDATE_SUITE_NAME")
+    if timing_fd is None or suite_name is None:
+        return
+    try:
+        write_checkpoint(int(timing_fd), suite_name, event, status)
+    except (OSError, ValueError):
+        # Timing evidence must never change the result of the test suite.
+        return
+
+
+def pytest_sessionstart(session: pytest.Session) -> None:
+    """Record the parent pytest process starting its session."""
+    if not hasattr(session.config, "workerinput"):
+        _write_validate_checkpoint("pytest_session_start")
+
+
+def pytest_sessionfinish(
+    session: pytest.Session,
+    exitstatus: int,
+) -> None:
+    """Record the parent pytest process finishing its session."""
+    if not hasattr(session.config, "workerinput"):
+        _write_validate_checkpoint("pytest_session_finish", str(exitstatus))
 
 
 def pytest_addoption(parser: pytest.Parser) -> None:

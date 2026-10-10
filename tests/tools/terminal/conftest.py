@@ -5,6 +5,7 @@ import socket
 import subprocess
 import tempfile
 import time
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -15,6 +16,12 @@ from openhands.tools.terminal.terminal import create_terminal_session
 
 
 logger = get_logger(__name__)
+
+
+@pytest.fixture(autouse=True)
+def isolated_tmux_tmpdir(isolated_tmux_server: None) -> Iterator[None]:
+    """Use the shared isolated tmux server for terminal tests."""
+    yield
 
 
 _WINDOWS_UNSUPPORTED_BACKEND_TEST_MODULES = {
