@@ -875,7 +875,7 @@ def test_claude_oauth_is_not_exported_to_non_claude_providers(
             }
         ),
     )
-    captured = _capture_start_env(agent, tmp_path)
+    captured = _capture_start_env(agent, tmp_path, ignore_startup_error=True)
     assert CLAUDE_CREDENTIALS_SECRET_NAME not in captured
     assert CLAUDE_OAUTH_TOKEN_ENV not in captured
     assert captured.get("UNRELATED_TOKEN") == "keep-me"
@@ -1054,6 +1054,26 @@ def _claude_agent_with_token(model: str | None, **kwargs) -> ACPAgent:
         ),
         **kwargs,
     )
+
+
+def test_haiku_read_only_start_keeps_subscription_oauth_isolated(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = _write_host_oauth(tmp_path, monkeypatch)
+    before = source.read_text(encoding="utf-8")
+    agent = _claude_agent_with_token(
+        "claude-haiku-5-5",
+        acp_permission_policy="read_only",
+        acp_env={"ANTHROPIC_API_KEY": "sk-payg"},
+    )
+
+    captured = _capture_start_env(agent, tmp_path, ignore_startup_error=True)
+
+    assert captured[CLAUDE_OAUTH_TOKEN_ENV] == "fake-token"
+    assert "ANTHROPIC_API_KEY" not in captured
+    isolated = Path(captured["CLAUDE_CONFIG_DIR"])
+    assert not (isolated / CLAUDE_CREDENTIALS_FILENAME).exists()
+    assert source.read_text(encoding="utf-8") == before
 
 
 def test_sonnet_5_5_exact_model_gets_400k_auto_compact_window(
