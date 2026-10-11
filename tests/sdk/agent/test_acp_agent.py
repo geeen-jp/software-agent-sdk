@@ -4371,6 +4371,104 @@ class TestSetACPModel:
         assert agent._restart_session_on_next_turn is True
         assert agent._requested_model_id is None
 
+    def test_claude_switch_does_not_use_stale_notification_as_write_proof(self):
+        from acp.schema import SetSessionConfigOptionResponse
+
+        agent = self._wire(
+            _make_agent(acp_permission_policy="read_only"),
+            "claude-agent-acp",
+            via_config_option=True,
+        )
+        agent._session_mode_id = "default"
+        agent._client.record_config_options(
+            "sess-1",
+            [
+                _config_option("model", "opus", ["default", "opus"]),
+                _config_option("mode", "default", ["default", "plan"]),
+                _config_option("effort", "medium", ["low", "medium"]),
+            ],
+        )
+        _agent_conn(agent).set_config_option = AsyncMock(
+            return_value=SetSessionConfigOptionResponse(
+                config_options=[_config_option("model", "opus", ["default", "opus"])]
+            )
+        )
+        run_config_write = agent._executor.run_async.side_effect
+
+        def _run_with_stale_update(*args: Any, **kwargs: Any) -> Any:
+            result = run_config_write(*args, **kwargs)
+            asyncio.run(
+                agent._client.session_update(
+                    "sess-1",
+                    _config_update(model="opus", mode="default", effort="medium"),
+                )
+            )
+            return result
+
+        agent._executor.run_async.side_effect = _run_with_stale_update
+
+        with pytest.raises(ACPSessionModeError, match="authoritative Claude config"):
+            agent.set_acp_model("claude-opus-5-5")
+
+        assert agent._restart_session_on_next_turn is True
+        assert agent._requested_model_id is None
+
+    def test_claude_switch_remembers_options_seen_during_config_application(self):
+        from acp.schema import SetSessionConfigOptionResponse
+
+        agent = self._wire(
+            _make_agent(acp_permission_policy="read_only"),
+            "claude-agent-acp",
+            via_config_option=True,
+        )
+        agent._session_mode_id = "default"
+        bridge = _OpenHandsACPBridge(permission_policy="read_only")
+        agent._client = bridge
+        initial_options = [
+            _config_option("model", "opus", ["default", "opus"]),
+            _config_option("mode", "default", ["default", "plan"]),
+            _config_option("effort", "low", ["low", "medium"]),
+        ]
+        bridge.record_config_options("sess-1", initial_options)
+        _agent_conn(agent).set_config_option = AsyncMock(
+            return_value=SetSessionConfigOptionResponse(
+                config_options=[
+                    _config_option("model", "opus", ["default", "opus"]),
+                    _config_option("mode", "default", ["default", "plan"]),
+                    _config_option("effort", "medium", ["low", "medium"]),
+                    _config_option("new-option", "enabled", ["enabled"]),
+                ]
+            )
+        )
+
+        asyncio.run(
+            _apply_session_config_options(
+                _agent_conn(agent),
+                bridge,
+                "claude-agent-acp",
+                "sess-1",
+                {"effort": "medium"},
+                initial_options,
+                required_session_mode="default",
+                provider_key="claude-code",
+            )
+        )
+        _agent_conn(agent).set_config_option = AsyncMock(
+            return_value=SetSessionConfigOptionResponse(
+                config_options=[
+                    _config_option("model", "opus", ["default", "opus"]),
+                    _config_option("mode", "default", ["default", "plan"]),
+                    _config_option("effort", "medium", ["low", "medium"]),
+                ]
+            )
+        )
+
+        with pytest.raises(ACPSessionModeError, match="authoritative Claude config"):
+            agent.set_acp_model("claude-opus-5-5")
+
+        assert agent._restart_session_on_next_turn is True
+        assert agent._requested_model_id is None
+
     @pytest.mark.parametrize(
         ("old_model", "new_model", "restarts"),
         [

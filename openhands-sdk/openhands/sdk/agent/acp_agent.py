@@ -753,13 +753,11 @@ async def _apply_acp_model(
                 config_id=config_id, value=value, session_id=session_id
             )
             last_options = response.config_options
-        if client is not None and last_options:
-            # Selecting a model can reveal dependent options (for example
-            # Gemini reasoning_effort or Muse context/effort). Preserve the
-            # complete response as the authoritative state for the following
-            # config pass; the server may not emit a ConfigOptionUpdate for
-            # this response.
-            client.record_config_options(session_id, last_options)
+        if client is not None:
+            # Keep the RPC response separate from notification state. A late
+            # ConfigOptionUpdate can replace the cache after this response,
+            # but it cannot become proof for the model write that just ran.
+            client.record_direct_config_options(session_id, last_options)
         return _resolve_effective_model(
             requested=model,
             agent_name=agent_name,
@@ -1372,7 +1370,9 @@ async def _apply_session_config_options(
         # complete state over the session/new snapshot so model-dependent
         # option type/choices cannot be taken from a stale pre-model state.
         state_by_id = {**state_by_id, **observed_by_id}
-    expected_config_option_ids = set(observed_by_id or state_by_id)
+    expected_config_option_ids = client.get_known_config_option_ids(session_id)
+    expected_config_option_ids.update(state_by_id)
+    expected_config_option_ids.update(observed_by_id)
     if not state_by_id and not observed_by_id:
         raise ACPSessionConfigError(
             f"ACP server {agent_name!r} session {session_id} reported no session "
@@ -1411,6 +1411,7 @@ async def _apply_session_config_options(
             ) from e
 
         last_response_options = response.config_options
+        client.record_direct_config_options(session_id, last_response_options)
         state_by_id = _resolve_config_options_state(
             client,
             session_id,
@@ -1462,6 +1463,7 @@ async def _apply_session_config_options(
         requested,
         final_state,
     )
+    expected_config_option_ids.update(client.get_known_config_option_ids(session_id))
     provider = detect_acp_provider_by_agent_name(agent_name)
     effective_provider_key = provider.key if provider is not None else provider_key
     claude_provider = effective_provider_key == "claude-code"
@@ -2033,6 +2035,16 @@ class _OpenHandsACPBridge:
         # satisfy the verification of this one.
         self._config_options_by_session: dict[str, list[SessionConfigOption]] = {}
         self._config_options_generation_by_session: dict[str, int] = {}
+        # Keep the observed catalog as a high-water mark. A replacement
+        # snapshot must not make a previously advertised option disappear
+        # from completeness checks.
+        self._known_config_option_ids_by_session: dict[str, set[str]] = {}
+        # Direct RPC responses retain their provenance separately from the
+        # notification-updated cache above.
+        self._direct_config_options_by_session: dict[
+            str, list[SessionConfigOption] | None
+        ] = {}
+        self._direct_config_options_generation_by_session: dict[str, int] = {}
         self._current_mode_by_session: dict[str, str] = {}
         self._current_mode_generation_by_session: dict[str, int] = {}
         self._current_mode_updated: dict[str, asyncio.Event] = {}
@@ -2285,8 +2297,39 @@ class _OpenHandsACPBridge:
     ) -> None:
         """Record a complete config state observed for one session."""
         self._config_options_by_session[session_id] = list(options)
+        self._known_config_option_ids_by_session.setdefault(session_id, set()).update(
+            option.id for option in options
+        )
         self._config_options_generation_by_session[session_id] = (
             self._config_options_generation_by_session.get(session_id, 0) + 1
+        )
+
+    def get_known_config_option_ids(self, session_id: str) -> set[str]:
+        """Return every config option id observed for this session."""
+        return set(self._known_config_option_ids_by_session.get(session_id, set()))
+
+    def record_direct_config_options(
+        self,
+        session_id: str,
+        options: list[SessionConfigOption] | None,
+    ) -> None:
+        """Record the config state returned directly by a configuration RPC."""
+        self._direct_config_options_by_session[session_id] = (
+            list(options) if options is not None else None
+        )
+        self._direct_config_options_generation_by_session[session_id] = (
+            self._direct_config_options_generation_by_session.get(session_id, 0) + 1
+        )
+        if options:
+            self.record_config_options(session_id, options)
+
+    def get_direct_config_options(
+        self, session_id: str
+    ) -> tuple[int, list[SessionConfigOption] | None]:
+        """Return the generation and state from the latest direct RPC response."""
+        return (
+            self._direct_config_options_generation_by_session.get(session_id, 0),
+            self._direct_config_options_by_session.get(session_id),
         )
 
     def get_config_options_generation(self, session_id: str) -> int:
@@ -2394,6 +2437,9 @@ class _OpenHandsACPBridge:
             # it per session so initialization can verify requested options
             # even when the server answers set_config_option asynchronously.
             self._config_options_by_session[session_id] = list(update.config_options)
+            self._known_config_option_ids_by_session.setdefault(
+                session_id, set()
+            ).update(option.id for option in update.config_options)
         elif isinstance(update, CurrentModeUpdate):
             current_mode_id = update.current_mode_id
             if isinstance(current_mode_id, str) and current_mode_id:
@@ -5510,7 +5556,7 @@ class ACPAgent(AgentBase):
         )
         claude_client = self._client if claude_read_only_config_boundary else None
         mode_generation_before = 0
-        config_generation_before = 0
+        direct_config_generation_before = 0
         expected_config_option_ids: set[str] = set()
         if claude_read_only_config_boundary:
             assert provider is not None
@@ -5523,15 +5569,18 @@ class ACPAgent(AgentBase):
             mode_generation_before = claude_client.get_current_mode_generation(
                 session_id
             )
-            config_generation_before = claude_client.get_config_options_generation(
+            expected_config_option_ids = claude_client.get_known_config_option_ids(
                 session_id
             )
-            expected_config_option_ids = {
+            expected_config_option_ids.update(
                 option.id
                 for option in _iter_session_config_options(
                     claude_client.get_config_options(session_id)
                 )
-            }
+            )
+            direct_config_generation_before, _ = (
+                claude_client.get_direct_config_options(session_id)
+            )
         try:
             effective_model = self._executor.run_async(
                 _apply_acp_model,
@@ -5582,11 +5631,15 @@ class ACPAgent(AgentBase):
         # before binding a new requested model to the next turn.
         if claude_read_only_config_boundary:
             assert claude_client is not None
-            config_options = claude_client.get_config_options(session_id)
+            direct_config_generation, config_options = (
+                claude_client.get_direct_config_options(session_id)
+            )
             config_options_authoritative = (
                 config_options is not None
-                and claude_client.get_config_options_generation(session_id)
-                > config_generation_before
+                and direct_config_generation > direct_config_generation_before
+            )
+            expected_config_option_ids.update(
+                claude_client.get_known_config_option_ids(session_id)
             )
             try:
                 _verify_read_only_mode_after_config(
