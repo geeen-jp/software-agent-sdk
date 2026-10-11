@@ -4072,15 +4072,8 @@ class ACPAgent(AgentBase):
                                 auth_kwargs["gateway"] = {"baseUrl": base_url}
                     await conn.authenticate(method_id=method_id, **auth_kwargs)
 
-                # Resume the prior ACP session if we have its id.  If the server
-                # has forgotten it (state wiped, new host, etc.) fall through to
-                # new_session so the conversation still starts cleanly.
-                #
-                # We only swallow ACPRequestError here: that is the protocol-level
-                # "I don't know this session" signal and is recoverable by
-                # starting fresh.  Transport failures (broken pipe, EOF, timeout,
-                # subprocess crash) propagate — there is no working connection to
-                # fall back on, and the outer init_state handler cleans up.
+                # Only Resource Not Found for this exact session is recoverable;
+                # other load errors must keep their startup diagnostic.
                 session_id: str | None = None
                 reported_model_id: str | None = None
                 available_models: list[ACPModelInfo] | None = None
@@ -4135,6 +4128,12 @@ class ACPAgent(AgentBase):
                             working_dir,
                         )
                     except ACPRequestError as e:
+                        if (
+                            e.code != -32002
+                            or not isinstance(e.data, dict)
+                            or e.data.get("uri") != prior_session_id
+                        ):
+                            raise
                         logger.warning(
                             "ACP load_session(%s) failed (%s); starting fresh session",
                             _fingerprint_session_id(prior_session_id),
