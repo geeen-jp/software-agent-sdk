@@ -13,6 +13,7 @@ from acp.schema import (
     DeniedOutcome,
     NewSessionResponse,
     PermissionOption,
+    SessionConfigOptionBoolean,
     SessionConfigOptionSelect,
     SessionConfigSelectOption,
     SessionMode,
@@ -773,6 +774,7 @@ def _start_acp_server_with_session_config(
     config_options: list[SessionConfigOptionSelect] | None = None,
     replace_mode_on_config: str | None = None,
     emit_mode_after_config: str | None = None,
+    response_option_ids: set[str] | None = None,
     resume: bool = False,
     protocol_trace: list[str] | None = None,
 ) -> MagicMock:
@@ -855,7 +857,13 @@ def _start_acp_server_with_session_config(
                     current_mode_id=emit_mode_after_config,
                 ),
             )
-        return SetSessionConfigOptionResponse(config_options=list(current))
+        response_options: list[
+            SessionConfigOptionSelect | SessionConfigOptionBoolean
+        ] = []
+        for option in current:
+            if response_option_ids is None or option.id in response_option_ids:
+                response_options.append(option)
+        return SetSessionConfigOptionResponse(config_options=response_options)
 
     conn.set_config_option = AsyncMock(side_effect=_set_config_option)
 
@@ -1084,8 +1092,11 @@ def test_read_only_claude_model_and_effort_keep_mode_proof_independent(
     ]
 
 
-@pytest.mark.parametrize("adapter_version", [None, "0.64.0"])
-def test_read_only_claude_unqualified_adapter_fails_closed(
+@pytest.mark.parametrize(
+    "adapter_version",
+    [CLAUDE_AGENT_ACP_VERSION, "unrecognized-future-version", None],
+)
+def test_read_only_claude_uses_complete_mode_snapshot_independent_of_version(
     tmp_path,
     adapter_version: str | None,
 ) -> None:
@@ -1094,11 +1105,40 @@ def test_read_only_claude_unqualified_adapter_fails_closed(
         acp_permission_policy="read_only",
         acp_config_options={"effort": "medium"},
     )
-    with pytest.raises(ACPSessionModeError, match="did not prove"):
+    conn = _start_acp_server_with_session_config(
+        agent,
+        tmp_path,
+        adapter_version=adapter_version,
+        modes=_claude_session_modes("default"),
+        config_options=[
+            _select_config_option(
+                "mode",
+                "default",
+                ["default", "plan", "bypassPermissions"],
+            ),
+            _select_config_option("effort", "low", ["low", "medium", "high"]),
+        ],
+    )
+    conn.set_config_option.assert_awaited_once_with(
+        config_id="effort",
+        session_id="sess-1",
+        value="medium",
+    )
+
+
+def test_read_only_claude_rejects_partial_snapshot_even_when_mode_is_present(
+    tmp_path,
+) -> None:
+    agent = ACPAgent(
+        acp_command=_CLAUDE_COMMAND,
+        acp_permission_policy="read_only",
+        acp_config_options={"effort": "medium"},
+    )
+    with pytest.raises(ACPSessionModeError, match="authoritative Claude config"):
         _start_acp_server_with_session_config(
             agent,
             tmp_path,
-            adapter_version=adapter_version,
+            adapter_version=CLAUDE_AGENT_ACP_VERSION,
             modes=_claude_session_modes("default"),
             config_options=[
                 _select_config_option(
@@ -1107,7 +1147,9 @@ def test_read_only_claude_unqualified_adapter_fails_closed(
                     ["default", "plan", "bypassPermissions"],
                 ),
                 _select_config_option("effort", "low", ["low", "medium", "high"]),
+                _select_config_option("model", "default", ["default", "opus"]),
             ],
+            response_option_ids={"mode", "effort"},
         )
 
 
