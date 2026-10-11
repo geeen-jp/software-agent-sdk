@@ -120,7 +120,6 @@ from openhands.sdk.mcp.config import MCPServer
 from openhands.sdk.observability.laminar import maybe_init_laminar, observe
 from openhands.sdk.secret import SecretSource
 from openhands.sdk.settings.acp_providers import (
-    CLAUDE_AGENT_ACP_VERSION,
     ACPFileSecretSpec,
     _build_session_meta,
     default_acp_file_secrets,
@@ -630,40 +629,35 @@ def _is_claude_exact_model_request(
 
 def _is_qualified_claude_exact_model(
     agent_name: str | None,
-    adapter_version: str | None,
     requested_model: str | None,
 ) -> bool:
-    """Identify the pinned Claude path that needs same-turn model proof.
+    """Identify explicit Claude model requests that need same-turn proof.
 
     Claude model-picker values such as ``opus`` and ``sonnet`` are selectors,
     not exact identities. Explicit Claude model IDs are intentionally detected
-    by their concrete ``claude-`` spelling; no alias table is introduced.
+    by their concrete ``claude-`` spelling; qualification follows protocol
+    evidence and does not depend on the adapter's reported version.
     """
-    return bool(
-        _is_claude_exact_model_request(agent_name, requested_model)
-        and adapter_version == CLAUDE_AGENT_ACP_VERSION
-    )
+    return _is_claude_exact_model_request(agent_name, requested_model)
 
 
 def _should_emit_claude_raw_sdk_messages(
     agent_name: str | None,
-    adapter_version: str | None,
     permission_policy: ACPPermissionPolicy,
 ) -> bool:
-    """Enable root-model provenance for every qualified read-only Claude session.
+    """Request root-model provenance for every read-only Claude session.
 
     A session may begin with a selector and later switch to an exact model.
     Raw SDK emission is session-scoped in claude-agent-acp, so enabling it only
     for the initial exact request would make that valid runtime-switch path
-    unverifiable. The bridge retains provenance only while an exact turn is
-    active; non-exact turns therefore incur no retained raw payload.
+    unverifiable. Exact-model turns still fail closed if the raw events are
+    missing or do not identify the requested model.
     """
     provider = detect_acp_provider_by_agent_name(agent_name or "")
     return bool(
         normalize_acp_permission_policy(permission_policy) == "read_only"
         and provider is not None
         and provider.key == "claude-code"
-        and adapter_version == CLAUDE_AGENT_ACP_VERSION
     )
 
 
@@ -759,13 +753,11 @@ async def _apply_acp_model(
                 config_id=config_id, value=value, session_id=session_id
             )
             last_options = response.config_options
-        if client is not None and last_options:
-            # Selecting a model can reveal dependent options (for example
-            # Gemini reasoning_effort or Muse context/effort). Preserve the
-            # complete response as the authoritative state for the following
-            # config pass; the server may not emit a ConfigOptionUpdate for
-            # this response.
-            client.record_config_options(session_id, last_options)
+        if client is not None:
+            # Keep the RPC response separate from notification state. A late
+            # ConfigOptionUpdate can replace the cache after this response,
+            # but it cannot become proof for the model write that just ran.
+            client.record_direct_config_options(session_id, last_options)
         return _resolve_effective_model(
             requested=model,
             agent_name=agent_name,
@@ -913,10 +905,10 @@ def _verify_read_only_mode_after_config(
     session_id: str,
     config_options: list[SessionConfigOption] | None,
     provider_key: str | None = None,
-    adapter_version: str | None = None,
     mode_generation_before: int = 0,
     require_fresh_mode: bool = False,
     config_options_authoritative: bool = False,
+    expected_config_option_ids: set[str] | None = None,
 ) -> None:
     """Fail closed if session configuration replaced the verified read_only mode.
 
@@ -925,14 +917,10 @@ def _verify_read_only_mode_after_config(
     keeps the confirmed ``ask`` mode effective while updating model-dependent
     options without emitting a second mode notification. Those providers may
     prove ``read_only`` from their provider-specific effective state instead of
-    requiring a fresh mode notification. The qualified Claude ACP 0.81.0
-    returns a complete
-    ``configOptions`` snapshot from ``session/set_config_option``; its ``mode``
-    option mirrors the effective session mode, so that provider-specific
-    snapshot is the qualified proof when no fresh mode notification is emitted.
-    This exception is qualified only for the adapter version pinned by the
-    provider registry; unknown or different versions still require a fresh
-    ``CurrentModeUpdate`` after config writes.
+    requiring a fresh mode notification. Claude config snapshots are accepted
+    only when the direct response is complete, current, and contains one
+    authoritative ``mode`` value. Adapter version is diagnostic metadata and
+    does not determine whether observed protocol evidence is trusted.
     """
     if (
         normalize_acp_permission_policy(policy) != "read_only"
@@ -999,13 +987,21 @@ def _verify_read_only_mode_after_config(
                     f"after applying session configuration (observed={observed!r})."
                 )
             return
-        if (
-            effective_provider_key == "claude-code"
-            and adapter_version == CLAUDE_AGENT_ACP_VERSION
-        ):
+        if effective_provider_key == "claude-code":
             if generation > mode_generation_before and observed == required_mode_id:
                 return
-            if not config_options_authoritative:
+            option_ids = [
+                getattr(option, "id", None)
+                for option in _iter_session_config_options(config_options)
+            ]
+            snapshot_is_complete = bool(
+                config_options_authoritative
+                and option_ids
+                and all(isinstance(option_id, str) for option_id in option_ids)
+                and len(option_ids) == len(set(option_ids))
+                and set(expected_config_option_ids or ()).issubset(option_ids)
+            )
+            if not snapshot_is_complete:
                 raise ACPSessionModeError(
                     f"ACP server {agent_name!r} session {session_id} did not "
                     f"return authoritative Claude config state to prove "
@@ -1312,7 +1308,6 @@ async def _apply_session_config_options(
     *,
     required_session_mode: str | None = None,
     provider_key: str | None = None,
-    adapter_version: str | None = None,
 ) -> list[SessionConfigOption] | None:
     """Apply *requested* session config options and verify the observed state.
 
@@ -1359,7 +1354,6 @@ async def _apply_session_config_options(
             session_id=session_id,
             config_options=initial_options,
             provider_key=provider_key,
-            adapter_version=adapter_version,
         )
         return None
 
@@ -1376,6 +1370,9 @@ async def _apply_session_config_options(
         # complete state over the session/new snapshot so model-dependent
         # option type/choices cannot be taken from a stale pre-model state.
         state_by_id = {**state_by_id, **observed_by_id}
+    expected_config_option_ids = client.get_known_config_option_ids(session_id)
+    expected_config_option_ids.update(state_by_id)
+    expected_config_option_ids.update(observed_by_id)
     if not state_by_id and not observed_by_id:
         raise ACPSessionConfigError(
             f"ACP server {agent_name!r} session {session_id} reported no session "
@@ -1395,6 +1392,10 @@ async def _apply_session_config_options(
             )
 
         wire_value = _config_option_wire_value(option, requested_value)
+        # A mode notification must follow the final configuration write; an
+        # earlier update in a multi-option pass cannot prove the state after a
+        # later write.
+        mode_generation_before = client.get_current_mode_generation(session_id)
         try:
             response = await conn.set_config_option(
                 config_id=config_id,
@@ -1410,11 +1411,13 @@ async def _apply_session_config_options(
             ) from e
 
         last_response_options = response.config_options
+        client.record_direct_config_options(session_id, last_response_options)
         state_by_id = _resolve_config_options_state(
             client,
             session_id,
             response.config_options,
         )
+        expected_config_option_ids.update(state_by_id)
         if not state_by_id:
             raise ACPSessionConfigError(
                 f"ACP server {agent_name!r} session {session_id} returned no "
@@ -1460,12 +1463,10 @@ async def _apply_session_config_options(
         requested,
         final_state,
     )
+    expected_config_option_ids.update(client.get_known_config_option_ids(session_id))
     provider = detect_acp_provider_by_agent_name(agent_name)
     effective_provider_key = provider.key if provider is not None else provider_key
-    qualified_claude_adapter = (
-        effective_provider_key == "claude-code"
-        and adapter_version == CLAUDE_AGENT_ACP_VERSION
-    )
+    claude_provider = effective_provider_key == "claude-code"
     _verify_read_only_mode_after_config(
         client,
         policy=client.permission_policy,
@@ -1473,17 +1474,15 @@ async def _apply_session_config_options(
         agent_name=agent_name,
         session_id=session_id,
         config_options=(
-            last_response_options
-            if qualified_claude_adapter
-            else list(final_state.values())
+            last_response_options if claude_provider else list(final_state.values())
         ),
         provider_key=provider_key,
-        adapter_version=adapter_version,
         mode_generation_before=mode_generation_before,
         require_fresh_mode=require_fresh_mode,
         config_options_authoritative=(
-            qualified_claude_adapter and last_response_options is not None
+            claude_provider and last_response_options is not None
         ),
+        expected_config_option_ids=expected_config_option_ids,
     )
     return list(final_state.values())
 
@@ -2035,6 +2034,17 @@ class _OpenHandsACPBridge:
         # Keyed by session so an update for a different session can never
         # satisfy the verification of this one.
         self._config_options_by_session: dict[str, list[SessionConfigOption]] = {}
+        self._config_options_generation_by_session: dict[str, int] = {}
+        # Keep the observed catalog as a high-water mark. A replacement
+        # snapshot must not make a previously advertised option disappear
+        # from completeness checks.
+        self._known_config_option_ids_by_session: dict[str, set[str]] = {}
+        # Direct RPC responses retain their provenance separately from the
+        # notification-updated cache above.
+        self._direct_config_options_by_session: dict[
+            str, list[SessionConfigOption] | None
+        ] = {}
+        self._direct_config_options_generation_by_session: dict[str, int] = {}
         self._current_mode_by_session: dict[str, str] = {}
         self._current_mode_generation_by_session: dict[str, int] = {}
         self._current_mode_updated: dict[str, asyncio.Event] = {}
@@ -2285,8 +2295,46 @@ class _OpenHandsACPBridge:
     def record_config_options(
         self, session_id: str, options: list[SessionConfigOption]
     ) -> None:
-        """Record a complete config state returned by a direct request."""
+        """Record a complete config state observed for one session."""
         self._config_options_by_session[session_id] = list(options)
+        self._known_config_option_ids_by_session.setdefault(session_id, set()).update(
+            option.id for option in options
+        )
+        self._config_options_generation_by_session[session_id] = (
+            self._config_options_generation_by_session.get(session_id, 0) + 1
+        )
+
+    def get_known_config_option_ids(self, session_id: str) -> set[str]:
+        """Return every config option id observed for this session."""
+        return set(self._known_config_option_ids_by_session.get(session_id, set()))
+
+    def record_direct_config_options(
+        self,
+        session_id: str,
+        options: list[SessionConfigOption] | None,
+    ) -> None:
+        """Record the config state returned directly by a configuration RPC."""
+        self._direct_config_options_by_session[session_id] = (
+            list(options) if options is not None else None
+        )
+        self._direct_config_options_generation_by_session[session_id] = (
+            self._direct_config_options_generation_by_session.get(session_id, 0) + 1
+        )
+        if options:
+            self.record_config_options(session_id, options)
+
+    def get_direct_config_options(
+        self, session_id: str
+    ) -> tuple[int, list[SessionConfigOption] | None]:
+        """Return the generation and state from the latest direct RPC response."""
+        return (
+            self._direct_config_options_generation_by_session.get(session_id, 0),
+            self._direct_config_options_by_session.get(session_id),
+        )
+
+    def get_config_options_generation(self, session_id: str) -> int:
+        """Return how many complete config snapshots arrived for a session."""
+        return self._config_options_generation_by_session.get(session_id, 0)
 
     def get_current_mode_id(self, session_id: str) -> str | None:
         """Return the last confirmed session mode id for *session_id*."""
@@ -2389,6 +2437,9 @@ class _OpenHandsACPBridge:
             # it per session so initialization can verify requested options
             # even when the server answers set_config_option asynchronously.
             self._config_options_by_session[session_id] = list(update.config_options)
+            self._known_config_option_ids_by_session.setdefault(
+                session_id, set()
+            ).update(option.id for option in update.config_options)
         elif isinstance(update, CurrentModeUpdate):
             current_mode_id = update.current_mode_id
             if isinstance(current_mode_id, str) and current_mode_id:
@@ -4053,7 +4104,6 @@ class ACPAgent(AgentBase):
                             structured_output=self.structured_output,
                             emit_raw_sdk_messages=_should_emit_claude_raw_sdk_messages(
                                 agent_name,
-                                self._startup_adapter_version,
                                 self.acp_permission_policy,
                             ),
                         )
@@ -4077,6 +4127,8 @@ class ACPAgent(AgentBase):
                             default_via_config_option=persisted_via_config_option,
                         )
                         config_options = load_response.config_options
+                        if config_options:
+                            client.record_config_options(session_id, config_options)
                         logger.info(
                             "Resumed ACP session: %s (cwd=%s)",
                             _fingerprint_session_id(session_id),
@@ -4100,7 +4152,6 @@ class ACPAgent(AgentBase):
                         structured_output=self.structured_output,
                         emit_raw_sdk_messages=_should_emit_claude_raw_sdk_messages(
                             agent_name,
-                            self._startup_adapter_version,
                             self.acp_permission_policy,
                         ),
                     )
@@ -4111,6 +4162,8 @@ class ACPAgent(AgentBase):
                     )
                     session_id = response.session_id
                     config_options = response.config_options
+                    if config_options:
+                        client.record_config_options(session_id, config_options)
                     session_response = response
                     (
                         reported_model_id,
@@ -4125,7 +4178,6 @@ class ACPAgent(AgentBase):
                     self._mark_startup("model", rpc=model_rpc, stage="apply_model")
                     defer_exact_model = _is_qualified_claude_exact_model(
                         agent_name,
-                        self._startup_adapter_version,
                         requested_model,
                     )
                     self._post_turn_model_verification_required = defer_exact_model
@@ -4150,7 +4202,6 @@ class ACPAgent(AgentBase):
                     session_response = load_response
                     defer_exact_model = _is_qualified_claude_exact_model(
                         agent_name,
-                        self._startup_adapter_version,
                         requested_model,
                     )
                     self._post_turn_model_verification_required = defer_exact_model
@@ -4239,20 +4290,7 @@ class ACPAgent(AgentBase):
                     config_options,
                     required_session_mode=mode_id,
                     provider_key=runtime_key,
-                    adapter_version=self._startup_adapter_version,
                 )
-                claude_exact_model = _is_claude_exact_model_request(
-                    agent_name,
-                    requested_model,
-                )
-                if claude_exact_model and not defer_exact_model:
-                    raise ACPSessionModelError(
-                        "Claude exact-model execution is not qualified for this "
-                        "adapter version; refusing to prompt "
-                        f"(requested={requested_model!r}, "
-                        f"adapter_version={self._startup_adapter_version!r}, "
-                        f"selector={current_model_id!r})."
-                    )
                 if defer_exact_model and self.acp_permission_policy != "read_only":
                     raise ACPSessionModelError(
                         "Qualified Claude exact-model execution requires a proven "
@@ -5499,17 +5537,8 @@ class ACPAgent(AgentBase):
             )
         qualified_exact_model = _is_qualified_claude_exact_model(
             self._agent_name,
-            self._startup_adapter_version,
             model,
         )
-        if _is_claude_exact_model_request(self._agent_name, model) and not (
-            qualified_exact_model
-        ):
-            raise ValueError(
-                "Claude exact-model switching is not qualified for this adapter "
-                f"version (requested={model!r}, "
-                f"adapter_version={self._startup_adapter_version!r})."
-            )
         if qualified_exact_model and self.acp_permission_policy != "read_only":
             raise ValueError(
                 "Qualified Claude exact-model execution requires a proven "
@@ -5523,11 +5552,12 @@ class ACPAgent(AgentBase):
         claude_read_only_config_boundary = (
             provider is not None
             and provider.key == "claude-code"
-            and self._startup_adapter_version == CLAUDE_AGENT_ACP_VERSION
             and self.acp_permission_policy == "read_only"
         )
         claude_client = self._client if claude_read_only_config_boundary else None
         mode_generation_before = 0
+        direct_config_generation_before = 0
+        expected_config_option_ids: set[str] = set()
         if claude_read_only_config_boundary:
             assert provider is not None
             if claude_client is None:
@@ -5538,6 +5568,18 @@ class ACPAgent(AgentBase):
             # notification cannot be mistaken for an old confirmation.
             mode_generation_before = claude_client.get_current_mode_generation(
                 session_id
+            )
+            expected_config_option_ids = claude_client.get_known_config_option_ids(
+                session_id
+            )
+            expected_config_option_ids.update(
+                option.id
+                for option in _iter_session_config_options(
+                    claude_client.get_config_options(session_id)
+                )
+            )
+            direct_config_generation_before, _ = (
+                claude_client.get_direct_config_options(session_id)
             )
         try:
             effective_model = self._executor.run_async(
@@ -5584,13 +5626,21 @@ class ACPAgent(AgentBase):
                 self._restart_session_on_next_turn = True
             raise
 
-        # A model config write is a post-mode configuration boundary.  On the
-        # qualified Claude adapter, re-prove the independently enforced
-        # read_only mode from the same complete response state before binding a
-        # new requested model to the next turn.
+        # A model config write is a post-mode configuration boundary. Re-prove
+        # the independently enforced read_only mode from fresh protocol state
+        # before binding a new requested model to the next turn.
         if claude_read_only_config_boundary:
             assert claude_client is not None
-            config_options = claude_client.get_config_options(session_id)
+            direct_config_generation, config_options = (
+                claude_client.get_direct_config_options(session_id)
+            )
+            config_options_authoritative = (
+                config_options is not None
+                and direct_config_generation > direct_config_generation_before
+            )
+            expected_config_option_ids.update(
+                claude_client.get_known_config_option_ids(session_id)
+            )
             try:
                 _verify_read_only_mode_after_config(
                     claude_client,
@@ -5600,10 +5650,10 @@ class ACPAgent(AgentBase):
                     session_id=session_id,
                     config_options=config_options,
                     provider_key="claude-code",
-                    adapter_version=self._startup_adapter_version,
                     mode_generation_before=mode_generation_before,
                     require_fresh_mode=True,
-                    config_options_authoritative=config_options is not None,
+                    config_options_authoritative=config_options_authoritative,
+                    expected_config_option_ids=expected_config_option_ids,
                 )
             except ACPSessionModeError:
                 # The provider has already received the model write, so do not

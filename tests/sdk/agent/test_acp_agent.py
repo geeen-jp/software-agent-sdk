@@ -4283,8 +4283,12 @@ class TestSetACPModel:
     @pytest.mark.parametrize(
         ("model", "selector", "other_generation"), _CLAUDE_EXACT_MODEL_CASES
     )
+    @pytest.mark.parametrize(
+        "adapter_version",
+        [CLAUDE_AGENT_ACP_VERSION, "unrecognized-future-version", None],
+    )
     def test_qualified_claude_switch_rebinds_next_turn_provenance(
-        self, model, selector, other_generation
+        self, model, selector, other_generation, adapter_version
     ):
         from acp.schema import SetSessionConfigOptionResponse
 
@@ -4293,11 +4297,13 @@ class TestSetACPModel:
             "claude-agent-acp",
             via_config_option=True,
         )
-        agent._startup_adapter_version = CLAUDE_AGENT_ACP_VERSION
+        agent._startup_adapter_version = adapter_version
+        agent._session_mode_id = "default"
         _agent_conn(agent).set_config_option = AsyncMock(
             return_value=SetSessionConfigOptionResponse(
                 config_options=[
                     _config_option("model", selector, ["default", "opus", "sonnet"]),
+                    _config_option("mode", "default", ["default", "plan"]),
                     _config_option(
                         "reasoning_effort",
                         "medium",
@@ -4331,6 +4337,137 @@ class TestSetACPModel:
         )
         agent._verify_served_model_for_turn()
         assert agent._served_model_id == model
+
+    def test_claude_switch_rejects_partial_mode_snapshot_and_restarts(self):
+        from acp.schema import SetSessionConfigOptionResponse
+
+        agent = self._wire(
+            _make_agent(acp_permission_policy="read_only"),
+            "claude-agent-acp",
+            via_config_option=True,
+        )
+        agent._startup_adapter_version = CLAUDE_AGENT_ACP_VERSION
+        agent._session_mode_id = "default"
+        agent._client.record_config_options(
+            "sess-1",
+            [
+                _config_option("model", "opus", ["default", "opus"]),
+                _config_option("mode", "default", ["default", "plan"]),
+                _config_option("effort", "medium", ["low", "medium"]),
+            ],
+        )
+        _agent_conn(agent).set_config_option = AsyncMock(
+            return_value=SetSessionConfigOptionResponse(
+                config_options=[
+                    _config_option("model", "opus", ["default", "opus"]),
+                    _config_option("mode", "default", ["default", "plan"]),
+                ]
+            )
+        )
+
+        with pytest.raises(ACPSessionModeError, match="authoritative Claude config"):
+            agent.set_acp_model("claude-opus-5-5")
+
+        assert agent._restart_session_on_next_turn is True
+        assert agent._requested_model_id is None
+
+    def test_claude_switch_does_not_use_stale_notification_as_write_proof(self):
+        from acp.schema import SetSessionConfigOptionResponse
+
+        agent = self._wire(
+            _make_agent(acp_permission_policy="read_only"),
+            "claude-agent-acp",
+            via_config_option=True,
+        )
+        agent._session_mode_id = "default"
+        agent._client.record_config_options(
+            "sess-1",
+            [
+                _config_option("model", "opus", ["default", "opus"]),
+                _config_option("mode", "default", ["default", "plan"]),
+                _config_option("effort", "medium", ["low", "medium"]),
+            ],
+        )
+        _agent_conn(agent).set_config_option = AsyncMock(
+            return_value=SetSessionConfigOptionResponse(
+                config_options=[_config_option("model", "opus", ["default", "opus"])]
+            )
+        )
+        run_config_write = agent._executor.run_async.side_effect
+
+        def _run_with_stale_update(*args: Any, **kwargs: Any) -> Any:
+            result = run_config_write(*args, **kwargs)
+            asyncio.run(
+                agent._client.session_update(
+                    "sess-1",
+                    _config_update(model="opus", mode="default", effort="medium"),
+                )
+            )
+            return result
+
+        agent._executor.run_async.side_effect = _run_with_stale_update
+
+        with pytest.raises(ACPSessionModeError, match="authoritative Claude config"):
+            agent.set_acp_model("claude-opus-5-5")
+
+        assert agent._restart_session_on_next_turn is True
+        assert agent._requested_model_id is None
+
+    def test_claude_switch_remembers_options_seen_during_config_application(self):
+        from acp.schema import SetSessionConfigOptionResponse
+
+        agent = self._wire(
+            _make_agent(acp_permission_policy="read_only"),
+            "claude-agent-acp",
+            via_config_option=True,
+        )
+        agent._session_mode_id = "default"
+        bridge = _OpenHandsACPBridge(permission_policy="read_only")
+        agent._client = bridge
+        initial_options = [
+            _config_option("model", "opus", ["default", "opus"]),
+            _config_option("mode", "default", ["default", "plan"]),
+            _config_option("effort", "low", ["low", "medium"]),
+        ]
+        bridge.record_config_options("sess-1", initial_options)
+        _agent_conn(agent).set_config_option = AsyncMock(
+            return_value=SetSessionConfigOptionResponse(
+                config_options=[
+                    _config_option("model", "opus", ["default", "opus"]),
+                    _config_option("mode", "default", ["default", "plan"]),
+                    _config_option("effort", "medium", ["low", "medium"]),
+                    _config_option("new-option", "enabled", ["enabled"]),
+                ]
+            )
+        )
+
+        asyncio.run(
+            _apply_session_config_options(
+                _agent_conn(agent),
+                bridge,
+                "claude-agent-acp",
+                "sess-1",
+                {"effort": "medium"},
+                initial_options,
+                required_session_mode="default",
+                provider_key="claude-code",
+            )
+        )
+        _agent_conn(agent).set_config_option = AsyncMock(
+            return_value=SetSessionConfigOptionResponse(
+                config_options=[
+                    _config_option("model", "opus", ["default", "opus"]),
+                    _config_option("mode", "default", ["default", "plan"]),
+                    _config_option("effort", "medium", ["low", "medium"]),
+                ]
+            )
+        )
+
+        with pytest.raises(ACPSessionModeError, match="authoritative Claude config"):
+            agent.set_acp_model("claude-opus-5-5")
+
+        assert agent._restart_session_on_next_turn is True
+        assert agent._requested_model_id is None
 
     @pytest.mark.parametrize(
         ("old_model", "new_model", "restarts"),
@@ -5292,6 +5429,37 @@ class TestServedModelGate:
         assert agent.current_model_id == model
         assert state.agent_state["acp_current_model_id"] == model
 
+    def test_step_rejects_missing_raw_evidence_even_for_pinned_version(self, tmp_path):
+        agent = self._agent()
+        agent._startup_adapter_version = CLAUDE_AGENT_ACP_VERSION
+        state = _make_state(tmp_path)
+        state.events.append(
+            MessageEvent(
+                source="user",
+                llm_message=Message(role="user", content=[TextContent(text="hi")]),
+            )
+        )
+        conversation = MagicMock()
+        conversation.state = state
+        client = agent._client
+        assert client is not None
+        response = MagicMock(usage=None, field_meta={"quota": {"model_usage": []}})
+        executor = MagicMock()
+
+        def _prompt_without_provider_evidence(_operation, **_kwargs):
+            client.accumulated_text.append("unverified")
+            return response
+
+        executor.run_async.side_effect = _prompt_without_provider_evidence
+        agent._executor = executor
+        events: list = []
+
+        with pytest.raises(ACPSessionModelError, match="served='UNKNOWN'"):
+            agent.step(conversation, on_event=events.append)
+
+        assert state.execution_status == ConversationExecutionStatus.ERROR
+        assert not any(isinstance(event, ActionEvent) for event in events)
+
     def test_step_restarts_flagged_session_before_prompt(self, tmp_path):
         agent = self._agent()
         state = _make_state(tmp_path)
@@ -5639,6 +5807,74 @@ class TestACPSessionIdPersistence:
             value=effort,
         )
 
+    @pytest.mark.parametrize(
+        "adapter_version",
+        [CLAUDE_AGENT_ACP_VERSION, "unrecognized-future-version", None],
+    )
+    def test_future_exact_model_uses_same_turn_evidence_across_versions(
+        self, tmp_path, adapter_version
+    ):
+        model = "claude-future-2099-synthetic"
+        agent = _make_agent(
+            acp_command=[
+                "npx",
+                "-y",
+                f"@agentclientprotocol/claude-agent-acp@{CLAUDE_AGENT_ACP_VERSION}",
+            ],
+            acp_server="claude-code",
+            acp_model=model,
+            acp_config_options={"effort": "medium"},
+            acp_permission_policy="read_only",
+        )
+        state = _make_state(tmp_path)
+        conn = _make_config_conn(
+            agent_name="claude-agent-acp",
+            agent_version=adapter_version,
+            options=self._qualified_claude_options(),
+            modes=self._qualified_claude_modes(),
+        )
+
+        with self._mocked_acp_runtime(agent, conn):
+            agent.init_state(state, on_event=lambda _: None)
+            _, kwargs = conn.new_session.await_args
+            assert kwargs["claudeCode"]["emitRawSDKMessages"] is True
+
+            state.events.append(
+                MessageEvent(
+                    source="user",
+                    llm_message=Message(
+                        role="user", content=[TextContent(text="Verify the model.")]
+                    ),
+                )
+            )
+            conversation = MagicMock()
+            conversation.state = state
+            client = agent._client
+            assert client is not None
+            response = MagicMock(
+                usage=None,
+                field_meta={"quota": {"model_usage": []}},
+            )
+            executor = MagicMock()
+
+            def _prompt_with_provider_evidence(_operation, **_kwargs):
+                client.accumulated_text.append("verified")
+                TestTurnModelEvidence._complete(
+                    client,
+                    "sess-new",
+                    root_models=(model,),
+                )
+                return response
+
+            executor.run_async.side_effect = _prompt_with_provider_evidence
+            agent._executor = executor
+            events: list = []
+            agent.step(conversation, on_event=events.append)
+
+            assert state.execution_status == ConversationExecutionStatus.FINISHED
+            assert agent._served_model_id == model
+            assert any(isinstance(event, ActionEvent) for event in events)
+
     def test_haiku_high_effort_fails_when_config_response_reports_mismatch(
         self, tmp_path
     ):
@@ -5815,9 +6051,7 @@ class TestACPSessionIdPersistence:
         conn.prompt.assert_not_called()
         assert agent._initialized is False
 
-    def test_unqualified_claude_exact_adapter_fails_closed_before_prompt(
-        self, tmp_path
-    ):
+    def test_claude_exact_model_does_not_require_pinned_adapter(self, tmp_path):
         agent = _make_agent(
             acp_command=[
                 "npx",
@@ -5837,11 +6071,13 @@ class TestACPSessionIdPersistence:
         )
 
         with self._mocked_acp_runtime(agent, conn):
-            with pytest.raises(ACPSessionModelError, match="not qualified"):
-                agent.init_state(state, on_event=lambda _: None)
+            agent.init_state(state, on_event=lambda _: None)
 
+        _, session_kwargs = conn.new_session.await_args
+        assert session_kwargs["claudeCode"]["emitRawSDKMessages"] is True
+        assert agent.current_model_id == "default"
+        assert state.agent_state["acp_current_model_id"] == "default"
         conn.prompt.assert_not_called()
-        assert agent._initialized is False
 
     @pytest.mark.parametrize(
         "model",
@@ -6792,7 +7028,7 @@ def _config_update(**options: str) -> ConfigOptionUpdate:
 def _make_config_conn(
     *,
     agent_name: str = "cursor-agent",
-    agent_version: str = "1.0",
+    agent_version: str | None = "1.0",
     session_id: str = "sess-new",
     options: list[SessionConfigOption] | None = None,
     models: SessionModelState | None = None,
@@ -7344,7 +7580,7 @@ class TestApplySessionConfigOptions:
         return conn
 
     async def test_claude_effort_uses_complete_mode_state_without_fresh_update(self):
-        """The qualified Claude adapter returns mode state without a second update."""
+        """A complete Claude config response can prove mode after a write."""
         session_id = "claude-sess"
         bridge = _OpenHandsACPBridge(permission_policy="read_only")
         conn = MagicMock()
@@ -7403,7 +7639,6 @@ class TestApplySessionConfigOptions:
             session_options,
             required_session_mode="default",
             provider_key="claude-code",
-            adapter_version=CLAUDE_AGENT_ACP_VERSION,
         )
 
         assert bridge.get_current_mode_generation(session_id) == mode_generation_before
@@ -7433,7 +7668,7 @@ class TestApplySessionConfigOptions:
             )
         )
 
-        with pytest.raises(ACPSessionModeError, match="complete configOptions"):
+        with pytest.raises(ACPSessionModeError, match="authoritative Claude config"):
             await _apply_session_config_options(
                 conn,
                 bridge,
@@ -7443,28 +7678,33 @@ class TestApplySessionConfigOptions:
                 bridge.get_config_options(session_id),
                 required_session_mode="default",
                 provider_key="claude-code",
-                adapter_version=CLAUDE_AGENT_ACP_VERSION,
             )
 
-    async def test_claude_different_adapter_version_requires_fresh_mode_update(self):
+    async def test_claude_partial_snapshot_with_mode_does_not_prove_mode(self):
         bridge = _OpenHandsACPBridge(permission_policy="read_only")
-        options = [
+        initial_options = [
+            _config_option("mode", "default", ["default", "bypassPermissions"]),
+            _config_option("effort", "medium", ["low", "medium"]),
+            _config_option("model", "default", ["default", "opus"]),
+        ]
+        response_options = [
             _config_option("mode", "default", ["default", "bypassPermissions"]),
             _config_option("effort", "medium", ["low", "medium"]),
         ]
-        conn = self._conn(SetSessionConfigOptionResponse(config_options=options))
+        conn = self._conn(
+            SetSessionConfigOptionResponse(config_options=response_options)
+        )
 
-        with pytest.raises(ACPSessionModeError, match="did not prove"):
+        with pytest.raises(ACPSessionModeError, match="authoritative Claude config"):
             await _apply_session_config_options(
                 conn,
                 bridge,
                 "claude-agent-acp",
                 "claude-sess",
                 {"effort": "medium"},
-                options,
+                initial_options,
                 required_session_mode="default",
                 provider_key="claude-code",
-                adapter_version="0.64.0",
             )
 
     async def test_empty_request_is_a_noop(self):
