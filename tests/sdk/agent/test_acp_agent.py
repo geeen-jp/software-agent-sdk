@@ -6160,14 +6160,16 @@ class TestACPSessionIdPersistence:
         conn.new_session.assert_not_awaited()
         assert agent._session_id == "stored-sess"
 
-    def test_load_session_failure_falls_back_to_new_session(self, tmp_path):
-        """ACPRequestError on load_session → new_session is called."""
+    def test_missing_load_session_falls_back_to_new_session(self, tmp_path):
+        """A matching Resource Not Found response starts a replacement session."""
         agent = _make_agent()
         state = _make_state(tmp_path)
         state.agent_state = {**state.agent_state, "acp_session_id": "stale-sess"}
         conn = self._make_conn(
             new_session_id="replacement-sess",
-            load_exc=ACPRequestError(-32602, "unknown session"),
+            load_exc=ACPRequestError(
+                -32002, "Resource not found", {"uri": "stale-sess"}
+            ),
         )
 
         self._patched_start_acp_server(agent, state, conn=conn)
@@ -6175,6 +6177,67 @@ class TestACPSessionIdPersistence:
         conn.load_session.assert_awaited_once()
         conn.new_session.assert_awaited_once()
         assert agent._session_id == "replacement-sess"
+
+    @pytest.mark.parametrize(
+        ("code", "data"),
+        [
+            pytest.param(-32602, None, id="invalid-params-without-data"),
+            pytest.param(
+                -32602,
+                {"uri": "stale-sess"},
+                id="invalid-params-with-session-uri",
+            ),
+            pytest.param(
+                -32002,
+                {"uri": "different-sess"},
+                id="resource-not-found-for-different-session",
+            ),
+            pytest.param(-32002, None, id="resource-not-found-without-data"),
+            pytest.param(
+                -32002,
+                {},
+                id="resource-not-found-without-uri",
+            ),
+            pytest.param(
+                -32002,
+                ["stale-sess"],
+                id="resource-not-found-with-non-dict-data",
+            ),
+            pytest.param(-32603, None, id="internal-error"),
+        ],
+    )
+    def test_non_missing_load_error_fails_startup(self, tmp_path, code, data):
+        agent = _make_agent()
+        state = _make_state(tmp_path)
+        state.agent_state = {
+            **state.agent_state,
+            "acp_session_id": "stale-sess",
+            "acp_session_cwd": str(tmp_path),
+        }
+        prior_agent_state = dict(state.agent_state)
+        load_error = ACPRequestError(code, "session/load failed", data)
+        conn = self._make_conn(load_exc=load_error)
+        events = []
+
+        with self._mocked_acp_runtime(agent, conn):
+            with pytest.raises(ACPRequestError) as raised:
+                agent.init_state(state, on_event=events.append)
+
+        assert raised.value is load_error
+        conn.load_session.assert_awaited_once()
+        conn.new_session.assert_not_awaited()
+        assert state.agent_state == prior_agent_state
+        assert agent._session_id is None
+        assert not agent._initialized
+        assert state.execution_status == ConversationExecutionStatus.ERROR
+        assert len(events) == 1
+        error_event = events[0]
+        assert isinstance(error_event, ConversationErrorEvent)
+        assert error_event.source == "agent"
+        assert error_event.code == "ACPInitError"
+        assert "session/load failed" in error_event.detail
+        assert "phase=load_session" in error_event.detail
+        assert "rpc=session/load" in error_event.detail
 
     def test_session_id_not_on_serialized_agent(self):
         """Session id must not leak onto the agent model — it lives in
@@ -6258,7 +6321,9 @@ class TestACPSessionIdPersistence:
         }
         conn = self._make_conn(
             new_session_id="replacement-sess",
-            load_exc=ACPRequestError(-32602, "unknown session"),
+            load_exc=ACPRequestError(
+                -32002, "Resource not found", {"uri": "stale-sess"}
+            ),
         )
 
         with self._mocked_acp_runtime(agent, conn):
@@ -6571,7 +6636,9 @@ class TestACPModelStatePersistence:
         new_session_response.session_id = "replacement-sess"
         new_session_response.config_options = None
         conn = TestACPSessionIdPersistence._make_conn(
-            load_exc=ACPRequestError(-32602, "unknown session"),
+            load_exc=ACPRequestError(
+                -32002, "Resource not found", {"uri": "stale-sess"}
+            ),
         )
         conn.new_session = AsyncMock(return_value=new_session_response)
 
@@ -7554,7 +7621,9 @@ class TestACPSessionConfigOptions:
                 available_models=[ModelInfo(model_id=acp_model, name=acp_model)],
                 current_model_id="auto",
             ),
-            load_exc=ACPRequestError(-32602, "unknown session"),
+            load_exc=ACPRequestError(
+                -32002, "Resource not found", {"uri": "stale-sess"}
+            ),
         )
 
         TestACPSessionIdPersistence._patched_start_acp_server(agent, state, conn=conn)
