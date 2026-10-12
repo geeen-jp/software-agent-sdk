@@ -37,6 +37,7 @@ repos:
             language: system
             types: [python]
             pass_filenames: true
+            require_serial: true
             always_run: false
           - id: check-import-rules
             name: Check import dependency rules
