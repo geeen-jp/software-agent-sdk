@@ -190,10 +190,28 @@ MAX_ACP_CONTENT_CHARS: int = 30_000
 # receives the JSON blob.
 _CLAUDE_OAUTH_CONFLICTING_ENV: frozenset[str] = CLAUDE_PAYG_CONFLICTING_ENV
 
-# Claude Code auto-compaction window, applied only to the exact Sonnet 5.5 model.
+# Claude Code auto-compaction windows, applied only to qualified model identities.
 _CLAUDE_SONNET_5_5_MODEL: Final[str] = "claude-sonnet-5-5"
+_CLAUDE_HAIKU_MODEL_PREFIX: Final[str] = "claude-haiku-"
 _CLAUDE_AUTO_COMPACT_WINDOW_ENV: Final[str] = "CLAUDE_CODE_AUTO_COMPACT_WINDOW"
 _CLAUDE_SONNET_5_5_AUTO_COMPACT_WINDOW: Final[str] = "400000"
+_CLAUDE_HAIKU_AUTO_COMPACT_WINDOW: Final[str] = "100000"
+
+
+def _claude_auto_compact_window(
+    provider_key: str | None, requested_model: str | None
+) -> str | None:
+    """Return the spawn-time compaction window for a qualified Claude model."""
+    if provider_key != "claude-code" or not requested_model:
+        return None
+    if requested_model == _CLAUDE_SONNET_5_5_MODEL:
+        return _CLAUDE_SONNET_5_5_AUTO_COMPACT_WINDOW
+    if requested_model.startswith(_CLAUDE_HAIKU_MODEL_PREFIX) and len(
+        requested_model
+    ) > len(_CLAUDE_HAIKU_MODEL_PREFIX):
+        return _CLAUDE_HAIKU_AUTO_COMPACT_WINDOW
+    return None
+
 
 # Limit for asyncio.StreamReader buffers used by the ACP subprocess pipes.
 # The default (64 KiB) is too small for session_update notifications that
@@ -3829,10 +3847,12 @@ class ACPAgent(AgentBase):
             if claude_oauth_file_channel:
                 env.pop(CLAUDE_OAUTH_TOKEN_ENV, None)
 
-        if command_is_claude and requested_model == _CLAUDE_SONNET_5_5_MODEL:
-            env[_CLAUDE_AUTO_COMPACT_WINDOW_ENV] = (
-                _CLAUDE_SONNET_5_5_AUTO_COMPACT_WINDOW
-            )
+        auto_compact_window = _claude_auto_compact_window(
+            command_provider.key if command_provider else None,
+            requested_model,
+        )
+        if auto_compact_window is not None:
+            env[_CLAUDE_AUTO_COMPACT_WINDOW_ENV] = auto_compact_window
 
         env.update(
             initial_agent_mode_env_for_policy(
@@ -3972,6 +3992,19 @@ class ACPAgent(AgentBase):
                     command=self.acp_command,
                     agent_name=agent_name or None,
                 )
+                runtime_provider = detect_acp_provider_by_agent_name(agent_name)
+                runtime_provider_key = (
+                    runtime_provider.key if runtime_provider is not None else None
+                )
+                if (
+                    auto_compact_window == _CLAUDE_HAIKU_AUTO_COMPACT_WINDOW
+                    and runtime_provider_key != "claude-code"
+                ):
+                    raise ACPSessionModelError(
+                        "Claude ACP auto-compaction requires initialize to report "
+                        "the launched Claude provider; "
+                        f"observed runtime provider={runtime_provider_key!r}."
+                    )
                 self._startup_package_version = resolve_acp_package_version(
                     self.acp_command,
                     provider_key=self._startup_provider_key,
@@ -5667,12 +5700,9 @@ class ACPAgent(AgentBase):
         # next turn's served-model evidence on the qualified Claude path.
         self._requested_model_id = model
         self._runtime_model_override_active = True
-        if (
-            provider is not None
-            and provider.key == "claude-code"
-            and (previous_requested_model == _CLAUDE_SONNET_5_5_MODEL)
-            != (model == _CLAUDE_SONNET_5_5_MODEL)
-        ):
+        if provider is not None and _claude_auto_compact_window(
+            provider.key, previous_requested_model
+        ) != _claude_auto_compact_window(provider.key, model):
             # The compaction env is fixed at spawn; respawn re-evaluates it.
             self._restart_session_on_next_turn = True
         self._post_turn_model_verification_required = qualified_exact_model

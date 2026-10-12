@@ -4474,11 +4474,15 @@ class TestSetACPModel:
         [
             ("claude-sonnet-5-5", "opus", True),
             ("claude-opus-5-5", "claude-sonnet-5-5", True),
-            ("claude-haiku-5-5", "opus", False),
+            ("claude-haiku-5-5", "opus", True),
+            ("claude-haiku-5-5", "claude-haiku-future-release", False),
+            ("claude-haiku-5-5", "claude-sonnet-5-5", True),
+            ("claude-sonnet-5-5", "claude-haiku-5-5", True),
+            ("claude-opus-5-5", "claude-haiku-5-5", True),
             ("claude-sonnet-5-5", "claude-sonnet-5-5", False),
         ],
     )
-    def test_claude_switch_across_sonnet_5_5_boundary_schedules_restart(
+    def test_claude_switch_across_auto_compact_policy_boundary_schedules_restart(
         self, old_model, new_model, restarts
     ):
         agent = self._wire(
@@ -4494,8 +4498,14 @@ class TestSetACPModel:
                 config_options=[
                     _config_option(
                         "model",
-                        "sonnet" if new_model == "claude-sonnet-5-5" else "opus",
-                        ["default", "opus", "sonnet"],
+                        (
+                            "sonnet"
+                            if new_model == "claude-sonnet-5-5"
+                            else "haiku"
+                            if new_model.startswith("claude-haiku-")
+                            else "opus"
+                        ),
+                        ["default", "haiku", "opus", "sonnet"],
                     ),
                 ]
             )
@@ -5874,6 +5884,33 @@ class TestACPSessionIdPersistence:
             assert state.execution_status == ConversationExecutionStatus.FINISHED
             assert agent._served_model_id == model
             assert any(isinstance(event, ActionEvent) for event in events)
+
+    @pytest.mark.parametrize("agent_name", [None, "custom-acp", "codex-acp"])
+    def test_haiku_policy_rejects_missing_or_conflicting_runtime_identity(
+        self, tmp_path, agent_name
+    ):
+        agent = _make_agent(
+            acp_command=[
+                "npx",
+                "-y",
+                f"@agentclientprotocol/claude-agent-acp@{CLAUDE_AGENT_ACP_VERSION}",
+            ],
+            acp_server="claude-code",
+            acp_model="claude-haiku-future-release",
+            acp_permission_policy="read_only",
+        )
+        state = _make_state(tmp_path)
+        conn = _make_config_conn(agent_name=agent_name or "")
+        if agent_name is None:
+            conn.initialize.return_value.agent_info = None
+
+        with self._mocked_acp_runtime(agent, conn):
+            with pytest.raises(ACPSessionModelError, match="runtime provider="):
+                agent.init_state(state, on_event=lambda _: None)
+
+        conn.new_session.assert_not_awaited()
+        assert not agent._initialized
+        assert not agent.has_live_acp_session
 
     def test_haiku_high_effort_fails_when_config_response_reports_mismatch(
         self, tmp_path
