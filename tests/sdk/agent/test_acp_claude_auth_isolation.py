@@ -24,6 +24,7 @@ from openhands.sdk.agent.acp_file_credentials import write_secret_file
 from openhands.sdk.conversation.secret_registry import SecretRegistry
 from openhands.sdk.conversation.state import ConversationState
 from openhands.sdk.credential import CredentialNeedsReauthentication, ResolvedCredential
+from openhands.sdk.settings.acp_providers import detect_acp_provider_by_command
 from openhands.sdk.utils.async_executor import AsyncExecutor
 
 
@@ -752,6 +753,8 @@ def _capture_start_env(
 ) -> dict[str, str]:
     from unittest.mock import AsyncMock, MagicMock, patch
 
+    from acp.schema import SessionMode, SessionModeState
+
     from openhands.sdk.secret import SecretSource
     from openhands.sdk.utils.async_executor import AsyncExecutor
     from openhands.sdk.workspace.local import LocalWorkspace
@@ -790,19 +793,34 @@ def _capture_start_env(
     conn = MagicMock()
     init_response = MagicMock()
     init_response.agent_info = MagicMock()
-    init_response.agent_info.name = "custom-acp"
+    launch_provider = detect_acp_provider_by_command(agent.acp_command)
+    init_response.agent_info.name = (
+        "claude-agent-acp"
+        if launch_provider is not None and launch_provider.key == "claude-code"
+        else "custom-acp"
+    )
     init_response.agent_info.version = "1.0"
     init_response.agent_capabilities = None
     init_response.auth_methods = []
     conn.initialize = AsyncMock(return_value=init_response)
     new_response = MagicMock()
     new_response.session_id = "sess-auth"
+    new_response.config_options = None
+    new_response.models = None
+    new_response.modes = SessionModeState(
+        current_mode_id="default",
+        available_modes=[SessionMode(id="default", name="Default")],
+    )
     conn.new_session = AsyncMock(return_value=new_response)
 
     async def _fake_load_session(*, session_id, **_kwargs):
         if loaded_session_ids is not None:
             loaded_session_ids.append(session_id)
-        return MagicMock()
+        response = MagicMock()
+        response.config_options = None
+        response.models = None
+        response.modes = new_response.modes
+        return response
 
     conn.load_session = AsyncMock(side_effect=_fake_load_session)
     conn.set_session_mode = AsyncMock()

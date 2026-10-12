@@ -3992,6 +3992,19 @@ class ACPAgent(AgentBase):
                     command=self.acp_command,
                     agent_name=agent_name or None,
                 )
+                runtime_provider = detect_acp_provider_by_agent_name(agent_name)
+                runtime_provider_key = (
+                    runtime_provider.key if runtime_provider is not None else None
+                )
+                if (
+                    auto_compact_window == _CLAUDE_HAIKU_AUTO_COMPACT_WINDOW
+                    and runtime_provider_key != "claude-code"
+                ):
+                    raise ACPSessionModelError(
+                        "Claude ACP auto-compaction requires initialize to report "
+                        "the launched Claude provider; "
+                        f"observed runtime provider={runtime_provider_key!r}."
+                    )
                 self._startup_package_version = resolve_acp_package_version(
                     self.acp_command,
                     provider_key=self._startup_provider_key,
