@@ -4474,11 +4474,15 @@ class TestSetACPModel:
         [
             ("claude-sonnet-5-5", "opus", True),
             ("claude-opus-5-5", "claude-sonnet-5-5", True),
-            ("claude-haiku-5-5", "opus", False),
+            ("claude-haiku-5-5", "opus", True),
+            ("claude-haiku-5-5", "claude-haiku-future-release", False),
+            ("claude-haiku-5-5", "claude-sonnet-5-5", True),
+            ("claude-sonnet-5-5", "claude-haiku-5-5", True),
+            ("claude-opus-5-5", "claude-haiku-5-5", True),
             ("claude-sonnet-5-5", "claude-sonnet-5-5", False),
         ],
     )
-    def test_claude_switch_across_sonnet_5_5_boundary_schedules_restart(
+    def test_claude_switch_across_auto_compact_policy_boundary_schedules_restart(
         self, old_model, new_model, restarts
     ):
         agent = self._wire(
@@ -4494,8 +4498,14 @@ class TestSetACPModel:
                 config_options=[
                     _config_option(
                         "model",
-                        "sonnet" if new_model == "claude-sonnet-5-5" else "opus",
-                        ["default", "opus", "sonnet"],
+                        (
+                            "sonnet"
+                            if new_model == "claude-sonnet-5-5"
+                            else "haiku"
+                            if new_model.startswith("claude-haiku-")
+                            else "opus"
+                        ),
+                        ["default", "haiku", "opus", "sonnet"],
                     ),
                 ]
             )

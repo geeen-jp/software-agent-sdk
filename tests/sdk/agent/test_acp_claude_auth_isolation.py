@@ -1071,6 +1071,7 @@ def test_haiku_read_only_start_keeps_subscription_oauth_isolated(
 
     assert captured[CLAUDE_OAUTH_TOKEN_ENV] == "fake-token"
     assert "ANTHROPIC_API_KEY" not in captured
+    assert captured[_AUTO_COMPACT_ENV] == "100000"
     isolated = Path(captured["CLAUDE_CONFIG_DIR"])
     assert not (isolated / CLAUDE_CREDENTIALS_FILENAME).exists()
     assert source.read_text(encoding="utf-8") == before
@@ -1087,9 +1088,37 @@ def test_sonnet_5_5_exact_model_gets_400k_auto_compact_window(
 
 
 @pytest.mark.parametrize(
-    "model", [None, "claude-haiku-5-5", "claude-opus-5-5", "sonnet"]
+    "model",
+    [
+        "claude-haiku-4-5",
+        "claude-haiku-5-5",
+        "claude-haiku-future-release",
+    ],
 )
-def test_non_sonnet_5_5_models_get_no_auto_compact_window(
+def test_haiku_family_model_gets_100k_auto_compact_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, model: str
+) -> None:
+    monkeypatch.delenv(_AUTO_COMPACT_ENV, raising=False)
+    agent = _claude_agent_with_token(model)
+    captured = _capture_start_env(agent, tmp_path, ignore_startup_error=True)
+    assert captured[_AUTO_COMPACT_ENV] == "100000"
+    assert captured["CLAUDE_CONFIG_DIR"]
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        None,
+        "claude-haiku",
+        "claude-haiku-",
+        "claude-opus-5-5",
+        "claude-sonnet-5-4",
+        "haiku",
+        "sonnet",
+        "opus",
+    ],
+)
+def test_unqualified_models_get_no_auto_compact_window(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, model: str | None
 ) -> None:
     monkeypatch.delenv(_AUTO_COMPACT_ENV, raising=False)
@@ -1105,20 +1134,28 @@ def test_non_claude_provider_gets_no_auto_compact_window(
     monkeypatch.delenv(_AUTO_COMPACT_ENV, raising=False)
     agent = ACPAgent(
         acp_command=["npx", "-y", "@agentclientprotocol/codex-acp"],
-        acp_model="claude-sonnet-5-5",
+        acp_model="claude-haiku-future-release",
     )
     captured = _capture_start_env(agent, tmp_path, ignore_startup_error=True)
     assert _AUTO_COMPACT_ENV not in captured
 
 
 @pytest.mark.parametrize("policy", ["read_only", "writable"])
-def test_sonnet_5_5_auto_compact_window_is_independent_of_permission_policy(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, policy: str
+@pytest.mark.parametrize(
+    ("model", "window"),
+    [("claude-sonnet-5-5", "400000"), ("claude-haiku-5-5", "100000")],
+)
+def test_auto_compact_window_is_independent_of_permission_policy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    policy: str,
+    model: str,
+    window: str,
 ) -> None:
     monkeypatch.delenv(_AUTO_COMPACT_ENV, raising=False)
-    agent = _claude_agent_with_token("claude-sonnet-5-5", acp_permission_policy=policy)
+    agent = _claude_agent_with_token(model, acp_permission_policy=policy)
     captured = _capture_start_env(agent, tmp_path, ignore_startup_error=True)
-    assert captured[_AUTO_COMPACT_ENV] == "400000"
+    assert captured[_AUTO_COMPACT_ENV] == window
 
 
 def test_sonnet_5_5_auto_compact_window_overrides_acp_env(
@@ -1130,6 +1167,17 @@ def test_sonnet_5_5_auto_compact_window_overrides_acp_env(
     )
     captured = _capture_start_env(agent, tmp_path, ignore_startup_error=True)
     assert captured[_AUTO_COMPACT_ENV] == "400000"
+
+
+def test_haiku_auto_compact_window_overrides_host_and_acp_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(_AUTO_COMPACT_ENV, "654321")
+    agent = _claude_agent_with_token(
+        "claude-haiku-future-release", acp_env={_AUTO_COMPACT_ENV: "123456"}
+    )
+    captured = _capture_start_env(agent, tmp_path, ignore_startup_error=True)
+    assert captured[_AUTO_COMPACT_ENV] == "100000"
 
 
 def test_sonnet_5_5_auto_compact_window_survives_restart_of_same_conversation(
@@ -1148,7 +1196,11 @@ def test_sonnet_5_5_auto_compact_window_survives_restart_of_same_conversation(
             "acp_session_id": "prior-sess",
             "acp_session_cwd": state.workspace.working_dir,
         }
-        for model in ("claude-opus-5-5", "claude-sonnet-5-5"):
+        for model in (
+            "claude-haiku-future-release",
+            "claude-opus-5-5",
+            "claude-sonnet-5-5",
+        ):
             agent._requested_model_id = model
             agent._runtime_model_override_active = True
             agent._restart_session_on_next_turn = True
@@ -1164,9 +1216,19 @@ def test_sonnet_5_5_auto_compact_window_survives_restart_of_same_conversation(
         loaded_session_ids=loaded_session_ids,
     )
 
-    assert [_AUTO_COMPACT_ENV in env for env in spawn_envs] == [True, False, True]
-    assert spawn_envs[2][_AUTO_COMPACT_ENV] == "400000"
-    assert loaded_session_ids == ["prior-sess", "prior-sess"]
+    assert [_AUTO_COMPACT_ENV in env for env in spawn_envs] == [
+        True,
+        True,
+        False,
+        True,
+    ]
+    assert [env.get(_AUTO_COMPACT_ENV) for env in spawn_envs] == [
+        "400000",
+        "100000",
+        None,
+        "400000",
+    ]
+    assert loaded_session_ids == ["prior-sess", "prior-sess", "prior-sess"]
 
 
 def test_auto_compact_window_does_not_leak_between_concurrent_conversations(
@@ -1195,7 +1257,7 @@ def test_auto_compact_window_does_not_leak_between_concurrent_conversations(
         while_running=_start_haiku_while_sonnet_runs,
     )
     assert sonnet[_AUTO_COMPACT_ENV] == "400000"
-    assert _AUTO_COMPACT_ENV not in haiku
+    assert haiku[_AUTO_COMPACT_ENV] == "100000"
     assert sonnet["CLAUDE_CONFIG_DIR"] != haiku["CLAUDE_CONFIG_DIR"]
     assert sonnet_dir_alive_during_haiku == [True]
     assert not Path(sonnet["CLAUDE_CONFIG_DIR"]).exists()
