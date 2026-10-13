@@ -4800,9 +4800,7 @@ class TestExtractTokenUsage:
         response = MagicMock()
         response.usage = None
         response.field_meta = {
-            "quota": {
-                "token_count": {"input_tokens": 200, "output_tokens": "80"}
-            }
+            "quota": {"token_count": {"input_tokens": 200, "output_tokens": "80"}}
         }
         assert _extract_token_usage(response) == (200, 0, 0, 0, 0)
 
