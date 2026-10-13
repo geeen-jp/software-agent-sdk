@@ -1505,6 +1505,13 @@ async def _apply_session_config_options(
     return list(final_state.values())
 
 
+def _safe_token_count(value: Any) -> int:
+    """Return a valid non-negative integer token count, or zero."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return 0
+    return value
+
+
 def _extract_token_usage(
     response: Any,
 ) -> tuple[int, int, int, int, int]:
@@ -1514,22 +1521,38 @@ def _extract_token_usage(
 
     Checks two locations:
     - claude-agent-acp, codex-acp: ``response.usage`` (standard ACP field)
-    - gemini-cli: ``response._meta.quota.token_count`` (non-standard)
+    - gemini-cli: ``response.field_meta.quota.token_count`` (non-standard)
     """
-    if response is not None and response.usage is not None:
-        u = response.usage
+    if response is None:
+        return (0, 0, 0, 0, 0)
+
+    usage = getattr(response, "usage", None)
+    if usage is not None:
         return (
-            u.input_tokens,
-            u.output_tokens,
-            u.cached_read_tokens or 0,
-            u.cached_write_tokens or 0,
-            u.thought_tokens or 0,
+            _safe_token_count(getattr(usage, "input_tokens", None)),
+            _safe_token_count(getattr(usage, "output_tokens", None)),
+            _safe_token_count(getattr(usage, "cached_read_tokens", None)),
+            _safe_token_count(getattr(usage, "cached_write_tokens", None)),
+            _safe_token_count(getattr(usage, "thought_tokens", None)),
         )
-    if response is not None and response.field_meta is not None:
-        quota = response.field_meta.get("quota", {})
-        tc = quota.get("token_count", {})
-        return (tc.get("input_tokens", 0), tc.get("output_tokens", 0), 0, 0, 0)
-    return (0, 0, 0, 0, 0)
+
+    field_meta = getattr(response, "field_meta", None)
+    if not isinstance(field_meta, Mapping):
+        return (0, 0, 0, 0, 0)
+    quota = field_meta.get("quota")
+    if not isinstance(quota, Mapping):
+        return (0, 0, 0, 0, 0)
+    token_count = quota.get("token_count")
+    if not isinstance(token_count, Mapping):
+        return (0, 0, 0, 0, 0)
+
+    return (
+        _safe_token_count(token_count.get("input_tokens")),
+        _safe_token_count(token_count.get("output_tokens")),
+        0,
+        0,
+        0,
+    )
 
 
 _SYNTHETIC_MODEL_RE = re.compile(r"^<[^>]+>$")
