@@ -1854,7 +1854,9 @@ class TestACPAgentTelemetry:
         assert llms[0] is agent.llm
         assert llms[0].model == "acp-managed"
 
-    def _make_step_fixtures(self, tmp_path, agent=None, usage=None, cost=None):
+    def _make_step_fixtures(
+        self, tmp_path, agent=None, usage=None, cost=None, field_meta=None
+    ):
         """Set up agent + client + executor for step() telemetry tests."""
         if agent is None:
             agent = _make_agent()
@@ -1877,7 +1879,7 @@ class TestACPAgentTelemetry:
             mock_response.usage = mock_usage
         else:
             mock_response.usage = None
-            mock_response.field_meta = None
+            mock_response.field_meta = field_meta
 
         def _fake_run_async(_coro, **_kwargs):
             mock_client.accumulated_text.append("response text")
@@ -1926,6 +1928,18 @@ class TestACPAgentTelemetry:
     def test_step_handles_no_usage(self, tmp_path):
         """step() handles PromptResponse with no usage gracefully."""
         agent, conversation = self._make_step_fixtures(tmp_path)
+
+        agent.step(conversation, on_event=lambda _: None)
+
+        assert len(agent.llm.metrics.token_usages) == 0
+
+    def test_step_handles_malformed_usage_metadata_without_usage_update(self, tmp_path):
+        """Malformed optional usage metadata cannot fail a successful prompt."""
+        agent, conversation = self._make_step_fixtures(
+            tmp_path,
+            field_meta={"quota": {"token_count": None}},
+            cost=None,
+        )
 
         agent.step(conversation, on_event=lambda _: None)
 
@@ -4762,6 +4776,42 @@ class TestExtractTokenUsage:
         response.usage = None
         response.field_meta = {"quota": {}}
         assert _extract_token_usage(response) == (0, 0, 0, 0, 0)
+
+    @pytest.mark.parametrize(
+        "field_meta",
+        [
+            None,
+            "not a mapping",
+            [],
+            {"quota": None},
+            {"quota": []},
+            {"quota": {"token_count": None}},
+            {"quota": {"token_count": []}},
+            {"quota": {"token_count": "invalid"}},
+        ],
+    )
+    def test_malformed_quota_metadata_returns_zero_usage(self, field_meta: Any):
+        response = MagicMock()
+        response.usage = None
+        response.field_meta = field_meta
+        assert _extract_token_usage(response) == (0, 0, 0, 0, 0)
+
+    def test_invalid_metadata_token_counts_are_normalized_individually(self):
+        response = MagicMock()
+        response.usage = None
+        response.field_meta = {
+            "quota": {"token_count": {"input_tokens": 200, "output_tokens": "80"}}
+        }
+        assert _extract_token_usage(response) == (200, 0, 0, 0, 0)
+
+    def test_invalid_standard_usage_counts_are_normalized_individually(self):
+        response = MagicMock()
+        response.usage.input_tokens = None
+        response.usage.output_tokens = "50"
+        response.usage.cached_read_tokens = -1
+        response.usage.cached_write_tokens = 5
+        response.usage.thought_tokens = True
+        assert _extract_token_usage(response) == (0, 0, 0, 5, 0)
 
 
 class TestTurnModelEvidence:
