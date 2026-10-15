@@ -134,15 +134,17 @@ rejecting a turn that has no completed structured result.
 
 ## Downstream handoff reconciliation
 
-The existing [Workflow #414 comment](https://github.com/geeen-jp/ai-dev-workflow-go/issues/414#issuecomment-6182678917)
-records NOT_SUPPORTED for execution `exec-46d41b351e2a54928701e81d9bb6b99e`
-and different schema digests. That comment describes an earlier Candidate and
-does not qualify the corrected digests in this record. The current disposition
-is PASS only for `root_if_then` and `nested_any_of` above; the other candidates
-remain offline-only. The authoritative qualification record is available in
-[Candidate commit `f6533f47d8a218e5d7fe91a87602d102679682da`](https://github.com/geeen-jp/software-agent-sdk/commit/f6533f47d8a218e5d7fe91a87602d102679682da).
-The downstream issue and its comments remain unchanged in this Builder run
-under the read-only issue boundary.
+Updated PASS handoff posted on Workflow #414 (supersedes the earlier
+NOT_SUPPORTED comment from `exec-46d41b351e2a54928701e81d9bb6b99e`):
+
+https://github.com/geeen-jp/ai-dev-workflow-go/issues/414#issuecomment-6184432178
+
+The prior [NOT_SUPPORTED comment](https://github.com/geeen-jp/ai-dev-workflow-go/issues/414#issuecomment-6182678917)
+described an earlier candidate with incomplete canonical constraints and
+different schema digests. The current disposition is **PASS** only for
+`root_if_then` and `nested_any_of` above; the other candidates remain
+offline-only. This qualification record in-tree is authoritative for the
+PASS digests and runtime identity in the sections above.
 
 ## Verification
 
