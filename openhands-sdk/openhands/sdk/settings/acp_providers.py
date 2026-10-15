@@ -72,19 +72,12 @@ def _validate_root_object_schema(
 def validate_claude_structured_output_schema(
     schema: Mapping[str, Any],
 ) -> None:
-    """Validate the exact root boundary of Claude ACP structured output.
+    """Validate the root boundary for Claude ACP structured output.
 
-    The pinned ``claude-agent-acp``/Claude Agent SDK path sends this schema as
-    a custom tool input schema. That boundary requires a root object and
-    rejects root-level composition keywords, even though the same keywords
-    are accepted in nested schemas. A root union (or conditional root
-    ``allOf``) cannot be flattened into one object without changing branch
-    membership, required fields, or branch constraints, so the SDK fails
-    closed instead of inventing a provider-specific broadening.
-
-    This deliberately does not normalize nested JSON Schema features. The
-    caller's schema remains the semantic authority and the qualified provider
-    currently accepts the nested features unchanged.
+    The local check requires a root object and rejects root composition
+    keywords. Other schema behavior is provider-enforced; the caller's schema
+    is passed unchanged. See the ScopeJudge qualification record for the
+    bounded evidence and its limits.
     """
     _validate_root_object_schema(schema, "Claude")
 
