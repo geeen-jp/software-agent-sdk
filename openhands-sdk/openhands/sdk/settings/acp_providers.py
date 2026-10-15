@@ -72,19 +72,25 @@ def _validate_root_object_schema(
 def validate_claude_structured_output_schema(
     schema: Mapping[str, Any],
 ) -> None:
-    """Validate the exact root boundary of Claude ACP structured output.
+    """Validate Claude ACP's root boundary for native structured output.
 
     The pinned ``claude-agent-acp``/Claude Agent SDK path sends this schema as
     a custom tool input schema. That boundary requires a root object and
-    rejects root-level composition keywords, even though the same keywords
-    are accepted in nested schemas. A root union (or conditional root
-    ``allOf``) cannot be flattened into one object without changing branch
-    membership, required fields, or branch constraints, so the SDK fails
-    closed instead of inventing a provider-specific broadening.
+    rejects root-level ``oneOf``, ``anyOf``, and ``allOf``. Bounded live
+    qualification for ScopeJudge outcome constraints established that a root
+    ``if``/``then``/``else`` chain and a nested ``anyOf`` of outcome objects
+    can both be accepted and enforced by the provider output path; see
+    ``tests/sdk/settings/claude_scopejudge_schema_qualification.md`` for the
+    exact schema digests, runtime identity, observed enforcement, and limits.
+    The digest regression test pins each tested schema. The nested-``anyOf``
+    expression needs a wrapper that its caller can map losslessly to the
+    canonical result.
 
-    This deliberately does not normalize nested JSON Schema features. The
-    caller's schema remains the semantic authority and the qualified provider
-    currently accepts the nested features unchanged.
+    The local check enforces only this root boundary, not a recursive JSON
+    Schema keyword allowlist. The caller's schema remains the semantic
+    authority and is passed unchanged; unqualified schema features are not
+    projected or replaced with prompt instructions. Provider schema rejection
+    remains a failed structured-output call.
     """
     _validate_root_object_schema(schema, "Claude")
 
