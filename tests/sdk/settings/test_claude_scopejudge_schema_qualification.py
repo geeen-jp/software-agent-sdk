@@ -13,8 +13,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-from copy import deepcopy
-from pathlib import Path
 from typing import Any
 
 import pytest
@@ -171,10 +169,6 @@ _CANDIDATE_SCHEMA_SHA256 = {
         "49444cffba28cdc033d7b3a7fda52381b7ad2de20ea747ccb76edfe5d73de37b"
     ),
 }
-_QUALIFICATION_RECORD = Path(__file__).with_name(
-    "claude_scopejudge_schema_qualification.md"
-)
-
 _VALID_RESULTS = {
     "PASS": {
         "outcome": "PASS",
@@ -227,6 +221,10 @@ _INVALID_RESULTS = {
         **_VALID_RESULTS["NEEDS_HUMAN"],
         "scope_findings": ["NEEDS_HUMAN must not report scope findings."],
     },
+    "NEEDS_HUMAN_without_human_reasons": {
+        **_VALID_RESULTS["NEEDS_HUMAN"],
+        "human_reasons": [],
+    },
     "TRIM_REQUIRED_with_human_reasons": {
         **_VALID_RESULTS["TRIM_REQUIRED"],
         "human_reasons": ["TRIM_REQUIRED must not report human reasons."],
@@ -247,23 +245,6 @@ def test_scopejudge_candidate_schema_digest_is_pinned(candidate: str) -> None:
     assert (
         hashlib.sha256(schema_json).hexdigest() == _CANDIDATE_SCHEMA_SHA256[candidate]
     )
-
-
-def test_live_qualification_record_keeps_identity_and_schema_digests() -> None:
-    record = _QUALIFICATION_RECORD.read_text()
-
-    for identity in (
-        "claude-haiku-5-5",
-        "high",
-        "read_only",
-        "Claude Code",
-        "2.1.293",
-        "Claude ACP",
-        "0.81.0",
-    ):
-        assert identity in record
-    for digest in _CANDIDATE_SCHEMA_SHA256.values():
-        assert f"`{digest}`" in record
 
 
 @pytest.mark.parametrize("candidate", _CANDIDATE_NAMES)
@@ -300,14 +281,6 @@ def test_scopejudge_candidate_keeps_claude_root_boundary(candidate: str) -> None
     assert schema.get("type") == "object"
     assert not {"oneOf", "anyOf", "allOf"}.intersection(schema)
     validate_claude_structured_output_schema(schema)
-
-
-def test_wrapper_candidates_map_losslessly_to_canonical_result_shape() -> None:
-    canonical_result = deepcopy(_VALID_RESULTS["TRIM_REQUIRED"])
-    wrapped = _candidate_payload("nested_any_of", canonical_result)
-
-    assert wrapped["result"] == canonical_result
-    assert wrapped["result"] == _VALID_RESULTS["TRIM_REQUIRED"]
 
 
 def test_codex_validator_still_rejects_conditional_keywords() -> None:

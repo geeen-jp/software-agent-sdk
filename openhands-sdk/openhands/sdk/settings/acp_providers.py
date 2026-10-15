@@ -72,25 +72,12 @@ def _validate_root_object_schema(
 def validate_claude_structured_output_schema(
     schema: Mapping[str, Any],
 ) -> None:
-    """Validate Claude ACP's root boundary for native structured output.
+    """Validate the root boundary for Claude ACP structured output.
 
-    The pinned ``claude-agent-acp``/Claude Agent SDK path sends this schema as
-    a custom tool input schema. That boundary requires a root object and
-    rejects root-level ``oneOf``, ``anyOf``, and ``allOf``. Bounded live
-    qualification for ScopeJudge outcome constraints established that a root
-    ``if``/``then``/``else`` chain and a nested ``anyOf`` of outcome objects
-    can both be accepted and enforced by the provider output path; see
-    ``tests/sdk/settings/claude_scopejudge_schema_qualification.md`` for the
-    exact schema digests, runtime identity, observed enforcement, and limits.
-    The digest regression test pins each tested schema. The nested-``anyOf``
-    expression needs a wrapper that its caller can map losslessly to the
-    canonical result.
-
-    The local check enforces only this root boundary, not a recursive JSON
-    Schema keyword allowlist. The caller's schema remains the semantic
-    authority and is passed unchanged; unqualified schema features are not
-    projected or replaced with prompt instructions. Provider schema rejection
-    remains a failed structured-output call.
+    The local check requires a root object and rejects root composition
+    keywords. Other schema behavior is provider-enforced; the caller's schema
+    is passed unchanged. See the ScopeJudge qualification record for the
+    bounded evidence and its limits.
     """
     _validate_root_object_schema(schema, "Claude")
 
