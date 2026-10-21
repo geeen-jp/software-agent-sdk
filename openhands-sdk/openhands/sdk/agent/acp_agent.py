@@ -80,6 +80,7 @@ from openhands.sdk.agent.acp_codex_output_schema import (
     build_codex_output_schema_env,
 )
 from openhands.sdk.agent.acp_file_credentials import (
+    CODEX_AUTH_SECRET_NAME,
     ACPFileCredentialLifecycle,
     codex_auth_file_is_chatgpt,
     create_file_credential_lifecycle,
@@ -488,6 +489,13 @@ def _classify_acp_init_error(exc: BaseException) -> str:
     if isinstance(exc, (FileNotFoundError, PermissionError)):
         return "ACPSpawnError"
     return "ACPInitError"
+
+
+def _is_acp_authentication_required(exc: BaseException) -> bool:
+    return (
+        isinstance(exc, ACPRequestError)
+        and "authentication required" in str(exc).casefold()
+    )
 
 
 # Session config-option id that selects the model on ACP servers that drive
@@ -4412,6 +4420,47 @@ class ACPAgent(AgentBase):
                 self._available_models,
                 self._model_override_applied,
             ) = self._executor.run_async(_init, timeout=self.acp_startup_timeout)
+        except ACPRequestError as exc:
+            with self._file_credential_lock:
+                codex_lifecycle = self._file_credential_lifecycles.get(
+                    CODEX_AUTH_SECRET_NAME
+                )
+            if (
+                self._startup_stage != "new_session"
+                or not _is_acp_authentication_required(exc)
+                or self._startup_provider_key != "codex"
+                or codex_lifecycle is None
+            ):
+                raise
+            resync_failed = False
+            try:
+                codex_lifecycle.resync_from_live()
+            except Exception:
+                resync_failed = True
+            try:
+                (
+                    self._conn,
+                    self._process,
+                    self._filtered_reader,
+                    self._session_id,
+                    self._agent_name,
+                    self._agent_version,
+                    self._current_model_id,
+                    self._available_models,
+                    self._model_override_applied,
+                ) = self._executor.run_async(_init, timeout=self.acp_startup_timeout)
+            except ACPRequestError as retry_exc:
+                if (
+                    self._startup_stage == "new_session"
+                    and _is_acp_authentication_required(retry_exc)
+                ):
+                    resync_detail = "; live auth resync failed" if resync_failed else ""
+                    raise RuntimeError(
+                        "Codex authentication failed after one retry; "
+                        f"stale credential suspected{resync_detail} "
+                        f"({codex_lifecycle.diagnostics()})"
+                    ) from None
+                raise
         except TimeoutError:
             raise TimeoutError(self._startup_timeout_message()) from None
         self._selector_model_id = self._current_model_id

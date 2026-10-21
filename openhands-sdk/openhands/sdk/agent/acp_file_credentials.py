@@ -8,6 +8,7 @@ import tempfile
 import threading
 import time
 from collections.abc import Callable, Coroutine, Mapping
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -53,6 +54,10 @@ class ACPFileCredentialLifecycle(Protocol):
     path: Path | None
 
     def materialize(self, registry: SecretRegistry, env: dict[str, str]) -> None: ...
+
+    def resync_from_live(self) -> bool: ...
+
+    def diagnostics(self) -> str: ...
 
     def track_current(self) -> None: ...
 
@@ -123,6 +128,45 @@ def is_valid_codex_auth(value: object) -> bool:
     )
 
 
+def _last_refresh(value: str) -> datetime | None:
+    try:
+        raw = json.loads(value).get("last_refresh")
+        if not isinstance(raw, str):
+            return None
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except (AttributeError, TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
+
+
+def _digest_prefix(value: str | None) -> str | None:
+    if value is None:
+        return None
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:8]
+
+
+def _read_live_codex_auth() -> str | None:
+    try:
+        value = (codex_auth_source_root() / "auth.json").read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return None
+    return value if is_valid_codex_auth(value) else None
+
+
+def _is_newer_live_auth(store_value: str, live_value: str | None) -> bool:
+    if live_value is None or store_value == live_value:
+        return False
+    store_refresh = _last_refresh(store_value)
+    live_refresh = _last_refresh(live_value)
+    return (
+        store_refresh is not None
+        and live_refresh is not None
+        and live_refresh > store_refresh
+    )
+
+
 def resolve_codex_auth_credentials(
     *,
     source_root: Path | None = None,
@@ -171,6 +215,8 @@ class _CodexAuthLifecycle:
 
     def materialize(self, registry: SecretRegistry, env: dict[str, str]) -> None:
         resolved = self._load()
+        live_value = _read_live_codex_auth()
+        resolved, outcome = self._reconcile_with_live(resolved, live_value)
         if not is_valid_codex_auth(resolved.value):
             raise CredentialNeedsReauthentication(
                 "ChatGPT authentication is invalid. Please sign in again."
@@ -204,7 +250,120 @@ class _CodexAuthLifecycle:
         self._monitor = monitor
         logger.info(
             "credential_binding_materialized",
-            extra={"credential": self.secret_name},
+            extra=self._diagnostic_extra(resolved.value, live_value, outcome),
+        )
+
+    def resync_from_live(self) -> bool:
+        """CAS-sync a newer host auth.json and refresh the isolated runtime file."""
+        with self._sync_lock:
+            resolved = self._load()
+            live_value = _read_live_codex_auth()
+            resolved, outcome = self._reconcile_with_live(resolved, live_value)
+            if not is_valid_codex_auth(resolved.value):
+                raise CredentialNeedsReauthentication(
+                    "ChatGPT authentication is invalid. Please sign in again."
+                )
+            digest = self._digest(resolved.value)
+            with self._lock:
+                path = self.path
+                changed = digest != self._local_digest
+            if path is None:
+                raise CredentialSyncError("Codex runtime credentials are unavailable.")
+            if changed:
+                self._track(resolved.value)
+                write_secret_file(path, resolved.value)
+            with self._lock:
+                self._expected_version = resolved.version
+                self._local_digest = digest
+            logger.info(
+                "credential_binding_resync",
+                extra=self._diagnostic_extra(resolved.value, live_value, outcome),
+            )
+            return changed
+
+    def diagnostics(self) -> str:
+        """Return token-free store/live refresh timestamps and digest prefixes."""
+        try:
+            store_value = self._load().value
+        except Exception:
+            store_value = None
+        live_value = _read_live_codex_auth()
+        return self._diagnostic_summary(store_value, live_value)
+
+    def _reconcile_with_live(
+        self,
+        resolved: ResolvedCredential,
+        live_value: str | None,
+    ) -> tuple[ResolvedCredential, str]:
+        if not _is_newer_live_auth(resolved.value, live_value):
+            return resolved, "kept_store"
+        assert live_value is not None
+        result, outcome, conflicted = self._replace_with_live(resolved, live_value)
+        if conflicted:
+            if _is_newer_live_auth(result.value, live_value):
+                result, _retry_outcome, _second_conflict = self._replace_with_live(
+                    result, live_value
+                )
+            outcome = "conflict_reloaded"
+        logger.info(
+            "credential_binding_replace",
+            extra=self._diagnostic_extra(result.value, live_value, outcome),
+        )
+        return result, outcome
+
+    def _replace_with_live(
+        self,
+        resolved: ResolvedCredential,
+        live_value: str,
+    ) -> tuple[ResolvedCredential, str, bool]:
+        try:
+            version = self.run_async(self.binding.replace(resolved.version, live_value))
+        except CredentialConflict:
+            return self._load_after_conflict(), "conflict_reloaded", True
+        except CredentialAuthorizationRejected:
+            return resolved, "kept_store", False
+        except CredentialSyncError:
+            latest = self._load_after_ambiguous_write()
+            adopted = latest is not None and latest.value == live_value
+            result = latest if latest is not None else resolved
+            outcome = "adopted_live" if adopted else "kept_store"
+            return result, outcome, False
+        if not isinstance(version, str) or not version:
+            raise CredentialSyncError("Credential source returned an invalid version.")
+        return ResolvedCredential(live_value, version), "adopted_live", False
+
+    def _diagnostic_extra(
+        self,
+        store_value: str | None,
+        live_value: str | None,
+        outcome: str,
+    ) -> dict[str, Any]:
+        return {
+            "credential": self.secret_name,
+            "outcome": outcome,
+            "store_digest": _digest_prefix(store_value),
+            "store_last_refresh": self._refresh_text(store_value),
+            "live_digest": _digest_prefix(live_value),
+            "live_last_refresh": self._refresh_text(live_value),
+        }
+
+    @staticmethod
+    def _refresh_text(value: str | None) -> str | None:
+        parsed = _last_refresh(value) if value is not None else None
+        return parsed.isoformat() if parsed is not None else None
+
+    def _diagnostic_summary(
+        self,
+        store_value: str | None,
+        live_value: str | None,
+    ) -> str:
+        store_refresh = self._refresh_text(store_value) or "unavailable"
+        live_refresh = self._refresh_text(live_value) or "unavailable"
+        store_digest = _digest_prefix(store_value) or "unavailable"
+        live_digest = _digest_prefix(live_value) or "unavailable"
+        return (
+            f"store(last_refresh={store_refresh}, digest={store_digest}); "
+            f"live(last_refresh={live_refresh}, digest={live_digest})"
         )
 
     def track_current(self) -> None:
@@ -596,6 +755,12 @@ class _ClaudeOAuthLifecycle(_CodexAuthLifecycle):
             "credential_binding_materialized",
             extra={"credential": self.secret_name},
         )
+
+    def resync_from_live(self) -> bool:
+        return False
+
+    def diagnostics(self) -> str:
+        return ""
 
     def _read_current(self) -> str | None:
         from openhands.sdk.agent.acp_claude_auth import (

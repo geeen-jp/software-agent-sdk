@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import threading
 import uuid
@@ -3461,6 +3462,124 @@ class TestSelectAuthMethod:
         assert runtime_dir is not None
         assert not runtime_dir.exists()
         assert not (tmp_path / "conversation" / "acp" / "codex" / "auth.json").exists()
+
+    @pytest.mark.parametrize("retry_fails", [False, True])
+    def test_codex_authentication_failure_resyncs_and_retries_once(
+        self, tmp_path, monkeypatch, retry_fails
+    ):
+        source_root = tmp_path / "host-codex"
+        source_root.mkdir()
+        live_path = source_root / "auth.json"
+        store = json.dumps(
+            {
+                "auth_mode": "chatgpt",
+                "tokens": {
+                    "refresh_token": "store-refresh-secret",
+                    "access_token": "store-access-secret",
+                },
+                "last_refresh": "2026-05-01T12:00:00Z",
+            }
+        )
+        live = json.dumps(
+            {
+                "auth_mode": "chatgpt",
+                "tokens": {
+                    "refresh_token": "live-refresh-secret",
+                    "access_token": "live-access-secret",
+                },
+                "last_refresh": "2026-05-02T12:00:00Z",
+            }
+        )
+        live_path.write_text(store, encoding="utf-8")
+        monkeypatch.setenv("OPENHANDS_CODEX_AUTH_SOURCE", str(source_root))
+
+        stored = {"value": store, "version": "v0"}
+        binding = MagicMock()
+
+        async def load():
+            return ResolvedCredential(stored["value"], stored["version"])
+
+        async def replace(expected_version, value):
+            assert expected_version == stored["version"]
+            stored.update(value=value, version="v1")
+            return "v1"
+
+        binding.load = AsyncMock(side_effect=load)
+        binding.replace = AsyncMock(side_effect=replace)
+        agent = ACPAgent(
+            acp_command=["codex-acp"],
+            acp_server="codex",
+            acp_isolate_data_dir=True,
+        )
+        agent.activate_file_credential_binding("CODEX_AUTH_JSON", binding)
+        state = ConversationState.create(
+            id=uuid.uuid4(),
+            agent=agent,
+            workspace=LocalWorkspace(working_dir=str(tmp_path / "workspace")),
+            persistence_dir=str(tmp_path / "conversation"),
+        )
+        conn = TestACPSessionIdPersistence._make_conn()
+        conn.initialize.return_value.agent_info.name = "codex-acp"
+        conn.initialize.return_value.auth_methods = [self._make_auth_method("chat-gpt")]
+        session_response = conn.new_session.return_value
+        session_attempts = 0
+
+        async def new_session(**_kwargs):
+            nonlocal session_attempts
+            session_attempts += 1
+            if session_attempts == 1:
+                live_path.write_text(live, encoding="utf-8")
+                raise ACPRequestError.auth_required()
+            if retry_fails:
+                raise ACPRequestError.auth_required()
+            return session_response
+
+        conn.new_session = AsyncMock(side_effect=new_session)
+        process_envs: list[dict[str, str]] = []
+        processes = []
+
+        async def capture_subprocess(*_args, env=None, **_kwargs):
+            process = MagicMock()
+            process.stdin = MagicMock()
+            process.stdout = MagicMock()
+            process.stdout.readline = AsyncMock(return_value=b"")
+            process.wait = AsyncMock(return_value=0)
+            process.returncode = 0
+            process.stderr = None
+            processes.append(process)
+            process_envs.append(dict(env or {}))
+            return process
+
+        try:
+            with TestACPSessionIdPersistence._mocked_acp_runtime(agent, conn):
+                with patch(
+                    "openhands.sdk.agent.acp_agent.asyncio.create_subprocess_exec",
+                    new=capture_subprocess,
+                ):
+                    if retry_fails:
+                        with pytest.raises(
+                            RuntimeError, match="stale credential"
+                        ) as exc:
+                            agent._start_acp_server(state)
+                        detail = str(exc.value)
+                        assert "2026-05-02T12:00:00+00:00" in detail
+                        assert hashlib.sha256(live.encode()).hexdigest()[:8] in detail
+                        assert "live-refresh-secret" not in detail
+                        assert "live-access-secret" not in detail
+                    else:
+                        agent._start_acp_server(state)
+
+                assert session_attempts == 2
+                assert conn.new_session.await_count == 2
+                assert len(processes) == 2
+                runtime_auth = Path(process_envs[1]["CODEX_HOME"]) / "auth.json"
+                assert runtime_auth.read_text(encoding="utf-8") == live
+                assert stored["value"] == live
+                binding.replace.assert_awaited_once()
+                agent.close()
+        finally:
+            if not agent._closed:
+                agent.close()
 
     def test_codex_chatgpt_file_auth_defers_explicit_auth(self, tmp_path, caplog):
         agent = ACPAgent(
