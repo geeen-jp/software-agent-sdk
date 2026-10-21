@@ -3,6 +3,7 @@ import json
 import threading
 import time
 from collections.abc import Coroutine
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, cast
 from unittest.mock import patch
 
@@ -24,16 +25,22 @@ from openhands.sdk.credential import (
 )
 
 
-def _auth(refresh_token: str, access_token: str = "access") -> str:
-    return json.dumps(
-        {
-            "auth_mode": "chatgpt",
-            "tokens": {
-                "refresh_token": refresh_token,
-                "access_token": access_token,
-            },
-        }
-    )
+def _auth(
+    refresh_token: str,
+    access_token: str = "access",
+    *,
+    last_refresh: str | None = None,
+) -> str:
+    value: dict[str, Any] = {
+        "auth_mode": "chatgpt",
+        "tokens": {
+            "refresh_token": refresh_token,
+            "access_token": access_token,
+        },
+    }
+    if last_refresh is not None:
+        value["last_refresh"] = last_refresh
+    return json.dumps(value)
 
 
 def _claude_auth(
@@ -61,17 +68,51 @@ class MemoryBinding:
         self.value = value
         self.generation = 0
         self.replace_calls = 0
+        self._lock = threading.Lock()
 
     async def load(self) -> ResolvedCredential:
-        return ResolvedCredential(self.value, str(self.generation))
+        with self._lock:
+            return ResolvedCredential(self.value, str(self.generation))
 
     async def replace(self, expected_version: str, value: str) -> str:
-        if expected_version != str(self.generation):
+        with self._lock:
+            if expected_version != str(self.generation):
+                raise CredentialConflict("conflict")
+            self.replace_calls += 1
+            self.generation += 1
+            self.value = value
+            return str(self.generation)
+
+
+class ConcurrentBinding(MemoryBinding):
+    def __init__(self, value: str) -> None:
+        super().__init__(value)
+        self.loads = threading.Barrier(2)
+        self.load_calls = 0
+
+    async def load(self) -> ResolvedCredential:
+        with self._lock:
+            self.load_calls += 1
+            wait_for_concurrent_loads = self.load_calls <= 2
+        if wait_for_concurrent_loads:
+            await asyncio.to_thread(self.loads.wait, 2)
+        return await super().load()
+
+
+class ConflictReloadBinding(MemoryBinding):
+    def __init__(self, value: str, competing_value: str) -> None:
+        super().__init__(value)
+        self.competing_value = competing_value
+        self.replace_attempts = 0
+
+    async def replace(self, expected_version: str, value: str) -> str:
+        self.replace_attempts += 1
+        if self.replace_attempts == 1:
+            with self._lock:
+                self.value = self.competing_value
+                self.generation += 1
             raise CredentialConflict("conflict")
-        self.replace_calls += 1
-        self.generation += 1
-        self.value = value
-        return str(self.generation)
+        return await super().replace(expected_version, value)
 
 
 class AmbiguousBinding(MemoryBinding):
@@ -216,6 +257,238 @@ def test_resolve_codex_auth_credentials_uses_explicit_source_environment(
     monkeypatch.setenv("OPENHANDS_CODEX_AUTH_SOURCE", str(source_root))
 
     assert resolve_codex_auth_credentials() == credentials
+
+
+def test_materialize_adopts_newer_live_auth_with_cas_and_redacted_logging(
+    tmp_path, monkeypatch, caplog
+) -> None:
+    source_root = tmp_path / "live-codex"
+    source_root.mkdir()
+    live = _auth(
+        "refresh-live-secret",
+        "access-live-secret",
+        last_refresh="2026-05-02T12:00:00Z",
+    )
+    live_path = source_root / "auth.json"
+    live_path.write_text(live, encoding="utf-8")
+    monkeypatch.setenv("OPENHANDS_CODEX_AUTH_SOURCE", str(source_root))
+    binding = MemoryBinding(
+        _auth(
+            "refresh-store-secret",
+            "access-store-secret",
+            last_refresh="2026-05-01T12:00:00Z",
+        )
+    )
+
+    with caplog.at_level("INFO", logger="openhands.sdk.agent.acp_file_credentials"):
+        lifecycle, _ = _lifecycle(binding, SecretRegistry())
+    path = lifecycle.path
+    assert path is not None
+    try:
+        assert path.read_text(encoding="utf-8") == live
+        assert binding.value == live
+        assert binding.replace_calls == 1
+        assert live_path.read_text(encoding="utf-8") == live
+        materialized = next(
+            record
+            for record in caplog.records
+            if record.msg == "credential_binding_materialized"
+        )
+        assert materialized.outcome == "adopted_live"
+        assert "refresh-live-secret" not in caplog.text
+        assert "access-live-secret" not in caplog.text
+        assert "refresh-store-secret" not in caplog.text
+        assert "access-store-secret" not in caplog.text
+    finally:
+        lifecycle.close()
+
+
+@pytest.mark.parametrize(
+    ("store_refresh", "live_refresh", "live_valid", "live_exists"),
+    [
+        ("2026-05-02T00:00:00Z", "2026-05-01T00:00:00Z", True, True),
+        ("2026-05-01T00:00:00Z", "2026-05-01T00:00:00Z", True, True),
+        (None, "2026-05-02T00:00:00Z", True, True),
+        ("2026-05-01T00:00:00Z", "invalid", True, True),
+        ("2026-05-01T00:00:00Z", "2026-05-02T00:00:00Z", False, True),
+        ("2026-05-01T00:00:00Z", "2026-05-02T00:00:00Z", True, False),
+    ],
+)
+def test_materialize_keeps_store_unless_live_is_valid_and_strictly_newer(
+    tmp_path,
+    monkeypatch,
+    store_refresh: str | None,
+    live_refresh: str,
+    live_valid: bool,
+    live_exists: bool,
+) -> None:
+    source_root = tmp_path / "live-codex"
+    source_root.mkdir()
+    store = _auth("refresh-store", last_refresh=store_refresh)
+    live = (
+        _auth("refresh-live", last_refresh=live_refresh)
+        if live_valid
+        else json.dumps(
+            {
+                "auth_mode": "chatgpt",
+                "tokens": {},
+                "last_refresh": live_refresh,
+            }
+        )
+    )
+    live_path = source_root / "auth.json"
+    if live_exists:
+        live_path.write_text(live, encoding="utf-8")
+    monkeypatch.setenv("OPENHANDS_CODEX_AUTH_SOURCE", str(source_root))
+    binding = MemoryBinding(store)
+
+    lifecycle, _ = _lifecycle(binding, SecretRegistry())
+    path = lifecycle.path
+    assert path is not None
+    try:
+        assert path.read_text(encoding="utf-8") == store
+        assert binding.value == store
+        assert binding.replace_calls == 0
+        if live_exists:
+            assert live_path.read_text(encoding="utf-8") == live
+    finally:
+        lifecycle.close()
+
+
+def test_materialize_conflict_reloads_store_once_and_keeps_newer_value(
+    tmp_path, monkeypatch, caplog
+) -> None:
+    source_root = tmp_path / "live-codex"
+    source_root.mkdir()
+    live = _auth("refresh-live", last_refresh="2026-05-02T00:00:00Z")
+    (source_root / "auth.json").write_text(live, encoding="utf-8")
+    monkeypatch.setenv("OPENHANDS_CODEX_AUTH_SOURCE", str(source_root))
+    competing = _auth("refresh-competing", last_refresh="2026-05-03T00:00:00Z")
+    binding = ConflictReloadBinding(
+        _auth("refresh-store", last_refresh="2026-05-01T00:00:00Z"), competing
+    )
+
+    with caplog.at_level("INFO", logger="openhands.sdk.agent.acp_file_credentials"):
+        lifecycle, _ = _lifecycle(binding, SecretRegistry())
+    path = lifecycle.path
+    assert path is not None
+    try:
+        assert path.read_text(encoding="utf-8") == competing
+        assert binding.value == competing
+        assert binding.replace_attempts == 1
+        materialized = next(
+            record
+            for record in caplog.records
+            if record.msg == "credential_binding_materialized"
+        )
+        assert materialized.outcome == "conflict_reloaded"
+    finally:
+        lifecycle.close()
+
+
+def test_concurrent_materialize_cas_converges_on_live_auth(
+    tmp_path, monkeypatch
+) -> None:
+    source_root = tmp_path / "live-codex"
+    source_root.mkdir()
+    live = _auth("refresh-live", last_refresh="2026-05-02T00:00:00Z")
+    live_path = source_root / "auth.json"
+    live_path.write_text(live, encoding="utf-8")
+    monkeypatch.setenv("OPENHANDS_CODEX_AUTH_SOURCE", str(source_root))
+    binding = ConcurrentBinding(
+        _auth("refresh-store", last_refresh="2026-05-01T00:00:00Z")
+    )
+
+    def materialize():
+        lifecycle = create_file_credential_lifecycle(
+            CODEX_AUTH_SECRET_NAME, binding, _run
+        )
+        assert lifecycle is not None
+        lifecycle.materialize(SecretRegistry(), {})
+        return lifecycle
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first_future = executor.submit(materialize)
+        second_future = executor.submit(materialize)
+        first = first_future.result(timeout=5)
+        second = second_future.result(timeout=5)
+    try:
+        assert first.path is not None
+        assert second.path is not None
+        assert first.path.read_text(encoding="utf-8") == live
+        assert second.path.read_text(encoding="utf-8") == live
+        assert binding.value == live
+        assert binding.replace_calls == 1
+        assert live_path.read_text(encoding="utf-8") == live
+    finally:
+        first.close()
+        second.close()
+
+
+def test_resync_from_live_rewrites_runtime_auth_once(tmp_path, monkeypatch) -> None:
+    source_root = tmp_path / "live-codex"
+    source_root.mkdir()
+    monkeypatch.setenv("OPENHANDS_CODEX_AUTH_SOURCE", str(source_root))
+    store = _auth("refresh-store", last_refresh="2026-05-01T00:00:00Z")
+    live = _auth("refresh-live", last_refresh="2026-05-02T00:00:00Z")
+    binding = MemoryBinding(store)
+    lifecycle, _ = _lifecycle(binding, SecretRegistry())
+    path = lifecycle.path
+    assert path is not None
+    live_path = source_root / "auth.json"
+    live_path.write_text(live, encoding="utf-8")
+
+    try:
+        assert lifecycle.resync_from_live()
+        assert path.read_text(encoding="utf-8") == live
+        assert binding.value == live
+        assert not lifecycle.resync_from_live()
+        assert binding.replace_calls == 1
+    finally:
+        lifecycle.close()
+
+
+def test_resync_clears_conflict_and_resumes_monitor(tmp_path, monkeypatch) -> None:
+    source_root = tmp_path / "live-codex"
+    source_root.mkdir()
+    monkeypatch.setenv("OPENHANDS_CODEX_AUTH_SOURCE", str(source_root))
+    store = _auth("refresh-store", last_refresh="2026-05-01T00:00:00Z")
+    competing = _auth("refresh-competing", last_refresh="2026-05-02T00:00:00Z")
+    live = _auth("refresh-live", last_refresh="2026-05-03T00:00:00Z")
+    binding = ConflictReloadBinding(store, competing)
+    lifecycle, _ = _lifecycle(binding, SecretRegistry())
+    runtime = cast(Any, lifecycle)
+    path = lifecycle.path
+    assert path is not None
+
+    try:
+        path.write_text(_auth("refresh-local"), encoding="utf-8")
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            with runtime._lock:
+                if isinstance(runtime._error, CredentialConflict):
+                    break
+            time.sleep(0.02)
+        with runtime._lock:
+            assert isinstance(runtime._error, CredentialConflict)
+        assert runtime._monitor is not None
+        assert runtime._monitor.is_alive()
+
+        (source_root / "auth.json").write_text(live, encoding="utf-8")
+        assert lifecycle.resync_from_live()
+
+        with runtime._lock:
+            assert runtime._error is None
+        assert path.read_text(encoding="utf-8") == live
+        assert binding.value == live
+        lifecycle.flush()
+
+        rotated = _auth("refresh-after-resync")
+        path.write_text(rotated, encoding="utf-8")
+        _wait_for_value(binding, rotated)
+        assert runtime._monitor.is_alive()
+    finally:
+        lifecycle.close()
 
 
 @pytest.mark.parametrize(
