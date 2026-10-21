@@ -448,6 +448,49 @@ def test_resync_from_live_rewrites_runtime_auth_once(tmp_path, monkeypatch) -> N
         lifecycle.close()
 
 
+def test_resync_clears_conflict_and_resumes_monitor(tmp_path, monkeypatch) -> None:
+    source_root = tmp_path / "live-codex"
+    source_root.mkdir()
+    monkeypatch.setenv("OPENHANDS_CODEX_AUTH_SOURCE", str(source_root))
+    store = _auth("refresh-store", last_refresh="2026-05-01T00:00:00Z")
+    competing = _auth("refresh-competing", last_refresh="2026-05-02T00:00:00Z")
+    live = _auth("refresh-live", last_refresh="2026-05-03T00:00:00Z")
+    binding = ConflictReloadBinding(store, competing)
+    lifecycle, _ = _lifecycle(binding, SecretRegistry())
+    runtime = cast(Any, lifecycle)
+    path = lifecycle.path
+    assert path is not None
+
+    try:
+        path.write_text(_auth("refresh-local"), encoding="utf-8")
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            with runtime._lock:
+                if isinstance(runtime._error, CredentialConflict):
+                    break
+            time.sleep(0.02)
+        with runtime._lock:
+            assert isinstance(runtime._error, CredentialConflict)
+        assert runtime._monitor is not None
+        assert runtime._monitor.is_alive()
+
+        (source_root / "auth.json").write_text(live, encoding="utf-8")
+        assert lifecycle.resync_from_live()
+
+        with runtime._lock:
+            assert runtime._error is None
+        assert path.read_text(encoding="utf-8") == live
+        assert binding.value == live
+        lifecycle.flush()
+
+        rotated = _auth("refresh-after-resync")
+        path.write_text(rotated, encoding="utf-8")
+        _wait_for_value(binding, rotated)
+        assert runtime._monitor.is_alive()
+    finally:
+        lifecycle.close()
+
+
 @pytest.mark.parametrize(
     "contents",
     [None, "not-json", json.dumps({"auth_mode": "chatgpt", "tokens": {}})],

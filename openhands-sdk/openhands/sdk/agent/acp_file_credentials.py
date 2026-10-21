@@ -275,6 +275,8 @@ class _CodexAuthLifecycle:
             with self._lock:
                 self._expected_version = resolved.version
                 self._local_digest = digest
+                if isinstance(self._error, CredentialConflict):
+                    self._error = None
             logger.info(
                 "credential_binding_resync",
                 extra=self._diagnostic_extra(resolved.value, live_value, outcome),
@@ -446,17 +448,23 @@ class _CodexAuthLifecycle:
         failure_logged = False
         retry_interval = _MONITOR_INTERVAL_SECONDS
         while not self._stop.wait(retry_interval):
+            conflict_paused = False
             try:
                 with self._sync_lock:
-                    self._raise_sticky_error()
-                    value = self._read_stable(attempts=1)
-                    if value is not None:
-                        self._sync_value(value)
-                        failure_logged = False
-                    retry_interval = _MONITOR_INTERVAL_SECONDS
+                    try:
+                        self._raise_sticky_error()
+                        value = self._read_stable(attempts=1)
+                        if value is not None:
+                            self._sync_value(value)
+                            failure_logged = False
+                        retry_interval = _MONITOR_INTERVAL_SECONDS
+                    except CredentialConflict as exc:
+                        # Keep the monitor available for an explicit resync to
+                        # clear a conflict and resume credential writeback.
+                        self._set_error(exc)
+                        conflict_paused = True
             except (
                 CredentialNeedsReauthentication,
-                CredentialConflict,
                 CredentialInvalidResponse,
             ) as exc:
                 self._set_error(exc)
@@ -481,6 +489,12 @@ class _CodexAuthLifecycle:
                     retry_interval * 2,
                     _MONITOR_MAX_RETRY_INTERVAL_SECONDS,
                 )
+            if conflict_paused:
+                retry_interval = _MONITOR_INTERVAL_SECONDS
+                while not self._stop.wait(retry_interval):
+                    with self._lock:
+                        if not isinstance(self._error, CredentialConflict):
+                            break
 
     def _read_current(self) -> str | None:
         with self._lock:
