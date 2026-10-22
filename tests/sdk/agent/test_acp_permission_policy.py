@@ -161,6 +161,7 @@ def _read_only_allowed(tool_call: object) -> bool:
         "git --no-pager diff --no-ext-diff --no-textconv HEAD",
         "git --no-pager diff --no-ext-diff --no-textconv /etc/hosts README.md",
         "git --no-pager status --short",
+        "git --no-pager status -- --verbose",
         "rg --no-config foo",
         "rg --no-config foo | head -20",
         "cat README.md",
@@ -239,6 +240,12 @@ def test_read_only_denies_mutating_tool_kinds(tool_call: object) -> None:
         "git --no-pager show --no-ext-diff HEAD",
         "git --no-pager log --oneline",
         "git --no-pager diff --no-ext-diff --no-textconv --ext-diff HEAD",
+        # Verbose status emits patches, which can invoke diff/textconv helpers.
+        "git --no-pager status -v",
+        "git --no-pager status -vv",
+        "git --no-pager status -sbv",
+        "git --no-pager status --verbose",
+        "git --no-pager status --verb",
         # --no-config must be effective, and inline ripgrep config is not
         # permitted under the read-only policy.
         "rg README README.md",

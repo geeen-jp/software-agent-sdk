@@ -246,6 +246,13 @@ _GIT_SIDE_EFFECT_OPTIONS: frozenset[str] = frozenset(
 )
 
 
+def _is_git_status_verbose_option(arg: str) -> bool:
+    if arg.startswith("--"):
+        option = arg[2:].partition("=")[0].removeprefix("no-")
+        return bool(option) and "verbose".startswith(option)
+    return arg.startswith("-") and "v" in arg[1:]
+
+
 def _read_only_simple_command_allowed(command: str) -> bool:
     try:
         argv = shlex.split(command, posix=True)
@@ -311,6 +318,16 @@ def _read_only_simple_command_allowed(command: str) -> bool:
         subcommand, *git_args = args[1:]
         if subcommand not in _READ_ONLY_GIT_COMMANDS:
             return False
+        if subcommand == "status":
+            # `git status -v` and `-vv` emit staged and working-tree patches,
+            # which can run external diff and textconv helpers. Git accepts
+            # abbreviated long options and clustered short options, so reject
+            # every spelling of the verbose flag before the pathspec delimiter.
+            status_options = (
+                git_args[: git_args.index("--")] if "--" in git_args else git_args
+            )
+            if any(_is_git_status_verbose_option(arg) for arg in status_options):
+                return False
         if subcommand in {"diff", "log", "show"}:
             # These commands can invoke diff.external / GIT_EXTERNAL_DIFF and
             # configured textconv drivers. Require the disabling flags
