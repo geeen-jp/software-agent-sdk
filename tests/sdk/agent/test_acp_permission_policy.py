@@ -155,13 +155,14 @@ def _read_only_allowed(tool_call: object) -> bool:
     [
         "ls",
         "ls -la src",
-        "git ls-files",
-        "git log --oneline",
-        "git show HEAD",
-        "git diff HEAD",
-        "git status --short",
-        "rg foo",
-        "rg foo | head -20",
+        "git --no-pager ls-files",
+        "git --no-pager log --no-ext-diff --no-textconv --oneline",
+        "git --no-pager show --no-ext-diff --no-textconv HEAD",
+        "git --no-pager diff --no-ext-diff --no-textconv HEAD",
+        "git --no-pager diff --no-ext-diff --no-textconv /etc/hosts README.md",
+        "git --no-pager status --short",
+        "rg --no-config foo",
+        "rg --no-config foo | head -20",
         "cat README.md",
         "head -20 README.md",
         "tail -n 5 README.md",
@@ -188,7 +189,10 @@ def test_read_only_accepts_typed_tool_call_and_argv_command() -> None:
     )
     assert _read_only_allowed(typed_tool_call)
     assert _read_only_allowed(
-        {"kind": "execute", "raw_input": {"command": ["git", "ls-files"]}}
+        {
+            "kind": "execute",
+            "raw_input": {"command": ["git", "--no-pager", "ls-files"]},
+        }
     )
 
 
@@ -227,6 +231,19 @@ def test_read_only_denies_mutating_tool_kinds(tool_call: object) -> None:
         "git diff -o f",
         "git diff *",
         "git diff {,--output=f}",
+        # Configured external diff and textconv helpers must be disabled
+        # explicitly on every approved Git invocation that can use them.
+        "git diff /etc/hosts README.md",
+        "git --no-pager diff HEAD",
+        "git --no-pager diff --no-ext-diff HEAD",
+        "git --no-pager show --no-ext-diff HEAD",
+        "git --no-pager log --oneline",
+        "git --no-pager diff --no-ext-diff --no-textconv --ext-diff HEAD",
+        # --no-config must be effective, and inline ripgrep config is not
+        # permitted under the read-only policy.
+        "rg README README.md",
+        "rg --config pre=/bin/echo README README.md",
+        "rg --no-config --config pre=/bin/echo README README.md",
         "sed -i s/a/b/ f",
         "find . -delete",
         "find . -exec rm {} +",

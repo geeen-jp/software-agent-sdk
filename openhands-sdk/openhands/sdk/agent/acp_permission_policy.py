@@ -267,15 +267,30 @@ def _read_only_simple_command_allowed(command: str) -> bool:
             for arg in args
         ):
             return False
-        if executable == "rg" and any(
-            arg in {"-z", "--search-zip", "--pre", "--pre-glob", "--hostname-bin"}
-            or arg.startswith("--pre=")
-            or arg.startswith("--pre-glob=")
-            or arg.startswith("--hostname-bin=")
-            or (arg.startswith("-") and not arg.startswith("--") and "z" in arg[1:])
-            for arg in args
-        ):
-            return False
+        if executable == "rg":
+            # Require this before any pattern/path so it cannot be mistaken
+            # for an operand. It disables RIPGREP_CONFIG_PATH as well as the
+            # default config file for this invocation.
+            if not args or args[0] != "--no-config":
+                return False
+            if any(
+                arg
+                in {
+                    "-z",
+                    "--search-zip",
+                    "--pre",
+                    "--pre-glob",
+                    "--hostname-bin",
+                    "--config",
+                }
+                or arg.startswith("--pre=")
+                or arg.startswith("--pre-glob=")
+                or arg.startswith("--hostname-bin=")
+                or arg.startswith("--config=")
+                or (arg.startswith("-") and not arg.startswith("--") and "z" in arg[1:])
+                for arg in args[1:]
+            ):
+                return False
         return True
 
     if executable == "find":
@@ -286,9 +301,23 @@ def _read_only_simple_command_allowed(command: str) -> bool:
         )
 
     if executable == "git" and args:
-        subcommand, *git_args = args
+        # A command-configured pager can run an arbitrary program when git's
+        # output is attached to a terminal. Keep this global option before the
+        # subcommand so Git applies it to every approved inspection command.
+        if args[0] != "--no-pager":
+            return False
+        if len(args) < 2:
+            return False
+        subcommand, *git_args = args[1:]
         if subcommand not in _READ_ONLY_GIT_COMMANDS:
             return False
+        if subcommand in {"diff", "log", "show"}:
+            # These commands can invoke diff.external / GIT_EXTERNAL_DIFF and
+            # configured textconv drivers. Require the disabling flags
+            # immediately after the subcommand, before any pathspec delimiter.
+            if git_args[:2] != ["--no-ext-diff", "--no-textconv"]:
+                return False
+            git_args = git_args[2:]
         return not any(
             arg in _GIT_SIDE_EFFECT_OPTIONS
             or arg.startswith("--output=")
