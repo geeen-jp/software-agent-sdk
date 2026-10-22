@@ -202,16 +202,11 @@ def _deny_option_id(options: list[object]) -> str | None:
 
 
 def _allow_option_id(options: list[object]) -> str | None:
-    for expected_kind in ("allow_once", "allow_always"):
-        for option in options:
-            if _permission_option_kind(option) == expected_kind:
-                option_id = _permission_option_id(option)
-                if option_id is not None:
-                    return option_id
-    for expected_id in ("allow_once", "allow_always"):
-        for option in options:
-            if _permission_option_id(option) == expected_id:
-                return expected_id
+    for option in options:
+        if _permission_option_kind(option) == "allow_once":
+            option_id = _permission_option_id(option)
+            if option_id is not None:
+                return option_id
     return None
 
 

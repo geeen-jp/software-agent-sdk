@@ -266,6 +266,27 @@ def test_read_only_does_not_invent_allow_option() -> None:
     assert isinstance(response.outcome, DeniedOutcome)
 
 
+@pytest.mark.parametrize(
+    "option",
+    [
+        PermissionOption(
+            kind="allow_always",
+            name="Always allow",
+            option_id="allow_always",
+        ),
+        SimpleNamespace(kind="read", option_id="allow_once"),
+        SimpleNamespace(option_id="allow_once"),
+    ],
+)
+def test_read_only_requires_allow_once_option_kind(option: object) -> None:
+    response = resolve_permission_response(
+        "read_only",
+        [option],
+        {"kind": "execute", "raw_input": {"command": "ls"}},
+    )
+    assert isinstance(response.outcome, DeniedOutcome)
+
+
 @pytest.mark.asyncio
 async def test_read_only_falls_back_to_cancelled_without_deny_option() -> None:
     bridge = _OpenHandsACPBridge(permission_policy="read_only")
