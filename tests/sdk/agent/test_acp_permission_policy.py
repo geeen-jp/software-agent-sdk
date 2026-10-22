@@ -19,6 +19,7 @@ from acp.schema import (
     SessionMode,
     SessionModeState,
     SetSessionConfigOptionResponse,
+    ToolCallUpdate,
 )
 
 from openhands.sdk.agent import acp_agent as acp_agent_module
@@ -137,6 +138,179 @@ def test_read_only_selects_reject_once_when_always_is_absent() -> None:
     assert response.outcome.option_id == "reject_once"
 
 
+def _read_only_allowed(tool_call: object) -> bool:
+    options: list[object] = [
+        PermissionOption(kind="allow_once", name="Allow", option_id="allow_once"),
+        PermissionOption(kind="reject_once", name="Reject", option_id="reject_once"),
+    ]
+    response = resolve_permission_response("read_only", options, tool_call)
+    return (
+        isinstance(response.outcome, AllowedOutcome)
+        and response.outcome.option_id == "allow_once"
+    )
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "ls",
+        "ls -la src",
+        "git --no-pager ls-files",
+        "git --no-pager log --no-ext-diff --no-textconv --oneline",
+        "git --no-pager show --no-ext-diff --no-textconv HEAD",
+        "git --no-pager diff --no-ext-diff --no-textconv HEAD",
+        "git --no-pager diff --no-ext-diff --no-textconv /etc/hosts README.md",
+        "git --no-pager status --short",
+        "git --no-pager status -- --verbose",
+        "rg --no-config foo",
+        "rg --no-config foo | head -20",
+        "cat README.md",
+        "head -20 README.md",
+        "tail -n 5 README.md",
+        "wc README.md",
+        "find . -name '*.py'",
+        "pwd",
+    ],
+)
+def test_read_only_allows_repository_inspection_commands(command: str) -> None:
+    assert _read_only_allowed({"kind": "execute", "rawInput": {"command": command}})
+
+
+@pytest.mark.parametrize("kind", ["read", "search"])
+def test_read_only_allows_read_and_search_tool_kinds(kind: str) -> None:
+    assert _read_only_allowed({"kind": kind})
+
+
+def test_read_only_accepts_typed_tool_call_and_argv_command() -> None:
+    typed_tool_call = ToolCallUpdate(
+        tool_call_id="call-1",
+        kind="execute",
+        title="Bash",
+        raw_input={"command": "ls"},
+    )
+    assert _read_only_allowed(typed_tool_call)
+    assert _read_only_allowed(
+        {
+            "kind": "execute",
+            "raw_input": {"command": ["git", "--no-pager", "ls-files"]},
+        }
+    )
+
+
+@pytest.mark.parametrize(
+    "tool_call",
+    [
+        {"kind": "edit"},
+        {"kind": "delete"},
+        {"kind": "move"},
+    ],
+)
+def test_read_only_denies_mutating_tool_kinds(tool_call: object) -> None:
+    assert not _read_only_allowed(tool_call)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "echo x > f",
+        "echo x >> f",
+        "rm f",
+        "ls; rm f",
+        "ls && rm f",
+        "ls || rm f",
+        "ls `rm f`",
+        "ls $(rm f)",
+        "cat f | sh",
+        "cat f | tee g",
+        "git commit -m x",
+        "git checkout .",
+        "git -c core.pager=sh log",
+        "git diff --output=f",
+        "git diff --ext-diff",
+        "git show --textconv",
+        "git log --paginate",
+        "git diff -o f",
+        "git diff *",
+        "git diff {,--output=f}",
+        # Configured external diff and textconv helpers must be disabled
+        # explicitly on every approved Git invocation that can use them.
+        "git diff /etc/hosts README.md",
+        "git --no-pager diff HEAD",
+        "git --no-pager diff --no-ext-diff HEAD",
+        "git --no-pager show --no-ext-diff HEAD",
+        "git --no-pager log --oneline",
+        "git --no-pager diff --no-ext-diff --no-textconv --ext-diff HEAD",
+        # Verbose status emits patches, which can invoke diff/textconv helpers.
+        "git --no-pager status -v",
+        "git --no-pager status -vv",
+        "git --no-pager status -sbv",
+        "git --no-pager status --verbose",
+        "git --no-pager status --verb",
+        # --no-config must be effective, and inline ripgrep config is not
+        # permitted under the read-only policy.
+        "rg README README.md",
+        "rg --config pre=/bin/echo README README.md",
+        "rg --no-config --config pre=/bin/echo README README.md",
+        "sed -i s/a/b/ f",
+        "find . -delete",
+        "find . -exec rm {} +",
+        "find . -*",
+        "curl http://x",
+        "rg --pre sh foo",
+        "tail -f log",
+        "tail -Fv log",
+    ],
+)
+def test_read_only_denies_writes_and_unapproved_commands(command: str) -> None:
+    assert not _read_only_allowed(
+        {"kind": "execute", "raw_input": {"command": command}}
+    )
+
+
+def test_read_only_fails_closed_for_malformed_tool_calls() -> None:
+    tool_calls: list[object] = [
+        {"kind": "execute"},
+        {"kind": "execute", "raw_input": {}},
+        {"kind": "execute", "raw_input": {"command": 7}},
+        {"kind": "execute", "raw_input": {"command": "ls 'unfinished"}},
+        {"kind": "unknown", "raw_input": {"command": "ls"}},
+        {"kind": "unknown"},
+        {"kind": "execute", "title": "ls"},
+        {"kind": [], "raw_input": {"command": "ls"}},
+    ]
+    assert all(not _read_only_allowed(tool_call) for tool_call in tool_calls)
+
+
+def test_read_only_does_not_invent_allow_option() -> None:
+    response = resolve_permission_response(
+        "read_only",
+        [SimpleNamespace(kind="maybe", option_id="maybe")],
+        {"kind": "execute", "raw_input": {"command": "ls"}},
+    )
+    assert isinstance(response.outcome, DeniedOutcome)
+
+
+@pytest.mark.parametrize(
+    "option",
+    [
+        PermissionOption(
+            kind="allow_always",
+            name="Always allow",
+            option_id="allow_always",
+        ),
+        SimpleNamespace(kind="read", option_id="allow_once"),
+        SimpleNamespace(option_id="allow_once"),
+    ],
+)
+def test_read_only_requires_allow_once_option_kind(option: object) -> None:
+    response = resolve_permission_response(
+        "read_only",
+        [option],
+        {"kind": "execute", "raw_input": {"command": "ls"}},
+    )
+    assert isinstance(response.outcome, DeniedOutcome)
+
+
 @pytest.mark.asyncio
 async def test_read_only_falls_back_to_cancelled_without_deny_option() -> None:
     bridge = _OpenHandsACPBridge(permission_policy="read_only")
@@ -154,6 +328,23 @@ async def test_read_only_policy_denies_unknown_permissions() -> None:
     bridge = _OpenHandsACPBridge(permission_policy="read_only")
     response = await bridge.request_permission([], "sess-1", {"kind": "unknown"})
     assert isinstance(response.outcome, DeniedOutcome)
+
+
+@pytest.mark.asyncio
+async def test_read_only_bridge_allows_repository_inspection() -> None:
+    bridge = _OpenHandsACPBridge(permission_policy="read_only")
+    response = await bridge.request_permission(
+        [PermissionOption(kind="allow_once", name="Allow", option_id="allow_once")],
+        "sess-1",
+        ToolCallUpdate(
+            tool_call_id="call-1",
+            kind="execute",
+            title="Bash",
+            raw_input={"command": "ls"},
+        ),
+    )
+    assert isinstance(response.outcome, AllowedOutcome)
+    assert response.outcome.option_id == "allow_once"
 
 
 def test_read_only_session_mode_fails_closed_for_unverified_providers() -> None:
@@ -1683,7 +1874,11 @@ def test_permission_logs_omit_tool_call_payload(
         },
     }
     with caplog.at_level("INFO", logger="openhands.sdk.agent.acp_permission_policy"):
-        resolve_permission_response("read_only", [], payload)
+        resolve_permission_response(
+            "read_only",
+            [SimpleNamespace(kind="allow_once", option_id="allow_once")],
+            payload,
+        )
         resolve_permission_response(
             "writable",
             [SimpleNamespace(option_id="allow_once")],
