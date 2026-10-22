@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shlex
 from collections.abc import Mapping
 from types import MappingProxyType
 from typing import Literal, cast
@@ -172,6 +173,17 @@ def _permission_option_kind(option: object) -> str | None:
     return _option_str(option, "kind")
 
 
+def _tool_call_field(tool_call: object, *names: str) -> object | None:
+    for name in names:
+        if isinstance(tool_call, Mapping):
+            value = tool_call.get(name)
+        else:
+            value = getattr(tool_call, name, None)
+        if value is not None:
+            return value
+    return None
+
+
 def _deny_option_id(options: list[object]) -> str | None:
     ranked: list[tuple[int, str]] = []
     for option in options:
@@ -189,17 +201,172 @@ def _deny_option_id(options: list[object]) -> str | None:
     return ranked[0][1]
 
 
+def _allow_option_id(options: list[object]) -> str | None:
+    for expected_kind in ("allow_once", "allow_always"):
+        for option in options:
+            if _permission_option_kind(option) == expected_kind:
+                option_id = _permission_option_id(option)
+                if option_id is not None:
+                    return option_id
+    for expected_id in ("allow_once", "allow_always"):
+        for option in options:
+            if _permission_option_id(option) == expected_id:
+                return expected_id
+    return None
+
+
+_READ_ONLY_COMMANDS: frozenset[str] = frozenset(
+    {"ls", "cat", "head", "tail", "wc", "pwd", "rg", "grep"}
+)
+_READ_ONLY_GIT_COMMANDS: frozenset[str] = frozenset(
+    {"ls-files", "log", "show", "diff", "status"}
+)
+_FIND_SIDE_EFFECT_OPTIONS: frozenset[str] = frozenset(
+    {
+        "-exec",
+        "-execdir",
+        "-ok",
+        "-okdir",
+        "-delete",
+        "-fprint",
+        "-fprint0",
+        "-fprintf",
+        "-fls",
+    }
+)
+_GIT_SIDE_EFFECT_OPTIONS: frozenset[str] = frozenset(
+    {
+        "-o",
+        "-O",
+        "--output",
+        "--ext-diff",
+        "--textconv",
+        "--extcmd",
+        "--open-files-in-pager",
+        "--no-index",
+        "--paginate",
+        "--help",
+        "-h",
+    }
+)
+
+
+def _read_only_simple_command_allowed(command: str) -> bool:
+    try:
+        argv = shlex.split(command, posix=True)
+    except ValueError:
+        return False
+    if not argv:
+        return False
+
+    executable, *args = argv
+    if executable in _READ_ONLY_COMMANDS:
+        if executable == "tail" and any(
+            arg in {"-f", "-F", "--follow"}
+            or arg.startswith("--follow=")
+            or (
+                arg.startswith("-")
+                and not arg.startswith("--")
+                and ("f" in arg[1:] or "F" in arg[1:])
+            )
+            for arg in args
+        ):
+            return False
+        if executable == "rg" and any(
+            arg in {"-z", "--search-zip", "--pre", "--pre-glob", "--hostname-bin"}
+            or arg.startswith("--pre=")
+            or arg.startswith("--pre-glob=")
+            or arg.startswith("--hostname-bin=")
+            or (arg.startswith("-") and not arg.startswith("--") and "z" in arg[1:])
+            for arg in args
+        ):
+            return False
+        return True
+
+    if executable == "find":
+        return not any(
+            arg in _FIND_SIDE_EFFECT_OPTIONS
+            or any(arg.startswith(f"{option}=") for option in _FIND_SIDE_EFFECT_OPTIONS)
+            for arg in args
+        )
+
+    if executable == "git" and args:
+        subcommand, *git_args = args
+        if subcommand not in _READ_ONLY_GIT_COMMANDS:
+            return False
+        return not any(
+            arg in _GIT_SIDE_EFFECT_OPTIONS
+            or arg.startswith("--output=")
+            or arg.startswith("--ext-diff=")
+            or arg.startswith("--textconv=")
+            or arg.startswith("--extcmd=")
+            or arg.startswith("--open-files-in-pager=")
+            or (
+                arg.startswith("-")
+                and not arg.startswith("--")
+                and arg[1:2] in {"o", "O"}
+            )
+            for arg in git_args
+        )
+
+    return False
+
+
+def _has_unquoted_shell_expansion(command: str) -> bool:
+    quote: str | None = None
+    escaped = False
+    for char in command:
+        if escaped:
+            escaped = False
+            continue
+        if char == "\\" and quote != "'":
+            escaped = True
+            continue
+        if quote is not None:
+            if char == quote:
+                quote = None
+            continue
+        if char in {"'", '"'}:
+            quote = char
+        elif char in "*?[]{}~":
+            return True
+    return False
+
+
+def _read_only_command_allowed(command: object) -> bool:
+    if isinstance(command, list):
+        if not command or not all(isinstance(part, str) for part in command):
+            return False
+        command = shlex.join(command)
+    if not isinstance(command, str) or not command:
+        return False
+    if any(char in command for char in ";&`$><()\n\r"):
+        return False
+    if _has_unquoted_shell_expansion(command):
+        return False
+    if command.count("|") > 1:
+        return False
+    return all(_read_only_simple_command_allowed(part) for part in command.split("|"))
+
+
+def _read_only_tool_call_allowed(tool_call: object) -> bool:
+    kind = _tool_call_field(tool_call, "kind")
+    if kind == "read" or kind == "search":
+        return True
+    if kind != "execute":
+        return False
+    raw_input = _tool_call_field(tool_call, "raw_input", "rawInput")
+    if not isinstance(raw_input, Mapping):
+        return False
+    return _read_only_command_allowed(raw_input.get("command"))
+
+
 def _permission_log_target(tool_call: object) -> str:
     """Return a non-payload identifier for permission logs."""
     for attr in ("tool_call_id", "title", "kind"):
-        value = getattr(tool_call, attr, None)
+        value = _tool_call_field(tool_call, attr)
         if isinstance(value, str) and value.strip():
             return value
-    if isinstance(tool_call, Mapping):
-        for key in ("tool_call_id", "title", "kind"):
-            value = tool_call.get(key)
-            if isinstance(value, str) and value.strip():
-                return value
     return type(tool_call).__name__
 
 
@@ -212,6 +379,21 @@ def resolve_permission_response(
     normalized = normalize_acp_permission_policy(policy)
     target = _permission_log_target(tool_call)
     if normalized == "read_only":
+        if _read_only_tool_call_allowed(tool_call):
+            allow_option_id = _allow_option_id(options)
+            if allow_option_id is not None:
+                logger.info(
+                    "ACP allowing read-only permission under read_only policy: "
+                    "%s (option: %s)",
+                    target,
+                    allow_option_id,
+                )
+                return RequestPermissionResponse(
+                    outcome=AllowedOutcome(
+                        outcome="selected",
+                        option_id=allow_option_id,
+                    ),
+                )
         deny_option_id = _deny_option_id(options)
         if deny_option_id is not None:
             logger.info(
