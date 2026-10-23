@@ -39,6 +39,7 @@ from openhands.sdk import StructuredOutputConfig
 from openhands.sdk.agent.acp_agent import (
     ACPAgent,
     ACPAuthSelectionError,
+    ACPModelEvidenceUnavailable,
     ACPSessionConfigError,
     ACPSessionModeError,
     ACPSessionModelError,
@@ -5409,6 +5410,36 @@ class TestServedModelGate:
         agent._client = _OpenHandsACPBridge(permission_policy="read_only")
         return agent
 
+    @staticmethod
+    def _write_transcript(config_dir: Path, entries: list[dict[str, Any]]) -> None:
+        transcript_dir = config_dir / "projects" / "encoded-working-dir"
+        transcript_dir.mkdir(parents=True)
+        transcript = transcript_dir / "session-1.jsonl"
+        transcript.write_text(
+            "".join(json.dumps(entry) + "\n" for entry in entries),
+            encoding="utf-8",
+        )
+
+    @staticmethod
+    def _transcript_user(uuid_value: str, prompt_id: str) -> dict[str, Any]:
+        return {
+            "type": "user",
+            "uuid": uuid_value,
+            "promptId": prompt_id,
+            "isSidechain": False,
+            "message": {"role": "user", "content": "probe"},
+        }
+
+    @staticmethod
+    def _transcript_assistant(
+        model: str, *, is_sidechain: bool = False
+    ) -> dict[str, Any]:
+        return {
+            "type": "assistant",
+            "isSidechain": is_sidechain,
+            "message": {"model": model},
+        }
+
     @pytest.mark.parametrize(
         ("model", "selector"),
         [
@@ -5444,6 +5475,188 @@ class TestServedModelGate:
 
         assert agent._served_model_id is None
         assert agent.current_model_id == selector
+
+    def test_transcript_fallback_accepts_matching_root_model_and_publishes(
+        self, tmp_path
+    ):
+        agent = self._agent(model="claude-sonnet-5-5", selector="default")
+        agent._claude_transcript_config_dir = tmp_path
+        state = _make_state(tmp_path)
+        agent._capture_claude_transcript_boundary()
+        self._write_transcript(
+            tmp_path,
+            [
+                self._transcript_user("earlier-user", "earlier-prompt"),
+                self._transcript_assistant("claude-opus-5-5"),
+                self._transcript_user("user-1", "current-prompt"),
+                self._transcript_assistant("claude-opus-5-5", is_sidechain=True),
+                self._transcript_assistant("claude-sonnet-5-5"),
+            ],
+        )
+
+        agent._verify_served_model_for_turn(state)
+
+        assert agent._served_model_id == "claude-sonnet-5-5"
+        assert state.agent_state["acp_current_model_id"] == "claude-sonnet-5-5"
+
+    def test_transcript_fallback_uses_prompt_uuid_for_incomplete_stream_evidence(
+        self, tmp_path
+    ):
+        agent = self._agent(model="claude-sonnet-5-5", selector="default")
+        agent._claude_transcript_config_dir = tmp_path
+        client = agent._client
+        client.begin_turn_model_evidence("session-1")
+        client._record_raw_sdk_message(TestTurnModelEvidence._user("session-1"))
+        client._record_raw_sdk_message(
+            TestTurnModelEvidence._assistant("session-1", None)
+        )
+        client.finish_turn_model_evidence("session-1")
+        self._write_transcript(
+            tmp_path,
+            [
+                self._transcript_user("earlier-user", "earlier-prompt"),
+                self._transcript_assistant("claude-opus-5-5"),
+                self._transcript_user("user-1", "current-prompt"),
+                self._transcript_assistant("claude-sonnet-5-5"),
+                self._transcript_user("later-user", "later-prompt"),
+                self._transcript_assistant("claude-haiku-5-5"),
+            ],
+        )
+
+        agent._verify_served_model_for_turn()
+
+        assert agent._served_model_id == "claude-sonnet-5-5"
+
+    def test_transcript_fallback_model_mismatch_is_not_unavailable(self, tmp_path):
+        agent = self._agent()
+        agent._claude_transcript_config_dir = tmp_path
+        agent._capture_claude_transcript_boundary()
+        self._write_transcript(
+            tmp_path,
+            [
+                self._transcript_user("user-1", "current-prompt"),
+                self._transcript_assistant("claude-sonnet-5-5"),
+            ],
+        )
+
+        with pytest.raises(ACPSessionModelError) as exc_info:
+            agent._verify_served_model_for_turn()
+
+        assert not isinstance(exc_info.value, ACPModelEvidenceUnavailable)
+        assert "served='claude-sonnet-5-5'" in str(exc_info.value)
+        assert agent._served_model_id is None
+        assert agent._restart_session_on_next_turn is True
+
+    @pytest.mark.parametrize("has_prompt_uuid", [False, True])
+    @pytest.mark.parametrize("mismatch_before_meta", [False, True])
+    @pytest.mark.parametrize(
+        "meta_marker", ["isMeta", "isCompactSummary", "isSynthetic"]
+    )
+    def test_transcript_provider_metadata_does_not_split_prompt(
+        self, tmp_path, has_prompt_uuid, mismatch_before_meta, meta_marker
+    ):
+        agent = self._agent(model="claude-sonnet-5-5", selector="default")
+        agent._claude_transcript_config_dir = tmp_path
+        if has_prompt_uuid:
+            client = agent._client
+            client.begin_turn_model_evidence("session-1")
+            client._record_raw_sdk_message(TestTurnModelEvidence._user("session-1"))
+            client.finish_turn_model_evidence("session-1")
+        agent._capture_claude_transcript_boundary()
+
+        models = (
+            ("claude-opus-5-5", "claude-sonnet-5-5")
+            if mismatch_before_meta
+            else ("claude-sonnet-5-5", "claude-opus-5-5")
+        )
+        provider_meta = self._transcript_user("user-1", "current-prompt")
+        provider_meta[meta_marker] = True
+        self._write_transcript(
+            tmp_path,
+            [
+                self._transcript_user("user-1", "current-prompt"),
+                self._transcript_assistant(models[0]),
+                provider_meta,
+                self._transcript_assistant(models[1]),
+            ],
+        )
+
+        with pytest.raises(ACPSessionModelError, match="served='claude-opus-5-5'"):
+            agent._verify_served_model_for_turn()
+
+    def test_stale_transcript_without_prompt_uuid_is_unavailable(self, tmp_path):
+        agent = self._agent(model="claude-sonnet-5-5", selector="default")
+        agent._claude_transcript_config_dir = tmp_path
+        self._write_transcript(
+            tmp_path,
+            [
+                self._transcript_user("previous-user", "previous-prompt"),
+                self._transcript_assistant("claude-sonnet-5-5"),
+            ],
+        )
+        agent._capture_claude_transcript_boundary()
+
+        with pytest.raises(ACPModelEvidenceUnavailable, match="served='UNKNOWN'"):
+            agent._verify_served_model_for_turn()
+
+        assert agent._served_model_id is None
+        assert agent._restart_session_on_next_turn is True
+
+    def test_transcript_fallback_preserves_conflicting_stream_model(self, tmp_path):
+        agent = self._agent(model="claude-sonnet-5-5", selector="default")
+        agent._claude_transcript_config_dir = tmp_path
+        TestTurnModelEvidence._complete(
+            agent._client,
+            "session-1",
+            message_start_models=("claude-opus-5-5",),
+        )
+        self._write_transcript(
+            tmp_path,
+            [
+                self._transcript_user("user-1", "current-prompt"),
+                self._transcript_assistant("claude-sonnet-5-5"),
+            ],
+        )
+
+        with pytest.raises(ACPSessionModelError) as exc_info:
+            agent._verify_served_model_for_turn()
+
+        assert not isinstance(exc_info.value, ACPModelEvidenceUnavailable)
+        assert "served='claude-opus-5-5'" in str(exc_info.value)
+        assert agent._served_model_id is None
+        assert agent._restart_session_on_next_turn is True
+
+    def test_missing_transcript_raises_distinct_unavailable_error(self, tmp_path):
+        agent = self._agent()
+        agent._claude_transcript_config_dir = tmp_path
+
+        with pytest.raises(ACPModelEvidenceUnavailable) as exc_info:
+            agent._verify_served_model_for_turn()
+
+        assert isinstance(exc_info.value, ACPSessionModelError)
+        assert "served='UNKNOWN'" in str(exc_info.value)
+        assert agent._served_model_id is None
+        assert agent._restart_session_on_next_turn is True
+
+    def test_confirmed_stream_mismatch_precedes_missing_transcript(self, tmp_path):
+        agent = self._agent(model="claude-sonnet-5-5", selector="default")
+        agent._claude_transcript_config_dir = tmp_path
+        client = agent._client
+        client.begin_turn_model_evidence("session-1")
+        client._record_raw_sdk_message(TestTurnModelEvidence._user("session-1"))
+        client._record_raw_sdk_message(
+            TestTurnModelEvidence._assistant("session-1", "claude-opus-5-5")
+        )
+        client._record_raw_sdk_message(
+            TestTurnModelEvidence._assistant("session-1", None)
+        )
+        client.finish_turn_model_evidence("session-1")
+
+        evidence = client._completed_model_evidence_by_session["session-1"]
+        assert evidence.root_models == ("claude-opus-5-5",)
+        assert evidence.invalid_root_evidence is True
+        with pytest.raises(ACPSessionModelError, match="served='claude-opus-5-5'"):
+            agent._verify_served_model_for_turn()
 
     def test_passing_turn_publishes_model_and_failed_next_turn_restores_selector(
         self, tmp_path
@@ -5633,11 +5846,15 @@ class TestServedModelGate:
         agent._executor = executor
         events: list = []
 
-        with pytest.raises(ACPSessionModelError, match="served='UNKNOWN'"):
+        with pytest.raises(ACPModelEvidenceUnavailable, match="served='UNKNOWN'"):
             agent.step(conversation, on_event=events.append)
 
         assert state.execution_status == ConversationExecutionStatus.ERROR
         assert not any(isinstance(event, ActionEvent) for event in events)
+        error_event = next(
+            event for event in events if isinstance(event, ConversationErrorEvent)
+        )
+        assert error_event.code == "ACPModelEvidenceUnavailable"
 
     def test_step_restarts_flagged_session_before_prompt(self, tmp_path):
         agent = self._agent()
