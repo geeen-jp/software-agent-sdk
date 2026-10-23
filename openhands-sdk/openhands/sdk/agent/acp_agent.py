@@ -270,6 +270,42 @@ _ACP_PENDING_SUBAGENT_WAIT_TIMEOUT: float = float(
 _TERMINAL_TOOL_CALL_STATUSES: frozenset[str] = frozenset({"completed", "failed"})
 
 
+def _acp_tool_call_identity(field_meta: Any) -> dict[str, Any]:
+    """Extract Claude ACP's stable tool identity from its extension metadata."""
+    if not isinstance(field_meta, Mapping):
+        return {}
+    claude_code = field_meta.get("claudeCode")
+    if not isinstance(claude_code, Mapping):
+        return {}
+
+    identity: dict[str, Any] = {}
+    tool_name = claude_code.get("toolName")
+    if isinstance(tool_name, str) and tool_name.strip():
+        identity["tool_name"] = tool_name
+    is_subagent = claude_code.get("subagent")
+    if isinstance(is_subagent, bool):
+        identity["is_subagent"] = is_subagent
+    elif isinstance(tool_name, str):
+        identity["is_subagent"] = tool_name.casefold() in {"agent", "task"}
+    return identity
+
+
+def _is_subagent_tool_call(tool_call: Mapping[str, Any]) -> bool:
+    is_subagent = tool_call.get("is_subagent")
+    if isinstance(is_subagent, bool):
+        return is_subagent
+
+    tool_name = tool_call.get("tool_name")
+    if isinstance(tool_name, str) and tool_name.casefold() in {"agent", "task"}:
+        return True
+
+    raw_input = tool_call.get("raw_input")
+    if isinstance(raw_input, Mapping):
+        subagent_type = raw_input.get("subagent_type")
+        return isinstance(subagent_type, str) and bool(subagent_type.strip())
+    return False
+
+
 def _pending_subagent_tool_calls(
     tool_calls: Iterable[Mapping[str, Any]],
 ) -> list[Mapping[str, Any]]:
@@ -278,24 +314,7 @@ def _pending_subagent_tool_calls(
     for tool_call in tool_calls:
         if tool_call.get("status") in _TERMINAL_TOOL_CALL_STATUSES:
             continue
-
-        raw_input = tool_call.get("raw_input")
-        if isinstance(raw_input, Mapping):
-            subagent_type = raw_input.get("subagent_type")
-            if isinstance(subagent_type, str) and subagent_type.strip():
-                pending.append(tool_call)
-                continue
-
-        labels = (tool_call.get("title"), tool_call.get("tool_kind"))
-        if any(
-            re.match(
-                r"^(?:task|agent|subagent)(?:\b|[_-])",
-                str(getattr(label, "value", label)).strip(),
-                re.IGNORECASE,
-            )
-            for label in labels
-            if label is not None
-        ):
+        if _is_subagent_tool_call(tool_call):
             pending.append(tool_call)
     return pending
 
@@ -2223,6 +2242,10 @@ class _OpenHandsACPBridge:
         self._last_message_id: str | None = None
         self.accumulated_thoughts: list[str] = []
         self.accumulated_tool_calls: list[dict[str, Any]] = []
+        # Pending delegated calls outlive a prompt turn. Keep their IDs
+        # separately from the per-turn accumulator, whose entries may be
+        # synthetically terminalized for the UI and cleared by reset().
+        self._pending_subagent_tool_call_ids_by_session: dict[str, set[str]] = {}
         self.trace = ACPTurnTrace(acp_server=None, model_id=None)
         self.on_token: Any = None  # ConversationTokenCallbackType | None
         # Secret masker — set per turn by ACPAgent to
@@ -2631,6 +2654,36 @@ class _OpenHandsACPBridge:
         if self._tool_call_updates.get(session_id) is event:
             self._tool_call_updates.pop(session_id, None)
 
+    def pending_subagent_tool_call_ids(self, session_id: str) -> set[str]:
+        """Return pending delegated calls tracked for a session and this turn."""
+        pending_ids = set(
+            self._pending_subagent_tool_call_ids_by_session.get(session_id, set())
+        )
+        pending_ids.update(
+            tool_call_id
+            for tool_call in _pending_subagent_tool_calls(self.accumulated_tool_calls)
+            if isinstance((tool_call_id := tool_call.get("tool_call_id")), str)
+            and tool_call_id
+        )
+        return pending_ids
+
+    def _record_subagent_tool_call_update(
+        self, session_id: str, tool_call: Mapping[str, Any]
+    ) -> None:
+        """Track provider updates, excluding synthetic UI terminal states."""
+        tool_call_id = tool_call.get("tool_call_id")
+        if not isinstance(tool_call_id, str) or not tool_call_id:
+            return
+        pending_ids = self._pending_subagent_tool_call_ids_by_session.setdefault(
+            session_id, set()
+        )
+        if tool_call.get("status") in _TERMINAL_TOOL_CALL_STATUSES:
+            pending_ids.discard(tool_call_id)
+        elif _is_subagent_tool_call(tool_call):
+            pending_ids.add(tool_call_id)
+        if not pending_ids:
+            self._pending_subagent_tool_call_ids_by_session.pop(session_id, None)
+
     def _signal_tool_call_update(self, session_id: str) -> None:
         event = self._tool_call_updates.get(session_id)
         if event is not None:
@@ -2701,9 +2754,11 @@ class _OpenHandsACPBridge:
                 "raw_input": update.raw_input,
                 "raw_output": update.raw_output,
                 "content": _serialize_tool_content(update.content),
+                **_acp_tool_call_identity(getattr(update, "field_meta", None)),
             }
             self._mask_tool_call_entry(entry)
             self.accumulated_tool_calls.append(entry)
+            self._record_subagent_tool_call_update(session_id, entry)
             self.trace.tool_started(entry)
             if entry.get("status") in _TERMINAL_TOOL_CALL_STATUSES:
                 self.trace.tool_finished(entry)
@@ -2714,6 +2769,7 @@ class _OpenHandsACPBridge:
         elif isinstance(update, ToolCallProgress):
             target: dict[str, Any] | None = None
             prev_status: str | None = None
+            identity = _acp_tool_call_identity(getattr(update, "field_meta", None))
             for index, tc in enumerate(self.accumulated_tool_calls):
                 if tc["tool_call_id"] == update.tool_call_id:
                     prev_status = tc.get("status")
@@ -2730,10 +2786,20 @@ class _OpenHandsACPBridge:
                         updated["raw_output"] = update.raw_output
                     if update.content is not None:
                         updated["content"] = _serialize_tool_content(update.content)
+                    updated.update(identity)
                     self._mask_tool_call_entry(updated)
                     self.accumulated_tool_calls[index] = updated
                     target = updated
                     break
+            self._record_subagent_tool_call_update(
+                session_id,
+                target
+                or {
+                    "tool_call_id": update.tool_call_id,
+                    "status": update.status,
+                    **identity,
+                },
+            )
             logger.debug("ACP tool call progress: %s", update.tool_call_id)
             became_terminal = (
                 target is not None
@@ -5104,8 +5170,8 @@ class ACPAgent(AgentBase):
 
         client = self._client
         session_id = self._session_id
-        pending = _pending_subagent_tool_calls(client.accumulated_tool_calls)
-        if not pending:
+        pending_ids = client.pending_subagent_tool_call_ids(session_id)
+        if not pending_ids:
             return 0
 
         event = client._tool_call_updates_for(session_id)
@@ -5115,10 +5181,10 @@ class ACPAgent(AgentBase):
         logger.info(
             "Waiting up to %.1fs for %d pending ACP subagent tool call(s)",
             _ACP_PENDING_SUBAGENT_WAIT_TIMEOUT,
-            len(pending),
+            len(pending_ids),
         )
         try:
-            while pending:
+            while pending_ids:
                 remaining = deadline - asyncio.get_running_loop().time()
                 if remaining <= 0:
                     break
@@ -5127,15 +5193,15 @@ class ACPAgent(AgentBase):
                     await asyncio.wait_for(event.wait(), timeout=remaining)
                 except TimeoutError:
                     break
-                pending = _pending_subagent_tool_calls(client.accumulated_tool_calls)
+                pending_ids = client.pending_subagent_tool_call_ids(session_id)
         finally:
             client._clear_tool_call_updates(session_id, event)
-        return len(_pending_subagent_tool_calls(client.accumulated_tool_calls))
+        return len(client.pending_subagent_tool_call_ids(session_id))
 
     def _pending_subagent_count(self) -> int:
-        if self._client is None:
+        if self._client is None or self._session_id is None:
             return 0
-        return len(_pending_subagent_tool_calls(self._client.accumulated_tool_calls))
+        return len(self._client.pending_subagent_tool_call_ids(self._session_id))
 
     def _log_pending_subagents(self, count: int) -> None:
         if count:

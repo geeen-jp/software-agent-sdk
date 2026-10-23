@@ -32,6 +32,8 @@ from acp.schema import (
     SessionModeState,
     SetSessionConfigOptionResponse,
     TextContentBlock,
+    ToolCallProgress,
+    ToolCallStart,
 )
 from pydantic import ValidationError
 
@@ -2714,6 +2716,41 @@ class TestACPToolCallEmission:
         conversation.state = state
         return conversation
 
+    def test_pending_subagent_detection_uses_claude_tool_metadata(self):
+        """Agent calls with descriptive titles remain distinguishable from Bash."""
+        client = _OpenHandsACPBridge()
+        agent = _make_agent()
+        agent._client = client
+        agent._session_id = "test-session"
+
+        subagent = ToolCallStart(
+            session_update="tool_call",
+            tool_call_id="agent-1",
+            title="Explore repository",
+            kind="think",
+            status="in_progress",
+            raw_input={"description": "Explore repository"},
+            field_meta={"claudeCode": {"toolName": "Agent", "subagent": True}},
+        )
+        ordinary_bash = ToolCallStart(
+            session_update="tool_call",
+            tool_call_id="bash-1",
+            title="agent --version",
+            kind="execute",
+            status="in_progress",
+            raw_input={"command": "agent --version"},
+            field_meta={"claudeCode": {"toolName": "Bash"}},
+        )
+
+        asyncio.run(client.session_update("test-session", subagent))
+        asyncio.run(client.session_update("test-session", ordinary_bash))
+
+        assert agent._pending_subagent_count() == 1
+        assert client.accumulated_tool_calls[0]["tool_name"] == "Agent"
+        assert client.accumulated_tool_calls[0]["is_subagent"] is True
+        assert client.accumulated_tool_calls[1]["tool_name"] == "Bash"
+        assert client.accumulated_tool_calls[1]["is_subagent"] is False
+
     def test_step_emits_tool_call_events_before_message(self, tmp_path):
         """Tool-call events reach on_event live, ahead of the MessageEvent."""
         from acp.schema import ToolCallStart
@@ -2926,6 +2963,75 @@ class TestACPToolCallEmission:
         assert finish_observation.pending_subagents == 1
         assert "1 pending subagent tool call" in caplog.text
         assert calls == 2
+
+    def test_astep_pending_subagent_survives_turn_reset_until_terminal_update(
+        self, tmp_path
+    ):
+        """A later turn keeps unresolved IDs until ACP reports a terminal update."""
+        from openhands.sdk.utils.async_executor import AsyncExecutor
+
+        agent = _make_agent()
+        conversation = self._make_conversation_with_message(tmp_path)
+        events: list = []
+        client = _OpenHandsACPBridge()
+        client.get_turn_usage_update = MagicMock(return_value=object())
+        agent._client = client
+        agent._conn = MagicMock()
+        agent._session_id = "test-session"
+        prompt_count = 0
+
+        async def _fake_prompt(_prompt, _session_id):
+            nonlocal prompt_count
+            prompt_count += 1
+            if prompt_count == 1:
+                await client.session_update(
+                    "test-session",
+                    ToolCallStart(
+                        session_update="tool_call",
+                        tool_call_id="task-1",
+                        title="Explore repository",
+                        kind="think",
+                        status="in_progress",
+                        raw_input={"description": "Explore repository"},
+                        field_meta={
+                            "claudeCode": {"toolName": "Agent", "subagent": True}
+                        },
+                    ),
+                )
+            elif prompt_count == 3:
+                # This arrives after reset() removed the original turn entry.
+                await client.session_update(
+                    "test-session",
+                    ToolCallProgress(
+                        session_update="tool_call_update",
+                        tool_call_id="task-1",
+                        status="completed",
+                    ),
+                )
+            client.accumulated_text.append(f"turn {prompt_count}")
+            return None
+
+        _agent_conn(agent).prompt = _fake_prompt
+        executor = AsyncExecutor()
+        agent._executor = executor
+        try:
+            with patch(
+                "openhands.sdk.agent.acp_agent._ACP_PENDING_SUBAGENT_WAIT_TIMEOUT",
+                0.001,
+            ):
+                for _ in range(3):
+                    asyncio.run(agent.astep(conversation, on_event=events.append))
+        finally:
+            executor.close()
+
+        observations = [
+            event.observation.pending_subagents
+            for event in events
+            if isinstance(event, ObservationEvent)
+            and isinstance(event.observation, FinishObservation)
+        ]
+        assert observations == [1, 1, 0]
+        assert prompt_count == 3
 
     def test_step_does_not_wait_for_completed_task(self, tmp_path):
         """Completed Tasks and regular tools keep the existing immediate finish."""
