@@ -76,6 +76,7 @@ from openhands.sdk.event import (
     ACPToolCallEvent,
     ActionEvent,
     MessageEvent,
+    ObservationEvent,
     SystemPromptEvent,
 )
 from openhands.sdk.event.conversation_error import ConversationErrorEvent
@@ -83,7 +84,7 @@ from openhands.sdk.llm import ImageContent, Message, TextContent
 from openhands.sdk.mcp.config import coerce_mcp_config
 from openhands.sdk.settings.acp_providers import CLAUDE_AGENT_ACP_VERSION
 from openhands.sdk.skills import KeywordTrigger, Skill
-from openhands.sdk.tool.builtins.finish import FinishAction
+from openhands.sdk.tool.builtins.finish import FinishAction, FinishObservation
 from openhands.sdk.utils.pydantic_secrets import REDACTED_SECRET_VALUE
 from openhands.sdk.workspace.local import LocalWorkspace
 
@@ -431,6 +432,14 @@ class TestACPAgentSerialization:
         agent = AgentBase.model_validate(data)
         assert isinstance(agent, ACPAgent)
         assert agent.acp_command == ["echo", "test"]
+
+    def test_finish_observation_legacy_payload_defaults_pending_subagents(self):
+        payload = FinishObservation().model_dump()
+        payload.pop("pending_subagents")
+
+        restored = FinishObservation.model_validate(payload)
+
+        assert restored.pending_subagents == 0
 
 
 # ---------------------------------------------------------------------------
@@ -2841,7 +2850,7 @@ class TestACPToolCallEmission:
         assert mock_client.on_activity is None
 
     def test_step_emits_no_tool_call_events_when_none(self, tmp_path):
-        """step() emits only MessageEvent when no tool calls accumulated."""
+        """A normal turn finishes without scheduling a subagent wait."""
         agent = _make_agent()
         conversation = self._make_conversation_with_message(tmp_path)
         events: list = []
@@ -2851,7 +2860,11 @@ class TestACPToolCallEmission:
         agent._conn = MagicMock()
         agent._session_id = "test-session"
 
+        calls = 0
+
         def _fake_run_async(_coro, **_kwargs):
+            nonlocal calls
+            calls += 1
             mock_client.accumulated_text.append("no tools used")
 
         mock_executor = MagicMock()
@@ -2863,6 +2876,108 @@ class TestACPToolCallEmission:
         # ActionEvent(FinishAction) + ObservationEvent(FinishObservation)
         assert len(events) == 2
         assert isinstance(events[0], ActionEvent)
+        assert calls == 1
+        assert events[1].observation.pending_subagents == 0
+
+    def test_step_reports_pending_subagent_after_wait_timeout(self, tmp_path, caplog):
+        """A Task that outlives the bounded wait is recorded on FinishObservation."""
+        agent = _make_agent()
+        conversation = self._make_conversation_with_message(tmp_path)
+        events: list = []
+
+        client = _OpenHandsACPBridge()
+        agent._client = client
+        agent._conn = MagicMock()
+        agent._session_id = "test-session"
+        calls = 0
+
+        def _run_async(operation, **_kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                client.accumulated_text.append("Waiting for Explore")
+                client.accumulated_tool_calls.append(
+                    {
+                        "tool_call_id": "task-1",
+                        "title": "Task",
+                        "tool_kind": "other",
+                        "status": "in_progress",
+                        "raw_input": {"subagent_type": "Explore"},
+                    }
+                )
+                return MagicMock(usage=None)
+            return asyncio.run(operation())
+
+        mock_executor = MagicMock()
+        mock_executor.run_async = _run_async
+        agent._executor = mock_executor
+
+        with patch(
+            "openhands.sdk.agent.acp_agent._ACP_PENDING_SUBAGENT_WAIT_TIMEOUT", 0.001
+        ):
+            agent.step(conversation, on_event=events.append)
+
+        finish_observation = next(
+            event.observation
+            for event in events
+            if isinstance(event, ObservationEvent)
+            and isinstance(event.observation, FinishObservation)
+        )
+        assert finish_observation.pending_subagents == 1
+        assert "1 pending subagent tool call" in caplog.text
+        assert calls == 2
+
+    def test_step_does_not_wait_for_completed_task(self, tmp_path):
+        """Completed Tasks and regular tools keep the existing immediate finish."""
+        agent = _make_agent()
+        conversation = self._make_conversation_with_message(tmp_path)
+        events: list = []
+
+        client = _OpenHandsACPBridge()
+        agent._client = client
+        agent._conn = MagicMock()
+        agent._session_id = "test-session"
+
+        calls = 0
+
+        def _run_async(_operation, **_kwargs):
+            nonlocal calls
+            calls += 1
+            client.accumulated_text.append("Done")
+            client.accumulated_tool_calls.extend(
+                [
+                    {
+                        "tool_call_id": "task-done",
+                        "title": "Task",
+                        "tool_kind": "other",
+                        "status": "completed",
+                        "raw_input": {"subagent_type": "Explore"},
+                    },
+                    {
+                        "tool_call_id": "read-file",
+                        "title": "Read file",
+                        "tool_kind": "read",
+                        "status": "completed",
+                        "raw_input": {"path": "README.md"},
+                    },
+                ]
+            )
+            return MagicMock(usage=None)
+
+        mock_executor = MagicMock()
+        mock_executor.run_async = _run_async
+        agent._executor = mock_executor
+
+        agent.step(conversation, on_event=events.append)
+
+        finish_observation = next(
+            event.observation
+            for event in events
+            if isinstance(event, ObservationEvent)
+            and isinstance(event.observation, FinishObservation)
+        )
+        assert finish_observation.pending_subagents == 0
+        assert calls == 1
 
     def test_tool_call_events_cleared_between_turns(self, tmp_path):
         """accumulated_tool_calls are cleared on reset() between turns."""
@@ -8727,6 +8842,78 @@ class TestACPAgentAstep:
         assert (
             conversation.state.execution_status == ConversationExecutionStatus.FINISHED
         )
+
+    def test_astep_waits_for_pending_subagent_result(self, tmp_path):
+        from acp.schema import ToolCallProgress, ToolCallStart
+
+        from openhands.sdk.utils.async_executor import AsyncExecutor
+
+        agent = _make_agent()
+        conversation = self._make_conversation_with_message(tmp_path)
+        events: list = []
+        client = _OpenHandsACPBridge()
+        client.get_turn_usage_update = MagicMock(return_value=object())
+        agent._client = client
+        agent._conn = MagicMock()
+        agent._session_id = "test-session"
+
+        async def _complete_after_wait_starts():
+            while "test-session" not in client._tool_call_updates:
+                await asyncio.sleep(0.001)
+            progress = MagicMock(spec=ToolCallProgress)
+            progress.tool_call_id = "task-1"
+            progress.title = None
+            progress.kind = None
+            progress.status = "completed"
+            progress.raw_input = None
+            progress.raw_output = "Explore findings"
+            progress.content = None
+            await client.session_update("test-session", progress)
+            await client.session_update(
+                "test-session", _message_chunk(" after the wait", "message-1")
+            )
+
+        async def _fake_prompt(_prompt, _session_id):  # noqa: ARG001
+            start = MagicMock(spec=ToolCallStart)
+            start.tool_call_id = "task-1"
+            start.title = "Task"
+            start.kind = "other"
+            start.status = "in_progress"
+            start.raw_input = {"subagent_type": "Explore"}
+            start.raw_output = None
+            start.content = None
+            await client.session_update("test-session", start)
+            await client.session_update(
+                "test-session", _message_chunk("Waiting on Explore", "message-1")
+            )
+            asyncio.create_task(_complete_after_wait_starts())
+            return None
+
+        _agent_conn(agent).prompt = _fake_prompt
+        executor = AsyncExecutor()
+        agent._executor = executor
+        try:
+            with patch(
+                "openhands.sdk.agent.acp_agent._ACP_PENDING_SUBAGENT_WAIT_TIMEOUT",
+                0.5,
+            ):
+                asyncio.run(agent.astep(conversation, on_event=events.append))
+        finally:
+            executor.close()
+
+        finish_action = next(
+            event.action
+            for event in events
+            if isinstance(event, ActionEvent) and isinstance(event.action, FinishAction)
+        )
+        finish_observation = next(
+            event.observation
+            for event in events
+            if isinstance(event, ObservationEvent)
+            and isinstance(event.observation, FinishObservation)
+        )
+        assert finish_action.message == "Waiting on Explore after the wait"
+        assert finish_observation.pending_subagents == 0
 
     @pytest.mark.parametrize(
         ("model", "selector", "other_generation"), _CLAUDE_EXACT_MODEL_CASES
