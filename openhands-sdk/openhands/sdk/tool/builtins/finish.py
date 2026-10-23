@@ -34,8 +34,16 @@ class FinishObservation(Observation):
     """
     Observation returned after finishing a task.
     The FinishAction itself contains the message sent to the user so no
-    extra fields are needed here.
+    additional response text is needed here.
     """
+
+    pending_subagents: int = Field(
+        default=0,
+        ge=0,
+        description=(
+            "Number of ACP subagent tool calls still pending when the turn ended."
+        ),
+    )
 
     @property
     def visualize(self) -> Text:

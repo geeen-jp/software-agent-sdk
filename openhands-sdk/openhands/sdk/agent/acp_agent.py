@@ -256,11 +256,67 @@ _ACP_CANCEL_DRAIN_TIMEOUT: float = float(
     os.environ.get("ACP_CANCEL_DRAIN_TIMEOUT", "2.0")
 )
 
+# Give delegated ACP Task/Agent calls a short chance to report their result
+# after the root prompt returns. A completed prompt still emits metadata when
+# the subagent outlives this bound.
+_ACP_PENDING_SUBAGENT_WAIT_TIMEOUT: float = float(
+    os.environ.get("ACP_PENDING_SUBAGENT_WAIT_TIMEOUT", "15.0")
+)
+
 # ACP tool-call statuses that represent a terminal outcome.  Non-terminal
 # statuses (``pending``, ``in_progress``) mean the call is still in flight
 # and, if the turn aborts before it reaches a terminal state, the live-
 # emitted event on state.events will otherwise be orphaned forever.
 _TERMINAL_TOOL_CALL_STATUSES: frozenset[str] = frozenset({"completed", "failed"})
+
+
+def _acp_tool_call_identity(field_meta: Any) -> dict[str, Any]:
+    """Extract Claude ACP's stable tool identity from its extension metadata."""
+    if not isinstance(field_meta, Mapping):
+        return {}
+    claude_code = field_meta.get("claudeCode")
+    if not isinstance(claude_code, Mapping):
+        return {}
+
+    identity: dict[str, Any] = {}
+    tool_name = claude_code.get("toolName")
+    if isinstance(tool_name, str) and tool_name.strip():
+        identity["tool_name"] = tool_name
+    is_subagent = claude_code.get("subagent")
+    if isinstance(is_subagent, bool):
+        identity["is_subagent"] = is_subagent
+    elif isinstance(tool_name, str):
+        identity["is_subagent"] = tool_name.casefold() in {"agent", "task"}
+    return identity
+
+
+def _is_subagent_tool_call(tool_call: Mapping[str, Any]) -> bool:
+    is_subagent = tool_call.get("is_subagent")
+    if isinstance(is_subagent, bool):
+        return is_subagent
+
+    tool_name = tool_call.get("tool_name")
+    if isinstance(tool_name, str) and tool_name.casefold() in {"agent", "task"}:
+        return True
+
+    raw_input = tool_call.get("raw_input")
+    if isinstance(raw_input, Mapping):
+        subagent_type = raw_input.get("subagent_type")
+        return isinstance(subagent_type, str) and bool(subagent_type.strip())
+    return False
+
+
+def _pending_subagent_tool_calls(
+    tool_calls: Iterable[Mapping[str, Any]],
+) -> list[Mapping[str, Any]]:
+    """Return unfinished ACP calls that represent delegated Task/Agent work."""
+    pending: list[Mapping[str, Any]] = []
+    for tool_call in tool_calls:
+        if tool_call.get("status") in _TERMINAL_TOOL_CALL_STATUSES:
+            continue
+        if _is_subagent_tool_call(tool_call):
+            pending.append(tool_call)
+    return pending
 
 
 class _PromptDrainResult(NamedTuple):
@@ -2186,6 +2242,10 @@ class _OpenHandsACPBridge:
         self._last_message_id: str | None = None
         self.accumulated_thoughts: list[str] = []
         self.accumulated_tool_calls: list[dict[str, Any]] = []
+        # Pending delegated calls outlive a prompt turn. Keep their IDs
+        # separately from the per-turn accumulator, whose entries may be
+        # synthetically terminalized for the UI and cleared by reset().
+        self._pending_subagent_tool_call_ids_by_session: dict[str, set[str]] = {}
         self.trace = ACPTurnTrace(acp_server=None, model_id=None)
         self.on_token: Any = None  # ConversationTokenCallbackType | None
         # Secret masker — set per turn by ACPAgent to
@@ -2222,6 +2282,7 @@ class _OpenHandsACPBridge:
         # Per-turn synchronization for UsageUpdate notifications.
         self._turn_usage_updates: dict[str, Any] = {}
         self._usage_received: dict[str, asyncio.Event] = {}
+        self._tool_call_updates: dict[str, asyncio.Event] = {}
         # Last complete session config option state observed per session id.
         # Keyed by session so an update for a different session can never
         # satisfy the verification of this one.
@@ -2267,6 +2328,7 @@ class _OpenHandsACPBridge:
         self.on_activity = None
         self._turn_usage_updates.clear()
         self._usage_received.clear()
+        self._tool_call_updates.clear()
         self._masking_error = None
         self.discard_turn_model_evidence(session_id)
         # Note: telemetry state (_last_cost, _context_window, _last_activity_signal,
@@ -2584,6 +2646,54 @@ class _OpenHandsACPBridge:
             self.accumulated_text.clear()
         self._last_message_id = message_id
 
+    def _tool_call_updates_for(self, session_id: str) -> asyncio.Event:
+        """Return the portal-loop event used to wake pending-task waiters."""
+        return self._tool_call_updates.setdefault(session_id, asyncio.Event())
+
+    def _clear_tool_call_updates(self, session_id: str, event: asyncio.Event) -> None:
+        if self._tool_call_updates.get(session_id) is event:
+            self._tool_call_updates.pop(session_id, None)
+
+    def pending_subagent_tool_call_ids(self, session_id: str) -> set[str]:
+        """Return pending delegated calls tracked for a session and this turn."""
+        pending_ids = set(
+            self._pending_subagent_tool_call_ids_by_session.get(session_id, set())
+        )
+        pending_ids.update(
+            tool_call_id
+            for tool_call in _pending_subagent_tool_calls(self.accumulated_tool_calls)
+            if isinstance((tool_call_id := tool_call.get("tool_call_id")), str)
+            and tool_call_id
+        )
+        return pending_ids
+
+    def clear_pending_subagent_tool_calls(self, session_id: str | None) -> None:
+        """Forget pending delegated calls when their turn or session is abandoned."""
+        if session_id is not None:
+            self._pending_subagent_tool_call_ids_by_session.pop(session_id, None)
+
+    def _record_subagent_tool_call_update(
+        self, session_id: str, tool_call: Mapping[str, Any]
+    ) -> None:
+        """Track provider updates, excluding synthetic UI terminal states."""
+        tool_call_id = tool_call.get("tool_call_id")
+        if not isinstance(tool_call_id, str) or not tool_call_id:
+            return
+        pending_ids = self._pending_subagent_tool_call_ids_by_session.setdefault(
+            session_id, set()
+        )
+        if tool_call.get("status") in _TERMINAL_TOOL_CALL_STATUSES:
+            pending_ids.discard(tool_call_id)
+        elif _is_subagent_tool_call(tool_call):
+            pending_ids.add(tool_call_id)
+        if not pending_ids:
+            self._pending_subagent_tool_call_ids_by_session.pop(session_id, None)
+
+    def _signal_tool_call_update(self, session_id: str) -> None:
+        event = self._tool_call_updates.get(session_id)
+        if event is not None:
+            event.set()
+
     async def session_update(
         self,
         session_id: str,
@@ -2649,18 +2759,22 @@ class _OpenHandsACPBridge:
                 "raw_input": update.raw_input,
                 "raw_output": update.raw_output,
                 "content": _serialize_tool_content(update.content),
+                **_acp_tool_call_identity(getattr(update, "field_meta", None)),
             }
             self._mask_tool_call_entry(entry)
             self.accumulated_tool_calls.append(entry)
+            self._record_subagent_tool_call_update(session_id, entry)
             self.trace.tool_started(entry)
             if entry.get("status") in _TERMINAL_TOOL_CALL_STATUSES:
                 self.trace.tool_finished(entry)
             logger.debug("ACP tool call start: %s", update.tool_call_id)
             self._emit_tool_call_event(entry)
+            self._signal_tool_call_update(session_id)
             self._maybe_signal_activity()
         elif isinstance(update, ToolCallProgress):
             target: dict[str, Any] | None = None
             prev_status: str | None = None
+            identity = _acp_tool_call_identity(getattr(update, "field_meta", None))
             for index, tc in enumerate(self.accumulated_tool_calls):
                 if tc["tool_call_id"] == update.tool_call_id:
                     prev_status = tc.get("status")
@@ -2677,10 +2791,20 @@ class _OpenHandsACPBridge:
                         updated["raw_output"] = update.raw_output
                     if update.content is not None:
                         updated["content"] = _serialize_tool_content(update.content)
+                    updated.update(identity)
                     self._mask_tool_call_entry(updated)
                     self.accumulated_tool_calls[index] = updated
                     target = updated
                     break
+            self._record_subagent_tool_call_update(
+                session_id,
+                target
+                or {
+                    "tool_call_id": update.tool_call_id,
+                    "status": update.status,
+                    **identity,
+                },
+            )
             logger.debug("ACP tool call progress: %s", update.tool_call_id)
             became_terminal = (
                 target is not None
@@ -2690,6 +2814,7 @@ class _OpenHandsACPBridge:
             if target is not None and became_terminal:
                 self.trace.tool_finished(target)
                 self._emit_tool_call_event(target)
+            self._signal_tool_call_update(session_id)
             self._maybe_signal_activity()
         else:
             logger.debug("ACP session update: %s", type(update).__name__)
@@ -5043,6 +5168,52 @@ class ACPAgent(AgentBase):
             asyncio.wrap_future(prompt_future), cancel_on_exit=False
         )
 
+    async def _wait_for_pending_subagent_tool_calls(self) -> int:
+        """Wait briefly for pending ACP Task/Agent calls to report completion."""
+        if self._client is None or self._session_id is None:
+            return 0
+
+        client = self._client
+        session_id = self._session_id
+        pending_ids = client.pending_subagent_tool_call_ids(session_id)
+        if not pending_ids:
+            return 0
+
+        event = client._tool_call_updates_for(session_id)
+        deadline = asyncio.get_running_loop().time() + (
+            _ACP_PENDING_SUBAGENT_WAIT_TIMEOUT
+        )
+        logger.info(
+            "Waiting up to %.1fs for %d pending ACP subagent tool call(s)",
+            _ACP_PENDING_SUBAGENT_WAIT_TIMEOUT,
+            len(pending_ids),
+        )
+        try:
+            while pending_ids:
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    break
+                event.clear()
+                try:
+                    await asyncio.wait_for(event.wait(), timeout=remaining)
+                except TimeoutError:
+                    break
+                pending_ids = client.pending_subagent_tool_call_ids(session_id)
+        finally:
+            client._clear_tool_call_updates(session_id, event)
+        return len(client.pending_subagent_tool_call_ids(session_id))
+
+    def _pending_subagent_count(self) -> int:
+        if self._client is None or self._session_id is None:
+            return 0
+        return len(self._client.pending_subagent_tool_call_ids(self._session_id))
+
+    def _log_pending_subagents(self, count: int) -> None:
+        if count:
+            logger.warning(
+                "ACP turn finished with %d pending subagent tool call(s)", count
+            )
+
     @staticmethod
     def _prompt_response_was_cancelled(response: PromptResponse | None) -> bool:
         return response is not None and response.stop_reason == "cancelled"
@@ -5073,6 +5244,8 @@ class ACPAgent(AgentBase):
         self._client._raise_masking_error()
         self._commit_suffix_installation(state)
 
+        pending_subagents = self._pending_subagent_count()
+        self._log_pending_subagents(pending_subagents)
         self._flush_inflight_tool_calls_as_completed()
 
         self._track_file_credentials_for_masking()
@@ -5106,7 +5279,9 @@ class ACPAgent(AgentBase):
         on_event(action_event)
         on_event(
             ObservationEvent(
-                observation=FinishObservation.from_text(text=response_text),
+                observation=FinishObservation.from_text(
+                    text=response_text, pending_subagents=pending_subagents
+                ),
                 action_id=action_event.id,
                 tool_name="finish",
                 tool_call_id=tc_id,
@@ -5241,6 +5416,7 @@ class ACPAgent(AgentBase):
                         _state,
                         _on_event,
                     )
+                    self._client.clear_pending_subagent_tool_calls(self._session_id)
             return
 
         self._cancel_inflight_tool_calls()
@@ -5403,6 +5579,7 @@ class ACPAgent(AgentBase):
 
         t0 = time.monotonic()
         prompt_future: Future[PromptResponse | None] | None = None
+        cancelled_session_id: str | None = None
         try:
             logger.info(
                 "Sending ACP prompt (idle_timeout=%.0fs, blocks=%d, async)",
@@ -5475,9 +5652,16 @@ class ACPAgent(AgentBase):
 
             elapsed = time.monotonic() - t0
             logger.info("ACP prompt returned in %.1fs (async)", elapsed)
+            if self._pending_subagent_count():
+                pending_future: Future[int] = portal.start_task_soon(
+                    self._wait_for_pending_subagent_tool_calls
+                )
+                await asyncio.wrap_future(pending_future)
             with state:
                 self._finalize_successful_turn(response, elapsed, state, on_event)
         except asyncio.CancelledError:
+            cancelled_session_id = self._session_id
+            self._client.clear_pending_subagent_tool_calls(cancelled_session_id)
             # Cancellation wins the authority race. Prevent a provider event
             # arriving during cancel/drain from becoming this turn's proof.
             self._client.discard_turn_model_evidence(self._session_id)
@@ -5514,9 +5698,11 @@ class ACPAgent(AgentBase):
                         )
                     raise
                 if drain_result.completed and drain_result.error is not None:
+                    self._client.clear_pending_subagent_tool_calls(self._session_id)
                     self._cancel_inflight_tool_calls()
                     self._restart_session_on_next_turn = True
                     raise
+                self._client.clear_pending_subagent_tool_calls(self._session_id)
                 self._cancel_inflight_tool_calls()
             if not drain_result.drained:
                 self._restart_session_on_next_turn = True
@@ -5542,6 +5728,7 @@ class ACPAgent(AgentBase):
                             self._record_discarded_turn_usage(
                                 drain_result.response, elapsed
                             )
+                        self._client.clear_pending_subagent_tool_calls(self._session_id)
                         self._emit_turn_timeout(elapsed, state, on_event)
                         self._restart_session_on_next_turn = True
                     else:
@@ -5559,10 +5746,12 @@ class ACPAgent(AgentBase):
                             raise
                 elif drain_result.completed and drain_result.error is not None:
                     self._client.discard_turn_model_evidence(self._session_id)
+                    self._client.clear_pending_subagent_tool_calls(self._session_id)
                     self._emit_turn_error(drain_result.error, state, on_event)
                     self._restart_session_on_next_turn = True
                 else:
                     self._client.discard_turn_model_evidence(self._session_id)
+                    self._client.clear_pending_subagent_tool_calls(self._session_id)
                     self._emit_turn_timeout(elapsed, state, on_event)
                     self._restart_session_on_next_turn = True
         except Exception as e:
@@ -5571,6 +5760,8 @@ class ACPAgent(AgentBase):
             raise
         finally:
             self._clear_turn_callbacks()
+            if cancelled_session_id is not None:
+                self._client.clear_pending_subagent_tool_calls(cancelled_session_id)
             await self._flush_file_credentials()
 
     @observe(name="acp_agent.step", ignore_inputs=["conversation", "on_event"])
@@ -5700,6 +5891,12 @@ class ACPAgent(AgentBase):
                     else:
                         raise
 
+            if self._pending_subagent_count():
+                self._executor.run_async(
+                    self._wait_for_pending_subagent_tool_calls,
+                    timeout=max(0.1, _ACP_PENDING_SUBAGENT_WAIT_TIMEOUT + 1.0),
+                )
+
             elapsed = time.monotonic() - t0
             logger.info("ACP prompt returned in %.1fs", elapsed)
 
@@ -5721,6 +5918,8 @@ class ACPAgent(AgentBase):
             # Build response message
             response_text = "".join(self._client.accumulated_text)
             thought_text = "".join(self._client.accumulated_thoughts)
+            pending_subagents = self._pending_subagent_count()
+            self._log_pending_subagents(pending_subagents)
 
             if not response_text:
                 response_text = "(No response from ACP server)"
@@ -5748,7 +5947,9 @@ class ACPAgent(AgentBase):
             on_event(action_event)
             on_event(
                 ObservationEvent(
-                    observation=FinishObservation.from_text(text=response_text),
+                    observation=FinishObservation.from_text(
+                        text=response_text, pending_subagents=pending_subagents
+                    ),
                     action_id=action_event.id,
                     tool_name="finish",
                     tool_call_id=tc_id,
@@ -5759,6 +5960,7 @@ class ACPAgent(AgentBase):
 
         except TimeoutError:
             self._client.discard_turn_model_evidence(self._session_id)
+            self._client.clear_pending_subagent_tool_calls(self._session_id)
             elapsed = time.monotonic() - t0
             logger.error(
                 "ACP prompt timed out after %.1fs (limit=%.0fs). "
@@ -6108,6 +6310,8 @@ class ACPAgent(AgentBase):
 
     def _shutdown_runtime(self, *, discard_bindings: bool) -> dict[str, Exception]:
         failures: dict[str, Exception] = {}
+        if self._client is not None:
+            self._client.clear_pending_subagent_tool_calls(self._session_id)
         if self._conn is not None and self._executor is not None:
             conn = self._conn
             try:

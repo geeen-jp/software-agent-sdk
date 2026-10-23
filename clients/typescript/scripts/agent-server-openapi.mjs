@@ -124,6 +124,23 @@ export function validateOpenApi(schema) {
   }
 }
 
+function isRecord(value) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+// Keep unreleased, additive API fields aligned with the pinned release schema.
+function applyOpenApiOverlay(schema, overlay) {
+  for (const [key, value] of Object.entries(overlay)) {
+    if (isRecord(value)) {
+      const target = isRecord(schema[key]) ? schema[key] : {};
+      schema[key] = applyOpenApiOverlay(target, value);
+    } else {
+      schema[key] = value;
+    }
+  }
+  return schema;
+}
+
 export async function loadPinnedAgentServerOpenApi({ repositoryRoot, explicitSchemaPath }) {
   const packageJson = JSON.parse(await readFile(join(repositoryRoot, 'package.json'), 'utf8'));
   const { image, version } = getPinnedAgentServer(packageJson);
@@ -142,5 +159,21 @@ export async function loadPinnedAgentServerOpenApi({ repositoryRoot, explicitSch
   }
 
   validateOpenApi(result.schema);
-  return { ...result, image, version };
+
+  const explicitOverlayPath = process.env.AGENT_SERVER_OPENAPI_OVERLAY_PATH;
+  const overlayPath = explicitOverlayPath
+    ? resolve(repositoryRoot, explicitOverlayPath)
+    : join(repositoryRoot, 'scripts/agent-server-openapi-overlay.json');
+  const overlay = JSON.parse(await readFile(overlayPath, 'utf8'));
+  applyOpenApiOverlay(result.schema, overlay);
+
+  const overlaySource = explicitOverlayPath
+    ? overlayPath
+    : 'clients/typescript/scripts/agent-server-openapi-overlay.json';
+  const source = `${result.source} + ${overlaySource}`;
+  const generatedSource = explicitSchemaPath
+    ? `${result.source} + ${overlaySource}`
+    : `${image} + ${overlaySource}`;
+
+  return { ...result, source, generatedSource, image, version };
 }

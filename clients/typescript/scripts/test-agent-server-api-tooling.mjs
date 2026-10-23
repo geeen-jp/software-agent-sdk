@@ -65,6 +65,8 @@ try {
   const additiveSchema = join(fixtureRoot, 'additive-openapi.json');
   const baselineGenerated = join(fixtureRoot, 'baseline.ts');
   const additiveGenerated = join(fixtureRoot, 'additive.ts');
+  const overlaidGenerated = join(fixtureRoot, 'overlaid.ts');
+  const emptyOverlay = join(fixtureRoot, 'empty-overlay.json');
   const summary = join(fixtureRoot, 'summary.md');
   const packageFixture = join(fixtureRoot, 'package.json');
   const report = join(fixtureRoot, 'drift-report.md');
@@ -79,6 +81,7 @@ try {
       })
     )}\n`
   );
+  await writeFile(emptyOverlay, '{}\n');
 
   for (const [openapi, output] of [
     [baselineSchema, baselineGenerated],
@@ -87,6 +90,7 @@ try {
     const result = run(generator, [], {
       AGENT_SERVER_OPENAPI_PATH: openapi,
       AGENT_SERVER_GENERATED_OUTPUT: output,
+      AGENT_SERVER_OPENAPI_OVERLAY_PATH: emptyOverlay,
       AGENT_SERVER_SCHEMA_SOURCE: 'fixture@exact-sha',
     });
     if (result.status !== 0) {
@@ -98,6 +102,19 @@ try {
   const additive = await readFile(additiveGenerated, 'utf8');
   if (baseline === additive || !additive.includes('description?: string | null')) {
     throw new Error('An additive Agent Server field did not create a generated type diff');
+  }
+
+  const overlayResult = run(generator, [], {
+    AGENT_SERVER_OPENAPI_PATH: baselineSchema,
+    AGENT_SERVER_GENERATED_OUTPUT: overlaidGenerated,
+    AGENT_SERVER_SCHEMA_SOURCE: 'fixture@exact-sha',
+  });
+  if (overlayResult.status !== 0) {
+    throw new Error(overlayResult.stderr || overlayResult.stdout);
+  }
+  const overlaid = await readFile(overlaidGenerated, 'utf8');
+  if (!overlaid.includes('pending_subagents?: number')) {
+    throw new Error('The repository OpenAPI overlay did not add pending_subagents');
   }
 
   const summarizeResult = run(summarizer, [
@@ -153,6 +170,7 @@ try {
   const staleResult = run(checker, [], {
     AGENT_SERVER_OPENAPI_PATH: additiveSchema,
     AGENT_SERVER_GENERATED_OUTPUT: staleGenerated,
+    AGENT_SERVER_OPENAPI_OVERLAY_PATH: emptyOverlay,
     AGENT_SERVER_SCHEMA_SOURCE: 'fixture@exact-sha',
   });
   if (staleResult.status === 0 || !staleResult.stderr.includes('was stale')) {
@@ -165,6 +183,7 @@ try {
   const cleanResult = run(checker, [], {
     AGENT_SERVER_OPENAPI_PATH: additiveSchema,
     AGENT_SERVER_GENERATED_OUTPUT: staleGenerated,
+    AGENT_SERVER_OPENAPI_OVERLAY_PATH: emptyOverlay,
     AGENT_SERVER_SCHEMA_SOURCE: 'fixture@exact-sha',
   });
   if (cleanResult.status !== 0) {

@@ -1,0 +1,18 @@
+{
+  "components": {
+    "schemas": {
+      "FinishObservation": {
+        "description": "Observation returned after finishing a task.\nThe FinishAction itself contains the message sent to the user so no\nadditional response text is needed here.",
+        "properties": {
+          "pending_subagents": {
+            "default": 0,
+            "description": "Number of ACP subagent tool calls still pending when the turn ended.",
+            "minimum": 0.0,
+            "title": "Pending Subagents",
+            "type": "integer"
+          }
+        }
+      }
+    }
+  }
+}
