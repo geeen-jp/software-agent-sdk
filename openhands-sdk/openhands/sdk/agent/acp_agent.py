@@ -4720,7 +4720,7 @@ class ACPAgent(AgentBase):
                     f"selector={selector_model!r}, served='UNKNOWN')."
                 )
             root_models = transcript_models
-            observed_models = root_models
+            observed_models = (*observed_models, *transcript_models)
             evidence_source = "transcript"
 
         first_root_model = next(iter(root_models), None)

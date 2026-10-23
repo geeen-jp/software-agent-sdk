@@ -5545,6 +5545,30 @@ class TestServedModelGate:
         assert agent._served_model_id is None
         assert agent._restart_session_on_next_turn is True
 
+    def test_transcript_fallback_preserves_conflicting_stream_model(self, tmp_path):
+        agent = self._agent(model="claude-sonnet-5-5", selector="default")
+        agent._claude_transcript_config_dir = tmp_path
+        TestTurnModelEvidence._complete(
+            agent._client,
+            "session-1",
+            message_start_models=("claude-opus-5-5",),
+        )
+        self._write_transcript(
+            tmp_path,
+            [
+                self._transcript_user("user-1", "current-prompt"),
+                self._transcript_assistant("claude-sonnet-5-5"),
+            ],
+        )
+
+        with pytest.raises(ACPSessionModelError) as exc_info:
+            agent._verify_served_model_for_turn()
+
+        assert not isinstance(exc_info.value, ACPModelEvidenceUnavailable)
+        assert "served='claude-opus-5-5'" in str(exc_info.value)
+        assert agent._served_model_id is None
+        assert agent._restart_session_on_next_turn is True
+
     def test_missing_transcript_raises_distinct_unavailable_error(self, tmp_path):
         agent = self._agent()
         agent._claude_transcript_config_dir = tmp_path
