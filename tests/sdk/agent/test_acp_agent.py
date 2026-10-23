@@ -2967,7 +2967,7 @@ class TestACPToolCallEmission:
     def test_astep_pending_subagent_survives_turn_reset_until_terminal_update(
         self, tmp_path
     ):
-        """A later turn keeps unresolved IDs until ACP reports a terminal update."""
+        """A retry and later turn keep IDs until ACP reports a terminal update."""
         from openhands.sdk.utils.async_executor import AsyncExecutor
 
         agent = _make_agent()
@@ -2998,7 +2998,9 @@ class TestACPToolCallEmission:
                         },
                     ),
                 )
-            elif prompt_count == 3:
+            elif prompt_count == 2:
+                raise ConnectionError("transient prompt failure")
+            elif prompt_count == 4:
                 # This arrives after reset() removed the original turn entry.
                 await client.session_update(
                     "test-session",
@@ -3015,9 +3017,12 @@ class TestACPToolCallEmission:
         executor = AsyncExecutor()
         agent._executor = executor
         try:
-            with patch(
-                "openhands.sdk.agent.acp_agent._ACP_PENDING_SUBAGENT_WAIT_TIMEOUT",
-                0.001,
+            with (
+                patch(
+                    "openhands.sdk.agent.acp_agent._ACP_PENDING_SUBAGENT_WAIT_TIMEOUT",
+                    0.001,
+                ),
+                patch("openhands.sdk.agent.acp_agent._ACP_PROMPT_RETRY_DELAYS", (0.0,)),
             ):
                 for _ in range(3):
                     asyncio.run(agent.astep(conversation, on_event=events.append))
@@ -3031,7 +3036,7 @@ class TestACPToolCallEmission:
             and isinstance(event.observation, FinishObservation)
         ]
         assert observations == [1, 1, 0]
-        assert prompt_count == 3
+        assert prompt_count == 4
 
     def test_step_does_not_wait_for_completed_task(self, tmp_path):
         """Completed Tasks and regular tools keep the existing immediate finish."""
@@ -4235,7 +4240,7 @@ class TestACPPromptRetry:
         assert "Success after retry" in events[0].action.message
 
     def test_no_retry_on_non_connection_error(self, tmp_path):
-        """Non-connection errors fail immediately without retry."""
+        """Non-connection errors keep pending IDs in a reusable session."""
         agent = _make_agent()
         conversation = self._make_conversation_with_message(tmp_path)
         events: list = []
@@ -4244,6 +4249,21 @@ class TestACPPromptRetry:
         agent._client = mock_client
         agent._conn = MagicMock()
         agent._session_id = "test-session"
+
+        asyncio.run(
+            mock_client.session_update(
+                "test-session",
+                ToolCallStart(
+                    session_update="tool_call",
+                    tool_call_id="pending-agent-call",
+                    title="Explore repository",
+                    kind="think",
+                    status="in_progress",
+                    raw_input={"description": "Explore repository"},
+                    field_meta={"claudeCode": {"toolName": "Agent", "subagent": True}},
+                ),
+            )
+        )
 
         call_count = 0
 
@@ -4261,6 +4281,10 @@ class TestACPPromptRetry:
 
         assert call_count == 1
         assert conversation.state.execution_status == ConversationExecutionStatus.ERROR
+        assert mock_client.pending_subagent_tool_call_ids("test-session") == {
+            "pending-agent-call"
+        }
+        assert not agent._restart_session_on_next_turn
 
     def test_no_retry_on_timeout(self, tmp_path):
         """Timeout errors are not retried."""

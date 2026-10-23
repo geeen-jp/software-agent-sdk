@@ -5038,7 +5038,6 @@ class ACPAgent(AgentBase):
         """Emit a terminal ``failed`` ACPToolCallEvent for every tool call
         in the accumulator that has not reached a terminal status yet.
         """
-        self._client.clear_pending_subagent_tool_calls(self._session_id)
         on_event = self._client.on_event
         self._clear_turn_callbacks()
         if on_event is None:
@@ -5699,9 +5698,11 @@ class ACPAgent(AgentBase):
                         )
                     raise
                 if drain_result.completed and drain_result.error is not None:
+                    self._client.clear_pending_subagent_tool_calls(self._session_id)
                     self._cancel_inflight_tool_calls()
                     self._restart_session_on_next_turn = True
                     raise
+                self._client.clear_pending_subagent_tool_calls(self._session_id)
                 self._cancel_inflight_tool_calls()
             if not drain_result.drained:
                 self._restart_session_on_next_turn = True
@@ -5727,6 +5728,7 @@ class ACPAgent(AgentBase):
                             self._record_discarded_turn_usage(
                                 drain_result.response, elapsed
                             )
+                        self._client.clear_pending_subagent_tool_calls(self._session_id)
                         self._emit_turn_timeout(elapsed, state, on_event)
                         self._restart_session_on_next_turn = True
                     else:
@@ -5744,10 +5746,12 @@ class ACPAgent(AgentBase):
                             raise
                 elif drain_result.completed and drain_result.error is not None:
                     self._client.discard_turn_model_evidence(self._session_id)
+                    self._client.clear_pending_subagent_tool_calls(self._session_id)
                     self._emit_turn_error(drain_result.error, state, on_event)
                     self._restart_session_on_next_turn = True
                 else:
                     self._client.discard_turn_model_evidence(self._session_id)
+                    self._client.clear_pending_subagent_tool_calls(self._session_id)
                     self._emit_turn_timeout(elapsed, state, on_event)
                     self._restart_session_on_next_turn = True
         except Exception as e:
