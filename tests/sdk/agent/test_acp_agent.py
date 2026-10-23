@@ -4286,8 +4286,8 @@ class TestACPPromptRetry:
         }
         assert not agent._restart_session_on_next_turn
 
-    def test_no_retry_on_timeout(self, tmp_path):
-        """Timeout errors are not retried."""
+    def test_sync_timeout_clears_pending_subagent_calls(self, tmp_path):
+        """A timed-out Agent call does not make the next turn wait on a ghost."""
         agent = _make_agent()
         conversation = self._make_conversation_with_message(tmp_path)
 
@@ -4296,12 +4296,43 @@ class TestACPPromptRetry:
         agent._conn = MagicMock()
         agent._session_id = "test-session"
 
-        call_count = 0
+        prompt_count = 0
+        wait_count = 0
 
-        def _fake_run_async(_coro, **_kwargs):
-            nonlocal call_count
-            call_count += 1
-            raise TimeoutError("ACP prompt timed out")
+        def _fake_run_async(operation, **_kwargs):
+            nonlocal prompt_count, wait_count
+            if (
+                getattr(operation, "__name__", "")
+                == "_wait_for_pending_subagent_tool_calls"
+            ):
+                wait_count += 1
+                return 1
+
+            prompt_count += 1
+            if prompt_count == 1:
+                asyncio.run(
+                    mock_client.session_update(
+                        "test-session",
+                        ToolCallStart(
+                            session_update="tool_call",
+                            tool_call_id="pending-agent-call",
+                            title="Explore repository",
+                            kind="think",
+                            status="in_progress",
+                            raw_input={"description": "Explore repository"},
+                            field_meta={
+                                "claudeCode": {
+                                    "toolName": "Agent",
+                                    "subagent": True,
+                                }
+                            },
+                        ),
+                    )
+                )
+                raise TimeoutError("ACP prompt timed out")
+
+            mock_client.accumulated_text.append("Next turn succeeded")
+            return MagicMock(usage=None)
 
         mock_executor = MagicMock()
         mock_executor.run_async = _fake_run_async
@@ -4309,8 +4340,21 @@ class TestACPPromptRetry:
 
         agent.step(conversation, on_event=lambda _: None)
 
-        assert call_count == 1
+        assert prompt_count == 1
         assert conversation.state.execution_status == ConversationExecutionStatus.ERROR
+
+        events: list = []
+        agent.step(conversation, on_event=events.append)
+
+        assert prompt_count == 2
+        assert wait_count == 0
+        finish_observation = next(
+            event.observation
+            for event in events
+            if isinstance(event, ObservationEvent)
+            and isinstance(event.observation, FinishObservation)
+        )
+        assert finish_observation.pending_subagents == 0
 
     def test_max_retries_exceeded(self, tmp_path):
         """Error raised after max retries exhausted."""

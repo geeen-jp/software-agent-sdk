@@ -5960,6 +5960,7 @@ class ACPAgent(AgentBase):
 
         except TimeoutError:
             self._client.discard_turn_model_evidence(self._session_id)
+            self._client.clear_pending_subagent_tool_calls(self._session_id)
             elapsed = time.monotonic() - t0
             logger.error(
                 "ACP prompt timed out after %.1fs (limit=%.0fs). "
