@@ -17,7 +17,7 @@ const explicitSchemaPath = process.env.AGENT_SERVER_OPENAPI_PATH;
 const explicitSchemaSource = process.env.AGENT_SERVER_SCHEMA_SOURCE;
 
 async function main() {
-  const { schema, source, image } = await loadPinnedAgentServerOpenApi({
+  const { schema, source, generatedSource } = await loadPinnedAgentServerOpenApi({
     repositoryRoot,
     explicitSchemaPath,
   });
@@ -36,7 +36,7 @@ async function main() {
     const generated = await readFile(join(generatorOutput, 'types.gen.ts'), 'utf8');
     const header = [
       '// Generated file. Do not edit by hand.',
-      `// Source: ${explicitSchemaSource ?? image}`,
+      `// Source: ${explicitSchemaSource ?? generatedSource}`,
       `// Regenerate with: npm run generate:agent-server-api`,
       '',
     ].join('\n');

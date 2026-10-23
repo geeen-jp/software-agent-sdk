@@ -303,16 +303,19 @@ validate the change against the new image. This is independent of the npm
 package version — bumping the tracked server does **not** cut a client release.
 
 The generated transport contract in
-`src/generated/agent-server-schema.ts` comes from that same exact pin. Run
-`npm run generate:agent-server-api` after changing the pin and
-`npm run check:agent-server-api` to enforce a clean regeneration. Released SDK
-versions use the `openapi.json` release artifact. Legacy releases without the
-artifact are exported from an isolated temporary container of the exact pinned
-image. Run `npm run test:agent-server-api-tooling` when changing generation or
-drift automation. The scheduled `agent-server-sdk-main-audit` records the exact
-SDK commit it tests and reports upcoming drift informationally; ordinary PR CI
-never reads from that moving target. The generator never reads from an unpinned
-`latest` endpoint.
+`src/generated/agent-server-schema.ts` comes from that exact pin plus the
+checked-in additive patch in `scripts/agent-server-openapi-overlay.json`. Use
+that patch only for API fields that need to reach clients before the pinned
+release artifact contains them, and remove an entry when the pin catches up.
+After changing the pin or overlay, run `npm run generate:agent-server-api` and
+`npm run check:agent-server-api` to regenerate and enforce a clean contract.
+Released SDK versions use the `openapi.json` release artifact. Legacy releases
+without the artifact are exported from an isolated temporary container of the
+exact pinned image. Run `npm run test:agent-server-api-tooling` when changing
+generation or drift automation. The scheduled `agent-server-sdk-main-audit`
+records the exact SDK commit it tests and reports upcoming drift
+informationally; ordinary PR CI never reads from that moving target. The
+generator never reads from an unpinned `latest` endpoint.
 
 ## Local Setup and Validation
 
