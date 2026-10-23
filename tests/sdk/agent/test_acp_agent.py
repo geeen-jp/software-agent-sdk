@@ -9234,6 +9234,90 @@ class TestACPAgentAstep:
         assert len(failed_tool_events) == 1
         assert failed_tool_events[0].is_error is True
 
+    def test_astep_cancelled_subagent_does_not_wait_on_next_turn(self, tmp_path):
+        from acp.schema import ToolCallStart
+
+        from openhands.sdk.utils.async_executor import AsyncExecutor
+
+        agent = _make_agent()
+        conversation = self._make_conversation_with_message(tmp_path)
+        client = _OpenHandsACPBridge()
+        client.get_turn_usage_update = MagicMock(return_value=object())
+        agent._client = client
+        agent._conn = MagicMock()
+        agent._session_id = "test-session"
+        executor = AsyncExecutor()
+        prompt_count = 0
+
+        async def _run_cancelled_then_next_turn() -> None:
+            prompt_entered = asyncio.Event()
+            prompt_released = threading.Event()
+            caller_loop = asyncio.get_running_loop()
+
+            async def _fake_prompt(_prompt, session_id):
+                nonlocal prompt_count
+                prompt_count += 1
+                if prompt_count == 1:
+                    await client.session_update(
+                        session_id,
+                        ToolCallStart(
+                            session_update="tool_call",
+                            tool_call_id="agent-call-1",
+                            title="Explore repository",
+                            kind="think",
+                            status="in_progress",
+                            raw_input={"description": "Explore repository"},
+                            field_meta={
+                                "claudeCode": {"toolName": "Agent", "subagent": True}
+                            },
+                        ),
+                    )
+                    caller_loop.call_soon_threadsafe(prompt_entered.set)
+                    assert await asyncio.to_thread(prompt_released.wait, 5.0)
+                client.accumulated_text.append(f"turn {prompt_count}")
+                return None
+
+            async def _fake_cancel(session_id):
+                assert session_id == "test-session"
+                prompt_released.set()
+
+            _agent_conn(agent).prompt = _fake_prompt
+            _agent_conn(agent).cancel = _fake_cancel
+
+            task = asyncio.create_task(
+                agent.astep(conversation, on_event=lambda _event: None)
+            )
+            await asyncio.wait_for(prompt_entered.wait(), timeout=5.0)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+            assert client.pending_subagent_tool_call_ids("test-session") == set()
+
+            wait_for_pending = AsyncMock(return_value=0)
+            with patch.object(
+                ACPAgent,
+                "_wait_for_pending_subagent_tool_calls",
+                new=wait_for_pending,
+            ):
+                events: list = []
+                await agent.astep(conversation, on_event=events.append)
+
+            wait_for_pending.assert_not_awaited()
+            observations = [
+                event.observation.pending_subagents
+                for event in events
+                if isinstance(event, ObservationEvent)
+                and isinstance(event.observation, FinishObservation)
+            ]
+            assert observations == [0]
+
+        try:
+            agent._executor = executor
+            asyncio.run(_run_cancelled_then_next_turn())
+        finally:
+            executor.close()
+
     def test_astep_times_out_when_idle_with_inflight_tool_call(self, tmp_path):
         agent = _make_agent(acp_prompt_timeout=0.02)
         conversation = self._make_conversation_with_message(tmp_path)

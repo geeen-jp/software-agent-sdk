@@ -2667,6 +2667,11 @@ class _OpenHandsACPBridge:
         )
         return pending_ids
 
+    def clear_pending_subagent_tool_calls(self, session_id: str | None) -> None:
+        """Forget pending delegated calls when their turn or session is abandoned."""
+        if session_id is not None:
+            self._pending_subagent_tool_call_ids_by_session.pop(session_id, None)
+
     def _record_subagent_tool_call_update(
         self, session_id: str, tool_call: Mapping[str, Any]
     ) -> None:
@@ -5033,6 +5038,7 @@ class ACPAgent(AgentBase):
         """Emit a terminal ``failed`` ACPToolCallEvent for every tool call
         in the accumulator that has not reached a terminal status yet.
         """
+        self._client.clear_pending_subagent_tool_calls(self._session_id)
         on_event = self._client.on_event
         self._clear_turn_callbacks()
         if on_event is None:
@@ -5411,6 +5417,7 @@ class ACPAgent(AgentBase):
                         _state,
                         _on_event,
                     )
+                    self._client.clear_pending_subagent_tool_calls(self._session_id)
             return
 
         self._cancel_inflight_tool_calls()
@@ -5573,6 +5580,7 @@ class ACPAgent(AgentBase):
 
         t0 = time.monotonic()
         prompt_future: Future[PromptResponse | None] | None = None
+        cancelled_session_id: str | None = None
         try:
             logger.info(
                 "Sending ACP prompt (idle_timeout=%.0fs, blocks=%d, async)",
@@ -5653,6 +5661,8 @@ class ACPAgent(AgentBase):
             with state:
                 self._finalize_successful_turn(response, elapsed, state, on_event)
         except asyncio.CancelledError:
+            cancelled_session_id = self._session_id
+            self._client.clear_pending_subagent_tool_calls(cancelled_session_id)
             # Cancellation wins the authority race. Prevent a provider event
             # arriving during cancel/drain from becoming this turn's proof.
             self._client.discard_turn_model_evidence(self._session_id)
@@ -5746,6 +5756,8 @@ class ACPAgent(AgentBase):
             raise
         finally:
             self._clear_turn_callbacks()
+            if cancelled_session_id is not None:
+                self._client.clear_pending_subagent_tool_calls(cancelled_session_id)
             await self._flush_file_credentials()
 
     @observe(name="acp_agent.step", ignore_inputs=["conversation", "on_event"])
@@ -6293,6 +6305,8 @@ class ACPAgent(AgentBase):
 
     def _shutdown_runtime(self, *, discard_bindings: bool) -> dict[str, Exception]:
         failures: dict[str, Exception] = {}
+        if self._client is not None:
+            self._client.clear_pending_subagent_tool_calls(self._session_id)
         if self._conn is not None and self._executor is not None:
             conn = self._conn
             try:
