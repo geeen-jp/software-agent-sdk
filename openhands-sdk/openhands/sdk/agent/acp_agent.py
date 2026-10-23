@@ -476,6 +476,16 @@ class ACPSessionModelError(RuntimeError):
     """
 
 
+class ACPModelEvidenceUnavailable(ACPSessionModelError):
+    """A qualified Claude turn completed without usable served-model evidence."""
+
+
+def _acp_prompt_error_code(exc: BaseException) -> str:
+    if isinstance(exc, ACPModelEvidenceUnavailable):
+        return "ACPModelEvidenceUnavailable"
+    return "ACPPromptError"
+
+
 class ACPSessionModeError(RuntimeError):
     """A required ACP session mode could not be advertised or confirmed."""
 
@@ -1574,6 +1584,7 @@ class _TurnModelEvidence(NamedTuple):
     message_start_models: tuple[str, ...]
     invalid_root_evidence: bool
     invalid_turn_binding: bool
+    user_message_uuid: str | None = None
 
 
 class _TurnModelEvidenceAccumulator:
@@ -1594,6 +1605,7 @@ class _TurnModelEvidenceAccumulator:
             message_start_models=tuple(self.message_start_models),
             invalid_root_evidence=self.invalid_root_evidence,
             invalid_turn_binding=self.invalid_turn_binding,
+            user_message_uuid=self.user_message_uuid,
         )
 
 
@@ -1605,6 +1617,107 @@ def _concrete_provider_model(value: Any) -> str | None:
     if not model or _SYNTHETIC_MODEL_RE.fullmatch(model):
         return None
     return model
+
+
+def _is_claude_transcript_prompt(entry: Mapping[str, Any]) -> bool:
+    if (
+        entry.get("type") != "user"
+        or entry.get("isSidechain") is True
+        or not entry.get("promptId")
+    ):
+        return False
+    message = entry.get("message")
+    content = message.get("content") if isinstance(message, Mapping) else None
+    if isinstance(content, list) and content:
+        block_types = [
+            block.get("type") for block in content if isinstance(block, Mapping)
+        ]
+        if block_types and all(
+            isinstance(block_type, str)
+            and (block_type == "tool_result" or block_type.endswith("_tool_result"))
+            for block_type in block_types
+        ):
+            return False
+    return True
+
+
+def _read_claude_transcript_root_models(
+    config_dir: Path,
+    session_id: str | None,
+    user_message_uuid: str | None = None,
+) -> tuple[str, ...] | None:
+    """Read root assistant models for one prompt from Claude Code's transcript.
+
+    Transcript files are internal Claude Code state, so malformed or missing
+    data is treated as unavailable evidence. The session UUID is used as a
+    filename only after rejecting path and glob syntax.
+    """
+    if (
+        not isinstance(session_id, str)
+        or not session_id
+        or session_id in {".", ".."}
+        or any(char in session_id for char in ("/", "\\", "*", "?", "[", "]", "\0"))
+    ):
+        return None
+
+    try:
+        projects_dir = config_dir / "projects"
+        transcripts = [
+            project_dir / f"{session_id}.jsonl"
+            for project_dir in projects_dir.iterdir()
+            if project_dir.is_dir() and (project_dir / f"{session_id}.jsonl").is_file()
+        ]
+    except OSError:
+        return None
+    if len(transcripts) != 1:
+        return None
+
+    active = False
+    root_models: list[str] = []
+    try:
+        with transcripts[0].open(encoding="utf-8") as transcript:
+            for line in transcript:
+                try:
+                    entry = json.loads(line)
+                except (TypeError, ValueError):
+                    continue
+                if not isinstance(entry, Mapping):
+                    continue
+
+                is_prompt = _is_claude_transcript_prompt(entry)
+                if user_message_uuid is not None:
+                    if not active:
+                        if (
+                            entry.get("type") == "user"
+                            and entry.get("isSidechain") is not True
+                            and entry.get("uuid") == user_message_uuid
+                        ):
+                            active = True
+                            root_models.clear()
+                            continue
+                    elif is_prompt:
+                        break
+                elif is_prompt:
+                    active = True
+                    root_models.clear()
+                    continue
+
+                if not active or entry.get("type") != "assistant":
+                    continue
+                if entry.get("isSidechain") is True:
+                    continue
+                message = entry.get("message")
+                model = (
+                    _concrete_provider_model(message.get("model"))
+                    if isinstance(message, Mapping)
+                    else None
+                )
+                if model is not None:
+                    root_models.append(model)
+    except (OSError, UnicodeError):
+        return None
+
+    return tuple(root_models) or None
 
 
 def _raw_message_scope(
@@ -2913,6 +3026,7 @@ class ACPAgent(AgentBase):
         default_factory=set
     )
     _claude_config_runtime_dir: Path | None = PrivateAttr(default=None)
+    _claude_transcript_config_dir: Path | None = PrivateAttr(default=None)
     _claude_oauth_source_digest: str | None = PrivateAttr(default=None)
     _secret_registry_for_masking: SecretRegistry | None = PrivateAttr(default=None)
     _startup_phase: str = PrivateAttr(default="not-started")
@@ -3885,6 +3999,16 @@ class ACPAgent(AgentBase):
         if auto_compact_window is not None:
             env[_CLAUDE_AUTO_COMPACT_WINDOW_ENV] = auto_compact_window
 
+        self._claude_transcript_config_dir = None
+        if command_is_claude:
+            config_dir = env.get(CLAUDE_CONFIG_DIR_ENV)
+            home_dir = env.get("HOME") or str(Path.home())
+            self._claude_transcript_config_dir = (
+                Path(os.path.abspath(config_dir))
+                if config_dir
+                else Path(home_dir) / ".claude"
+            )
+
         env.update(
             initial_agent_mode_env_for_policy(
                 self.acp_permission_policy,
@@ -4559,27 +4683,58 @@ class ACPAgent(AgentBase):
             if self._client is not None
             else None
         )
-        root_models = evidence.root_models if evidence is not None else ()
+        root_models: tuple[str, ...] = (
+            evidence.root_models if evidence is not None else ()
+        )
         message_start_models = (
             evidence.message_start_models if evidence is not None else ()
         )
         observed_models = (*root_models, *message_start_models)
-        if (
-            evidence is None
-            or evidence.invalid_root_evidence
-            or evidence.invalid_turn_binding
-            or not root_models
-            or not observed_models
-        ):
+        stream_evidence_is_complete = (
+            evidence is not None
+            and not evidence.invalid_root_evidence
+            and not evidence.invalid_turn_binding
+            and bool(root_models)
+            and bool(observed_models)
+        )
+        evidence_source = "stream"
+        if not stream_evidence_is_complete:
+            transcript_config_dir = self._claude_transcript_config_dir
+            transcript_models = (
+                _read_claude_transcript_root_models(
+                    transcript_config_dir,
+                    evidence_session_id,
+                    evidence.user_message_uuid if evidence is not None else None,
+                )
+                if transcript_config_dir is not None
+                else None
+            )
+            if transcript_models is None:
+                if not preserve_published_surface:
+                    self._served_model_id = None
+                    self._restore_selector_model_surface(state)
+                    self._restart_session_on_next_turn = True
+                raise ACPModelEvidenceUnavailable(
+                    "Claude ACP turn did not provide qualified same-turn root "
+                    f"evidence (requested={requested_model!r}, "
+                    f"selector={selector_model!r}, served='UNKNOWN')."
+                )
+            root_models = transcript_models
+            observed_models = root_models
+            evidence_source = "transcript"
+
+        first_root_model = next(iter(root_models), None)
+        if first_root_model is None:
             if not preserve_published_surface:
                 self._served_model_id = None
                 self._restore_selector_model_surface(state)
                 self._restart_session_on_next_turn = True
-            raise ACPSessionModelError(
+            raise ACPModelEvidenceUnavailable(
                 "Claude ACP turn did not provide qualified same-turn root "
                 f"evidence (requested={requested_model!r}, "
                 f"selector={selector_model!r}, served='UNKNOWN')."
             )
+
         mismatched = next(
             (model for model in observed_models if model != requested_model), None
         )
@@ -4591,21 +4746,22 @@ class ACPAgent(AgentBase):
             raise ACPSessionModelError(
                 "Claude ACP turn served a model different from the request "
                 f"(requested={requested_model!r}, selector={selector_model!r}, "
-                f"served={mismatched or root_models[0]!r}, "
+                f"served={mismatched or first_root_model!r}, "
                 f"root_models={list(root_models)!r})."
             )
-        served_model = root_models[0]
+        served_model = first_root_model
         if not preserve_published_surface:
             self._served_model_id = served_model
             if state is not None:
                 self._publish_verified_model_surface(state)
         logger.info(
-            "Claude ACP same-turn root model verification passed: requested=%s "
-            "selector=%s root_models=%s delegated_models=%s",
+            "Claude ACP same-turn root model verification passed: source=%s "
+            "requested=%s selector=%s root_models=%s delegated_models=%s",
+            evidence_source,
             requested_model,
             selector_model,
             list(root_models),
-            list(evidence.delegated_models),
+            list(evidence.delegated_models) if evidence is not None else [],
         )
 
     def _clear_turn_callbacks(self) -> None:
@@ -4896,7 +5052,7 @@ class ACPAgent(AgentBase):
         on_event(
             ConversationErrorEvent(
                 source="agent",
-                code="UsagePolicyRefusal" if is_aup else "ACPPromptError",
+                code=("UsagePolicyRefusal" if is_aup else _acp_prompt_error_code(exc)),
                 detail=error_str[:500],
             )
         )
@@ -5518,7 +5674,9 @@ class ACPAgent(AgentBase):
             on_event(
                 ConversationErrorEvent(
                     source="agent",
-                    code="UsagePolicyRefusal" if is_aup else "ACPPromptError",
+                    code=(
+                        "UsagePolicyRefusal" if is_aup else _acp_prompt_error_code(e)
+                    ),
                     detail=error_str[:500],
                 )
             )
@@ -5915,6 +6073,7 @@ class ACPAgent(AgentBase):
                 self._file_credential_lifecycles = {}
                 self._file_credential_bindings = {}
                 self._claude_config_runtime_dir = None
+                self._claude_transcript_config_dir = None
                 self._claude_oauth_source_digest = None
                 self._secret_registry_for_masking = None
                 self._closed = True
