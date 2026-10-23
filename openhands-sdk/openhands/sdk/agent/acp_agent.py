@@ -88,6 +88,7 @@ from openhands.sdk.agent.acp_file_credentials import (
 )
 from openhands.sdk.agent.acp_models import ACPModelInfo
 from openhands.sdk.agent.acp_permission_policy import (
+    _READ_ONLY_COMMAND_GUIDANCE,
     ACPPermissionPolicy,
     assert_config_options_compatible_with_permission_policy,
     initial_agent_mode_env_for_policy,
@@ -2168,10 +2169,17 @@ class _OpenHandsACPBridge:
       treat the post-message event as authoritative.
     """
 
-    def __init__(self, permission_policy: ACPPermissionPolicy = "writable") -> None:
+    def __init__(
+        self,
+        permission_policy: ACPPermissionPolicy = "writable",
+        *,
+        workspace_root: str | None = None,
+    ) -> None:
         self.permission_policy: ACPPermissionPolicy = normalize_acp_permission_policy(
             permission_policy
         )
+        self.workspace_root = workspace_root
+        self.workspace_home: str | None = None
         self.accumulated_text: list[str] = []
         # Codex constrains only the last agent message.
         self.final_message_only = False
@@ -2748,6 +2756,8 @@ class _OpenHandsACPBridge:
             self.permission_policy,
             options,
             tool_call,
+            workspace_root=self.workspace_root,
+            workspace_home=self.workspace_home,
         )
 
     # fs/terminal methods — raise NotImplementedError; ACP server handles its own
@@ -3943,7 +3953,10 @@ class ACPAgent(AgentBase):
             self.acp_permission_policy,
             self.acp_config_options,
         )
-        client = _OpenHandsACPBridge(permission_policy=self.acp_permission_policy)
+        client = _OpenHandsACPBridge(
+            permission_policy=self.acp_permission_policy,
+            workspace_root=str(state.workspace.working_dir),
+        )
         client.final_message_only = (
             self.structured_output is not None and self._startup_provider_key == "codex"
         )
@@ -4044,6 +4057,11 @@ class ACPAgent(AgentBase):
             env.update(
                 build_codex_output_schema_env(self.structured_output.schema, env)
             )
+
+        if self.acp_permission_policy == "read_only":
+            # Relative `cd` must not be redirected by a caller-provided CDPATH.
+            env.pop("CDPATH", None)
+            client.workspace_home = env.get("HOME", str(Path.home()))
 
         command = self.acp_command[0]
         args = list(self.acp_command[1:]) + list(self.acp_args)
@@ -4885,6 +4903,8 @@ class ACPAgent(AgentBase):
             and self._installed_suffix
         ):
             blocks.append(text_block(self._installed_suffix))
+        if self.acp_permission_policy == "read_only":
+            blocks.append(text_block(_READ_ONLY_COMMAND_GUIDANCE))
         if not blocks:
             return None
         return blocks
