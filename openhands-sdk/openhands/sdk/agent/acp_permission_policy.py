@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import os
 import shlex
 from collections.abc import Mapping
+from pathlib import Path
 from types import MappingProxyType
 from typing import Literal, cast
 
@@ -244,6 +246,16 @@ _GIT_SIDE_EFFECT_OPTIONS: frozenset[str] = frozenset(
         "-h",
     }
 )
+_READ_ONLY_COMMAND_GUIDANCE = (
+    "Read-only shell policy: inspection commands may be combined with `;` or `&&` "
+    "and with one or more `|` pipes. `cd` may target an existing directory inside "
+    "the workspace. Start Git commands with `git --no-pager`; `git diff`, `git "
+    "log`, and `git show` also require `--no-ext-diff --no-textconv` immediately "
+    "after the subcommand. Start ripgrep with `rg --no-config`. Use only "
+    "read-only inspection commands, and do not use redirects, command "
+    "substitution, background jobs, or shell globs. If a command is denied, "
+    "rewrite it to follow these rules and retry."
+)
 
 
 def _is_git_status_verbose_option(arg: str) -> bool:
@@ -253,13 +265,13 @@ def _is_git_status_verbose_option(arg: str) -> bool:
     return arg.startswith("-") and "v" in arg[1:]
 
 
-def _read_only_simple_command_allowed(command: str) -> bool:
+def _read_only_simple_command_denial_reason(command: str) -> str | None:
     try:
         argv = shlex.split(command, posix=True)
     except ValueError:
-        return False
+        return "Use balanced shell quotes around command arguments."
     if not argv:
-        return False
+        return "Each command in a read-only command chain must be non-empty."
 
     executable, *args = argv
     if executable in _READ_ONLY_COMMANDS:
@@ -273,13 +285,13 @@ def _read_only_simple_command_allowed(command: str) -> bool:
             )
             for arg in args
         ):
-            return False
+            return "Do not use follow mode with `tail` in a read-only command."
         if executable == "rg":
             # Require this before any pattern/path so it cannot be mistaken
             # for an operand. It disables RIPGREP_CONFIG_PATH as well as the
             # default config file for this invocation.
             if not args or args[0] != "--no-config":
-                return False
+                return "Start ripgrep commands with `rg --no-config`."
             if any(
                 arg
                 in {
@@ -297,27 +309,38 @@ def _read_only_simple_command_allowed(command: str) -> bool:
                 or (arg.startswith("-") and not arg.startswith("--") and "z" in arg[1:])
                 for arg in args[1:]
             ):
-                return False
-        return True
+                return (
+                    "Do not use ripgrep options that load config or run preprocessors."
+                )
+        return None
 
     if executable == "find":
-        return not any(
+        if any(
             arg in _FIND_SIDE_EFFECT_OPTIONS
             or any(arg.startswith(f"{option}=") for option in _FIND_SIDE_EFFECT_OPTIONS)
             for arg in args
-        )
+        ):
+            return (
+                "Do not use `find` actions that execute commands, delete, or "
+                "write files."
+            )
+        return None
 
-    if executable == "git" and args:
+    if executable == "git":
         # A command-configured pager can run an arbitrary program when git's
         # output is attached to a terminal. Keep this global option before the
         # subcommand so Git applies it to every approved inspection command.
-        if args[0] != "--no-pager":
-            return False
+        if not args or args[0] != "--no-pager":
+            return (
+                "Start Git commands with `git --no-pager` to disable configured pagers."
+            )
         if len(args) < 2:
-            return False
+            return "Use an approved inspection subcommand after `git --no-pager`."
         subcommand, *git_args = args[1:]
         if subcommand not in _READ_ONLY_GIT_COMMANDS:
-            return False
+            return (
+                "Use Git inspection subcommands: ls-files, log, show, diff, or status."
+            )
         if subcommand == "status":
             # `git status -v` and `-vv` emit staged and working-tree patches,
             # which can run external diff and textconv helpers. Git accepts
@@ -327,15 +350,19 @@ def _read_only_simple_command_allowed(command: str) -> bool:
                 git_args[: git_args.index("--")] if "--" in git_args else git_args
             )
             if any(_is_git_status_verbose_option(arg) for arg in status_options):
-                return False
+                return "Do not use verbose Git status options in a read-only command."
         if subcommand in {"diff", "log", "show"}:
             # These commands can invoke diff.external / GIT_EXTERNAL_DIFF and
             # configured textconv drivers. Require the disabling flags
             # immediately after the subcommand, before any pathspec delimiter.
             if git_args[:2] != ["--no-ext-diff", "--no-textconv"]:
-                return False
+                return (
+                    f"Use `git --no-pager {subcommand} --no-ext-diff "
+                    "--no-textconv ...` "
+                    "to disable external diff and textconv helpers."
+                )
             git_args = git_args[2:]
-        return not any(
+        if any(
             arg in _GIT_SIDE_EFFECT_OPTIONS
             or arg.startswith("--output=")
             or arg.startswith("--ext-diff=")
@@ -348,9 +375,14 @@ def _read_only_simple_command_allowed(command: str) -> bool:
                 and arg[1:2] in {"o", "O"}
             )
             for arg in git_args
-        )
+        ):
+            return "Do not use Git options that write output or invoke external tools."
+        return None
 
-    return False
+    return (
+        "Use only read-only inspection commands such as ls, cat, head, tail, wc, "
+        "pwd, rg, grep, find, and the approved Git inspection subcommands."
+    )
 
 
 def _has_unquoted_shell_expansion(command: str) -> bool:
@@ -374,32 +406,233 @@ def _has_unquoted_shell_expansion(command: str) -> bool:
     return False
 
 
-def _read_only_command_allowed(command: object) -> bool:
+def _split_read_only_command(
+    command: str,
+) -> list[tuple[tuple[str, ...], str | None]] | None:
+    """Split the supported shell subset into command pipelines."""
+    groups: list[tuple[tuple[str, ...], str | None]] = []
+    stages: list[str] = []
+    start = 0
+    quote: str | None = None
+    escaped = False
+    last_separator: str | None = None
+    separator_before: str | None = None
+    index = 0
+
+    while index < len(command):
+        char = command[index]
+        if char in "\n\r":
+            return None
+        if quote == '"' and char in {"$", "`"}:
+            return None
+        if escaped:
+            escaped = False
+            index += 1
+            continue
+        if char == "\\" and quote != "'":
+            escaped = True
+            index += 1
+            continue
+        if quote is not None:
+            if char == quote:
+                quote = None
+            index += 1
+            continue
+        if char in {"'", '"'}:
+            quote = char
+            index += 1
+            continue
+        if char in {"$", "`", ">", "<", "(", ")"}:
+            return None
+        if char not in {"|", ";", "&"}:
+            index += 1
+            continue
+
+        stage = command[start:index].strip()
+        if not stage:
+            return None
+        stages.append(stage)
+        if char == "|":
+            if index + 1 < len(command) and command[index + 1] == "|":
+                return None
+            last_separator = "|"
+            index += 1
+        elif char == "&":
+            if index + 1 >= len(command) or command[index + 1] != "&":
+                return None
+            groups.append((tuple(stages), separator_before))
+            stages = []
+            last_separator = "&&"
+            separator_before = "&&"
+            index += 2
+        else:
+            groups.append((tuple(stages), separator_before))
+            stages = []
+            last_separator = ";"
+            separator_before = ";"
+            index += 1
+        start = index
+
+    if quote is not None:
+        return None
+    final_stage = command[start:].strip()
+    if final_stage:
+        stages.append(final_stage)
+        groups.append((tuple(stages), separator_before))
+        return groups
+    if last_separator == ";" and groups:
+        return groups
+    return None
+
+
+def _cd_target(
+    argv: list[str],
+    *,
+    workspace_root: str | None,
+    workspace_home: str | None,
+    current_directory: Path | None,
+) -> tuple[Path | None, str | None]:
+    if workspace_root is None:
+        return None, "`cd` is allowed only when the workspace path is known."
+    if len(argv) > 2 or (len(argv) == 2 and argv[1].startswith("-")):
+        return None, "Use `cd` with no argument or one directory inside the workspace."
+
+    try:
+        root = Path(os.path.abspath(workspace_root))
+        resolved_root = root.resolve()
+        if len(argv) == 1:
+            home = Path(workspace_home or os.path.expanduser("~"))
+            target = home if home.is_absolute() else (current_directory or root) / home
+        else:
+            path = Path(argv[1])
+            base = current_directory or root
+            target = path if path.is_absolute() else base / path
+        # Bash tracks PWD logically by default. Normalize `..` without resolving
+        # symlinks so later relative cd commands follow the same path Bash uses.
+        target = Path(os.path.abspath(target))
+        resolved_target = target.resolve()
+    except (OSError, RuntimeError):
+        return None, "The `cd` target must resolve to a directory inside the workspace."
+    if not resolved_target.is_relative_to(resolved_root):
+        return None, "The `cd` target must stay inside the workspace."
+    if not target.is_dir():
+        return (
+            None,
+            "The `cd` target must be an existing directory inside the workspace.",
+        )
+    return target, None
+
+
+def _read_only_command_denial_reason(
+    command: object,
+    *,
+    workspace_root: str | None = None,
+    workspace_home: str | None = None,
+) -> str | None:
     if isinstance(command, list):
         if not command or not all(isinstance(part, str) for part in command):
-            return False
+            return "Provide a non-empty read-only shell command."
         command = shlex.join(command)
     if not isinstance(command, str) or not command:
-        return False
-    if any(char in command for char in ";&`$><()\n\r"):
-        return False
+        return "Provide a non-empty read-only shell command."
     if _has_unquoted_shell_expansion(command):
-        return False
-    if command.count("|") > 1:
-        return False
-    return all(_read_only_simple_command_allowed(part) for part in command.split("|"))
+        return "Do not use shell glob expansion in a read-only command."
+    groups = _split_read_only_command(command)
+    if groups is None:
+        return (
+            "Combine commands only with `;`, `&&`, and `|`. Redirects, command "
+            "substitution, background jobs, newlines, and other shell syntax are "
+            "not allowed."
+        )
+
+    initial_directory = (
+        Path(os.path.abspath(workspace_root)) if workspace_root is not None else None
+    )
+    # Each state records the shell's logical directory and whether the previous
+    # command in the current && list may have succeeded. Keeping both states
+    # preserves the fact that a failed left-hand command skips every remaining
+    # command in that && list, including cd commands.
+    directory_states: set[tuple[Path | None, bool]] = {(initial_directory, True)}
+    for stages, separator_before in groups:
+        if separator_before == "&&":
+            executable_directories = {
+                directory
+                for directory, chain_active in directory_states
+                if chain_active
+            }
+            next_states = {
+                (directory, False)
+                for directory, chain_active in directory_states
+                if not chain_active
+            }
+        else:
+            executable_directories = {directory for directory, _ in directory_states}
+            next_states: set[tuple[Path | None, bool]] = set()
+
+        if not executable_directories:
+            directory_states = next_states
+            continue
+
+        parsed_stages: list[list[str]] = []
+        for stage in stages:
+            try:
+                argv = shlex.split(stage, posix=True)
+            except ValueError:
+                return "Use balanced shell quotes around command arguments."
+            parsed_stages.append(argv)
+
+        if len(stages) > 1 and any(argv and argv[0] == "cd" for argv in parsed_stages):
+            return (
+                "Use `cd` as a standalone command before a `;` or `&&`, not in a pipe."
+            )
+
+        if len(stages) == 1 and parsed_stages[0] and parsed_stages[0][0] == "cd":
+            for current_directory in executable_directories:
+                if workspace_root is None:
+                    return "`cd` is allowed only when the workspace path is known."
+                target, denial_reason = _cd_target(
+                    parsed_stages[0],
+                    workspace_root=workspace_root,
+                    workspace_home=workspace_home,
+                    current_directory=current_directory,
+                )
+                if denial_reason is not None:
+                    return denial_reason
+                next_states.add((target, True))
+        else:
+            for stage in stages:
+                denial_reason = _read_only_simple_command_denial_reason(stage)
+                if denial_reason is not None:
+                    return denial_reason
+            # Inspection commands can fail or succeed, which determines whether
+            # the next && group executes. They do not change the shell directory.
+            for directory in executable_directories:
+                next_states.add((directory, True))
+                next_states.add((directory, False))
+
+        directory_states = next_states
+    return None
 
 
-def _read_only_tool_call_allowed(tool_call: object) -> bool:
+def _read_only_tool_call_denial_reason(
+    tool_call: object,
+    *,
+    workspace_root: str | None = None,
+    workspace_home: str | None = None,
+) -> str | None:
     kind = _tool_call_field(tool_call, "kind")
     if kind == "read" or kind == "search":
-        return True
+        return None
     if kind != "execute":
-        return False
+        return "Only read, search, and approved read-only execute requests are allowed."
     raw_input = _tool_call_field(tool_call, "raw_input", "rawInput")
     if not isinstance(raw_input, Mapping):
-        return False
-    return _read_only_command_allowed(raw_input.get("command"))
+        return "The execute request did not provide a command to check."
+    return _read_only_command_denial_reason(
+        raw_input.get("command"),
+        workspace_root=workspace_root,
+        workspace_home=workspace_home,
+    )
 
 
 def _permission_log_target(tool_call: object) -> str:
@@ -415,12 +648,20 @@ def resolve_permission_response(
     policy: str,
     options: list[object],
     tool_call: object,
+    *,
+    workspace_root: str | None = None,
+    workspace_home: str | None = None,
 ) -> RequestPermissionResponse:
     """Apply the conversation-local ACP permission policy to one request."""
     normalized = normalize_acp_permission_policy(policy)
     target = _permission_log_target(tool_call)
     if normalized == "read_only":
-        if _read_only_tool_call_allowed(tool_call):
+        denial_reason = _read_only_tool_call_denial_reason(
+            tool_call,
+            workspace_root=workspace_root,
+            workspace_home=workspace_home,
+        )
+        if denial_reason is None:
             allow_option_id = _allow_option_id(options)
             if allow_option_id is not None:
                 logger.info(
@@ -435,21 +676,31 @@ def resolve_permission_response(
                         option_id=allow_option_id,
                     ),
                 )
+            denial_reason = (
+                "The ACP request did not offer an `allow_once` option for this "
+                "read-only command."
+            )
         deny_option_id = _deny_option_id(options)
         if deny_option_id is not None:
             logger.info(
-                "ACP denying permission under read_only policy: %s (option: %s)",
+                "ACP denying permission under read_only policy: %s (%s; option: %s)",
                 target,
+                denial_reason,
                 deny_option_id,
             )
             return RequestPermissionResponse(
+                field_meta={"openhands/denial_reason": denial_reason},
                 outcome=AllowedOutcome(outcome="selected", option_id=deny_option_id),
             )
         logger.info(
-            "ACP denying permission under read_only policy: %s",
+            "ACP denying permission under read_only policy: %s (%s)",
             target,
+            denial_reason,
         )
-        return RequestPermissionResponse(outcome=DeniedOutcome(outcome="cancelled"))
+        return RequestPermissionResponse(
+            field_meta={"openhands/denial_reason": denial_reason},
+            outcome=DeniedOutcome(outcome="cancelled"),
+        )
 
     option_id = "allow_once"
     if options:

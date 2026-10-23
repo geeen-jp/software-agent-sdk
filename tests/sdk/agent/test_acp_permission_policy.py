@@ -138,12 +138,21 @@ def test_read_only_selects_reject_once_when_always_is_absent() -> None:
     assert response.outcome.option_id == "reject_once"
 
 
-def _read_only_allowed(tool_call: object) -> bool:
+def _read_only_allowed(
+    tool_call: object,
+    *,
+    workspace_root: str | None = None,
+) -> bool:
     options: list[object] = [
         PermissionOption(kind="allow_once", name="Allow", option_id="allow_once"),
         PermissionOption(kind="reject_once", name="Reject", option_id="reject_once"),
     ]
-    response = resolve_permission_response("read_only", options, tool_call)
+    response = resolve_permission_response(
+        "read_only",
+        options,
+        tool_call,
+        workspace_root=workspace_root,
+    )
     return (
         isinstance(response.outcome, AllowedOutcome)
         and response.outcome.option_id == "allow_once"
@@ -164,6 +173,12 @@ def _read_only_allowed(tool_call: object) -> bool:
         "git --no-pager status -- --verbose",
         "rg --no-config foo",
         "rg --no-config foo | head -20",
+        "rg --no-config foo | grep -i bar | head -20",
+        "ls && git --no-pager status --short",
+        "ls; pwd",
+        "grep 'a;b' file.txt",
+        'grep "a;b" file.txt',
+        "ls ';' rm",
         "cat README.md",
         "head -20 README.md",
         "tail -n 5 README.md",
@@ -214,12 +229,18 @@ def test_read_only_denies_mutating_tool_kinds(tool_call: object) -> None:
     [
         "echo x > f",
         "echo x >> f",
+        "echo x < f",
         "rm f",
         "ls; rm f",
         "ls && rm f",
         "ls || rm f",
         "ls `rm f`",
         "ls $(rm f)",
+        "ls $HOME",
+        'ls "$HOME"',
+        "ls &",
+        "ls\npwd",
+        "ls;;pwd",
         "cat f | sh",
         "cat f | tee g",
         "git commit -m x",
@@ -281,6 +302,164 @@ def test_read_only_fails_closed_for_malformed_tool_calls() -> None:
     assert all(not _read_only_allowed(tool_call) for tool_call in tool_calls)
 
 
+def test_read_only_allows_observed_compound_inspection_command_after_git_fix(
+    tmp_path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    pattern = r"\.cs$|README|\.sln"
+    command = (
+        f"cd {workspace}; ls; git --no-pager ls-files | grep -iE '{pattern}' "
+        "| head -80; "
+        r'grep -n "def \|^class " src/catalog/remote_updates.py | head -80'
+    )
+
+    assert _read_only_allowed(
+        {"kind": "execute", "raw_input": {"command": command}},
+        workspace_root=str(workspace),
+    )
+
+
+def test_read_only_cd_stays_inside_workspace_and_tracks_chains(
+    tmp_path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    subdirectory = workspace / "sub"
+    deep_directory = subdirectory / "deep"
+    deep_directory.mkdir(parents=True)
+    (workspace / "tests").mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (workspace / "outside-link").symlink_to(outside, target_is_directory=True)
+    (workspace / "logical-link").symlink_to(deep_directory, target_is_directory=True)
+
+    def allowed(command: str) -> bool:
+        return _read_only_allowed(
+            {"kind": "execute", "raw_input": {"command": command}},
+            workspace_root=str(workspace),
+        )
+
+    assert allowed(f"cd {subdirectory} && ls")
+    assert allowed("cd sub; cd ..; pwd")
+    assert allowed("cd sub && cd ..; pwd")
+    assert not allowed("cd ..; ls")
+    assert not allowed("cd /etc; ls")
+    assert not allowed("cd outside-link; ls")
+    assert allowed("cd logical-link; cd ..; pwd")
+    assert not allowed("cd logical-link; cd ../..; pwd")
+    assert not allowed("ls /definitely-missing-sdk125 && cd tests; cd ..; pwd")
+    assert not _read_only_allowed(
+        {"kind": "execute", "raw_input": {"command": "cd sub; ls"}}
+    )
+
+
+def test_read_only_cd_without_argument_requires_home_inside_workspace(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setenv("HOME", str(workspace))
+
+    assert _read_only_allowed(
+        {"kind": "execute", "raw_input": {"command": "cd && pwd"}},
+        workspace_root=str(workspace),
+    )
+
+
+def test_read_only_denial_includes_actionable_reason(tmp_path, caplog) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    observed_command = (
+        f"cd {workspace}; ls; git ls-files | grep -iE '\\.cs$|README|\\.sln' "
+        '| head -80; grep -n "def \\|^class " src/catalog/remote_updates.py | head -80'
+    )
+    options: list[object] = [
+        PermissionOption(kind="allow_once", name="Allow", option_id="allow_once"),
+        PermissionOption(kind="reject_once", name="Reject", option_id="reject_once"),
+    ]
+    with caplog.at_level("INFO", logger="openhands.sdk.agent.acp_permission_policy"):
+        response = resolve_permission_response(
+            "read_only",
+            options,
+            {"kind": "execute", "raw_input": {"command": observed_command}},
+            workspace_root=str(workspace),
+        )
+
+    assert response.field_meta is not None
+    reason = response.field_meta["openhands/denial_reason"]
+    assert "--no-pager" in reason
+    assert "--no-pager" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_read_only_denial_steers_reason_to_supported_acp_agent() -> None:
+    bridge = _OpenHandsACPBridge(permission_policy="read_only")
+    conn = MagicMock()
+    conn.ext_method = AsyncMock(return_value={"outcome": "injected"})
+    bridge.on_connect(conn)
+    bridge.record_initialize_metadata({"steering": {"supported": True}})
+    options = [
+        PermissionOption(kind="allow_once", name="Allow", option_id="allow_once"),
+        PermissionOption(kind="reject_once", name="Reject", option_id="reject"),
+    ]
+
+    response = await bridge.request_permission(
+        options,
+        "session-1",
+        {
+            "kind": "execute",
+            "raw_input": {"command": "echo x > output.txt"},
+        },
+    )
+
+    # Claude ACP 0.81.0 turns this selected rejection into its generic denial
+    # message and ignores response _meta. The separate steering request carries
+    # the actionable reason into the active model turn.
+    wire_response = response.model_dump(
+        mode="json", by_alias=True, exclude_none=True, exclude_unset=True
+    )
+    assert wire_response["outcome"] == {"outcome": "selected", "optionId": "reject"}
+    assert "openhands/denial_reason" in wire_response["_meta"]
+    conn.ext_method.assert_awaited_once()
+    method, params = conn.ext_method.await_args.args
+    assert method == "session/steering"
+    assert params["sessionId"] == "session-1"
+    assert params["_meta"] == {"steering": {"idleBehavior": "promptRequired"}}
+    message = params["prompt"][0]["text"]
+    assert "Redirects" in message
+    assert "not executed" in message
+
+
+def test_read_only_redirect_denial_explains_supported_shell_syntax() -> None:
+    response = resolve_permission_response(
+        "read_only",
+        [],
+        {"kind": "execute", "raw_input": {"command": "echo x > output.txt"}},
+    )
+    assert response.field_meta is not None
+    reason = response.field_meta["openhands/denial_reason"]
+    assert "Redirects" in reason
+    assert "&&" in reason
+    assert "|" in reason
+
+
+def test_read_only_prompt_includes_command_retry_guidance() -> None:
+    agent = ACPAgent(acp_command=["echo"], acp_permission_policy="read_only")
+    event = MessageEvent(
+        source="user",
+        llm_message=Message(role="user", content=[TextContent(text="Inspect files.")]),
+    )
+
+    blocks = agent._build_acp_prompt(event)
+
+    assert blocks is not None
+    prompt_text = "\n".join(block.text for block in blocks if hasattr(block, "text"))
+    assert "rewrite it to follow these rules and retry" in prompt_text
+    assert "git --no-pager" in prompt_text
+    assert "rg --no-config" in prompt_text
+
+
 def test_read_only_does_not_invent_allow_option() -> None:
     response = resolve_permission_response(
         "read_only",
@@ -331,8 +510,11 @@ async def test_read_only_policy_denies_unknown_permissions() -> None:
 
 
 @pytest.mark.asyncio
-async def test_read_only_bridge_allows_repository_inspection() -> None:
-    bridge = _OpenHandsACPBridge(permission_policy="read_only")
+async def test_read_only_bridge_allows_repository_inspection(tmp_path) -> None:
+    bridge = _OpenHandsACPBridge(
+        permission_policy="read_only",
+        workspace_root=str(tmp_path),
+    )
     response = await bridge.request_permission(
         [PermissionOption(kind="allow_once", name="Allow", option_id="allow_once")],
         "sess-1",
@@ -340,7 +522,7 @@ async def test_read_only_bridge_allows_repository_inspection() -> None:
             tool_call_id="call-1",
             kind="execute",
             title="Bash",
-            raw_input={"command": "ls"},
+            raw_input={"command": f"cd {tmp_path} && ls"},
         ),
     )
     assert isinstance(response.outcome, AllowedOutcome)
@@ -517,6 +699,9 @@ def _start_acp_server_with_mocked_transport(
     init_response.agent_info.version = "1.0"
     init_response.agent_capabilities = None
     init_response.auth_methods = []
+    init_response.field_meta = (
+        {"steering": {"supported": True}} if agent_name == "claude-agent-acp" else None
+    )
     conn.initialize = AsyncMock(return_value=init_response)
     new_response = MagicMock()
     new_response.session_id = "sess-1"
@@ -575,13 +760,23 @@ def _start_acp_server_with_mocked_transport(
 
 
 def test_start_acp_server_wires_configured_policy_onto_bridge(tmp_path) -> None:
+    capture_env: dict[str, str] = {}
     agent = ACPAgent(
         acp_command=_CLAUDE_COMMAND,
         acp_permission_policy="read_only",
+        acp_env={"CDPATH": str(tmp_path)},
     )
-    conn = _start_acp_server_with_mocked_transport(agent, tmp_path)
+    conn = _start_acp_server_with_mocked_transport(
+        agent,
+        tmp_path,
+        capture_env=capture_env,
+    )
     assert agent._client is not None
     assert agent._client.permission_policy == "read_only"
+    assert agent._client.workspace_root == str(tmp_path)
+    assert agent._client.workspace_home == capture_env["HOME"]
+    assert agent._client._supports_session_steering
+    assert "CDPATH" not in capture_env
     conn.set_session_mode.assert_awaited_once_with(
         mode_id="default",
         session_id="sess-1",
