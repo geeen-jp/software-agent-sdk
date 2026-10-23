@@ -406,14 +406,17 @@ def _has_unquoted_shell_expansion(command: str) -> bool:
     return False
 
 
-def _split_read_only_command(command: str) -> list[tuple[str, ...]] | None:
+def _split_read_only_command(
+    command: str,
+) -> list[tuple[tuple[str, ...], str | None]] | None:
     """Split the supported shell subset into command pipelines."""
-    groups: list[tuple[str, ...]] = []
+    groups: list[tuple[tuple[str, ...], str | None]] = []
     stages: list[str] = []
     start = 0
     quote: str | None = None
     escaped = False
     last_separator: str | None = None
+    separator_before: str | None = None
     index = 0
 
     while index < len(command):
@@ -457,14 +460,16 @@ def _split_read_only_command(command: str) -> list[tuple[str, ...]] | None:
         elif char == "&":
             if index + 1 >= len(command) or command[index + 1] != "&":
                 return None
-            groups.append(tuple(stages))
+            groups.append((tuple(stages), separator_before))
             stages = []
             last_separator = "&&"
+            separator_before = "&&"
             index += 2
         else:
-            groups.append(tuple(stages))
+            groups.append((tuple(stages), separator_before))
             stages = []
             last_separator = ";"
+            separator_before = ";"
             index += 1
         start = index
 
@@ -473,7 +478,7 @@ def _split_read_only_command(command: str) -> list[tuple[str, ...]] | None:
     final_stage = command[start:].strip()
     if final_stage:
         stages.append(final_stage)
-        groups.append(tuple(stages))
+        groups.append((tuple(stages), separator_before))
         return groups
     if last_separator == ";" and groups:
         return groups
@@ -493,7 +498,8 @@ def _cd_target(
         return None, "Use `cd` with no argument or one directory inside the workspace."
 
     try:
-        root = Path(workspace_root).resolve()
+        root = Path(os.path.abspath(workspace_root))
+        resolved_root = root.resolve()
         if len(argv) == 1:
             home = Path(workspace_home or os.path.expanduser("~"))
             target = home if home.is_absolute() else (current_directory or root) / home
@@ -501,10 +507,13 @@ def _cd_target(
             path = Path(argv[1])
             base = current_directory or root
             target = path if path.is_absolute() else base / path
-        target = target.resolve()
+        # Bash tracks PWD logically by default. Normalize `..` without resolving
+        # symlinks so later relative cd commands follow the same path Bash uses.
+        target = Path(os.path.abspath(target))
+        resolved_target = target.resolve()
     except (OSError, RuntimeError):
         return None, "The `cd` target must resolve to a directory inside the workspace."
-    if not target.is_relative_to(root):
+    if not resolved_target.is_relative_to(resolved_root):
         return None, "The `cd` target must stay inside the workspace."
     if not target.is_dir():
         return (
@@ -536,39 +545,72 @@ def _read_only_command_denial_reason(
             "not allowed."
         )
 
-    current_directory: Path | None = None
-    for stages in groups:
-        if len(stages) == 1:
+    initial_directory = (
+        Path(os.path.abspath(workspace_root)) if workspace_root is not None else None
+    )
+    # Each state records the shell's logical directory and whether the previous
+    # command in the current && list may have succeeded. Keeping both states
+    # preserves the fact that a failed left-hand command skips every remaining
+    # command in that && list, including cd commands.
+    directory_states: set[tuple[Path | None, bool]] = {(initial_directory, True)}
+    for stages, separator_before in groups:
+        if separator_before == "&&":
+            executable_directories = {
+                directory
+                for directory, chain_active in directory_states
+                if chain_active
+            }
+            next_states = {
+                (directory, False)
+                for directory, chain_active in directory_states
+                if not chain_active
+            }
+        else:
+            executable_directories = {directory for directory, _ in directory_states}
+            next_states: set[tuple[Path | None, bool]] = set()
+
+        if not executable_directories:
+            directory_states = next_states
+            continue
+
+        parsed_stages: list[list[str]] = []
+        for stage in stages:
             try:
-                argv = shlex.split(stages[0], posix=True)
+                argv = shlex.split(stage, posix=True)
             except ValueError:
                 return "Use balanced shell quotes around command arguments."
-            if argv and argv[0] == "cd":
-                current_directory, denial_reason = _cd_target(
-                    argv,
+            parsed_stages.append(argv)
+
+        if len(stages) > 1 and any(argv and argv[0] == "cd" for argv in parsed_stages):
+            return (
+                "Use `cd` as a standalone command before a `;` or `&&`, not in a pipe."
+            )
+
+        if len(stages) == 1 and parsed_stages[0] and parsed_stages[0][0] == "cd":
+            for current_directory in executable_directories:
+                if workspace_root is None:
+                    return "`cd` is allowed only when the workspace path is known."
+                target, denial_reason = _cd_target(
+                    parsed_stages[0],
                     workspace_root=workspace_root,
                     workspace_home=workspace_home,
                     current_directory=current_directory,
                 )
                 if denial_reason is not None:
                     return denial_reason
-                continue
+                next_states.add((target, True))
         else:
             for stage in stages:
-                try:
-                    argv = shlex.split(stage, posix=True)
-                except ValueError:
-                    return "Use balanced shell quotes around command arguments."
-                if argv and argv[0] == "cd":
-                    return (
-                        "Use `cd` as a standalone command before a `;` or `&&`, "
-                        "not in a pipe."
-                    )
+                denial_reason = _read_only_simple_command_denial_reason(stage)
+                if denial_reason is not None:
+                    return denial_reason
+            # Inspection commands can fail or succeed, which determines whether
+            # the next && group executes. They do not change the shell directory.
+            for directory in executable_directories:
+                next_states.add((directory, True))
+                next_states.add((directory, False))
 
-        for stage in stages:
-            denial_reason = _read_only_simple_command_denial_reason(stage)
-            if denial_reason is not None:
-                return denial_reason
+        directory_states = next_states
     return None
 
 

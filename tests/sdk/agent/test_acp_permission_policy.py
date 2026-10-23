@@ -325,10 +325,13 @@ def test_read_only_cd_stays_inside_workspace_and_tracks_chains(
 ) -> None:
     workspace = tmp_path / "workspace"
     subdirectory = workspace / "sub"
-    subdirectory.mkdir(parents=True)
+    deep_directory = subdirectory / "deep"
+    deep_directory.mkdir(parents=True)
+    (workspace / "tests").mkdir()
     outside = tmp_path / "outside"
     outside.mkdir()
     (workspace / "outside-link").symlink_to(outside, target_is_directory=True)
+    (workspace / "logical-link").symlink_to(deep_directory, target_is_directory=True)
 
     def allowed(command: str) -> bool:
         return _read_only_allowed(
@@ -338,9 +341,13 @@ def test_read_only_cd_stays_inside_workspace_and_tracks_chains(
 
     assert allowed(f"cd {subdirectory} && ls")
     assert allowed("cd sub; cd ..; pwd")
+    assert allowed("cd sub && cd ..; pwd")
     assert not allowed("cd ..; ls")
     assert not allowed("cd /etc; ls")
     assert not allowed("cd outside-link; ls")
+    assert allowed("cd logical-link; cd ..; pwd")
+    assert not allowed("cd logical-link; cd ../..; pwd")
+    assert not allowed("ls /definitely-missing-sdk125 && cd tests; cd ..; pwd")
     assert not _read_only_allowed(
         {"kind": "execute", "raw_input": {"command": "cd sub; ls"}}
     )
@@ -383,6 +390,45 @@ def test_read_only_denial_includes_actionable_reason(tmp_path, caplog) -> None:
     reason = response.field_meta["openhands/denial_reason"]
     assert "--no-pager" in reason
     assert "--no-pager" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_read_only_denial_steers_reason_to_supported_acp_agent() -> None:
+    bridge = _OpenHandsACPBridge(permission_policy="read_only")
+    conn = MagicMock()
+    conn.ext_method = AsyncMock(return_value={"outcome": "injected"})
+    bridge.on_connect(conn)
+    bridge.record_initialize_metadata({"steering": {"supported": True}})
+    options = [
+        PermissionOption(kind="allow_once", name="Allow", option_id="allow_once"),
+        PermissionOption(kind="reject_once", name="Reject", option_id="reject"),
+    ]
+
+    response = await bridge.request_permission(
+        options,
+        "session-1",
+        {
+            "kind": "execute",
+            "raw_input": {"command": "echo x > output.txt"},
+        },
+    )
+
+    # Claude ACP 0.81.0 turns this selected rejection into its generic denial
+    # message and ignores response _meta. The separate steering request carries
+    # the actionable reason into the active model turn.
+    wire_response = response.model_dump(
+        mode="json", by_alias=True, exclude_none=True, exclude_unset=True
+    )
+    assert wire_response["outcome"] == {"outcome": "selected", "optionId": "reject"}
+    assert "openhands/denial_reason" in wire_response["_meta"]
+    conn.ext_method.assert_awaited_once()
+    method, params = conn.ext_method.await_args.args
+    assert method == "session/steering"
+    assert params["sessionId"] == "session-1"
+    assert params["_meta"] == {"steering": {"idleBehavior": "promptRequired"}}
+    message = params["prompt"][0]["text"]
+    assert "Redirects" in message
+    assert "not executed" in message
 
 
 def test_read_only_redirect_denial_explains_supported_shell_syntax() -> None:
@@ -653,6 +699,9 @@ def _start_acp_server_with_mocked_transport(
     init_response.agent_info.version = "1.0"
     init_response.agent_capabilities = None
     init_response.auth_methods = []
+    init_response.field_meta = (
+        {"steering": {"supported": True}} if agent_name == "claude-agent-acp" else None
+    )
     conn.initialize = AsyncMock(return_value=init_response)
     new_response = MagicMock()
     new_response.session_id = "sess-1"
@@ -726,6 +775,7 @@ def test_start_acp_server_wires_configured_policy_onto_bridge(tmp_path) -> None:
     assert agent._client.permission_policy == "read_only"
     assert agent._client.workspace_root == str(tmp_path)
     assert agent._client.workspace_home == capture_env["HOME"]
+    assert agent._client._supports_session_steering
     assert "CDPATH" not in capture_env
     conn.set_session_mode.assert_awaited_once_with(
         mode_id="default",

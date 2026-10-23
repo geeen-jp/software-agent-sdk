@@ -2207,6 +2207,8 @@ class _OpenHandsACPBridge:
         # ACPAgent.step() to keep the agent-server's idle timer alive.
         self.on_activity: Any = None  # Callable[[], None] | None
         self._last_activity_signal: float = float("-inf")
+        self._conn: weakref.ReferenceType[ClientSideConnection] | None = None
+        self._supports_session_steering = False
         # Monotonic timestamp of the most recent ``session_update``. Unlike the
         # throttled ``_last_activity_signal``, updated on *every* update so the
         # prompt idle-timeout watchdog sees real progress. Armed per turn via
@@ -2747,18 +2749,65 @@ class _OpenHandsACPBridge:
     async def request_permission(
         self,
         options: list[Any],
-        session_id: str,  # noqa: ARG002
+        session_id: str,
         tool_call: Any,
         **kwargs: Any,  # noqa: ARG002
     ) -> Any:
         """Apply the conversation-local ACP permission policy."""
-        return resolve_permission_response(
+        response = resolve_permission_response(
             self.permission_policy,
             options,
             tool_call,
             workspace_root=self.workspace_root,
             workspace_home=self.workspace_home,
         )
+        metadata = response.field_meta
+        denial_reason = (
+            metadata.get("openhands/denial_reason")
+            if isinstance(metadata, Mapping)
+            else None
+        )
+        if isinstance(denial_reason, str):
+            await self._steer_permission_denial_reason(session_id, denial_reason)
+        return response
+
+    async def _steer_permission_denial_reason(
+        self, session_id: str, denial_reason: str
+    ) -> None:
+        """Send policy feedback through the ACP steering channel when supported.
+
+        Claude ACP 0.81.0 decodes permission outcomes into a fixed denial
+        message and ignores response `_meta`. Steering makes the actual policy
+        reason part of the running model turn before the generic denial arrives.
+        """
+        conn = self._conn() if self._conn is not None else None
+        if conn is None or not self._supports_session_steering:
+            return
+        message = (
+            "OpenHands read-only policy denied this request; it was not executed. "
+            f"Reason: {denial_reason} Adjust your next action to follow the policy."
+        )
+        try:
+            result = await conn.ext_method(
+                "session/steering",
+                {
+                    "sessionId": session_id,
+                    "prompt": [{"type": "text", "text": message}],
+                    "_meta": {"steering": {"idleBehavior": "promptRequired"}},
+                },
+            )
+        except Exception:
+            logger.warning(
+                "ACP failed to steer read-only permission feedback into session %s",
+                session_id,
+                exc_info=True,
+            )
+            return
+        if not isinstance(result, Mapping) or result.get("outcome") != "injected":
+            logger.warning(
+                "ACP did not inject read-only permission feedback into session %s",
+                session_id,
+            )
 
     # fs/terminal methods — raise NotImplementedError; ACP server handles its own
     async def write_text_file(
@@ -2833,8 +2882,15 @@ class _OpenHandsACPBridge:
         if isinstance(params, Mapping):
             self._record_raw_sdk_message(params)
 
-    def on_connect(self, conn: Any) -> None:  # noqa: ARG002
-        pass
+    def on_connect(self, conn: Any) -> None:
+        self._conn = weakref.ref(conn)
+
+    def record_initialize_metadata(self, metadata: object) -> None:
+        """Record optional ACP extension capabilities from initialize `_meta`."""
+        steering = metadata.get("steering") if isinstance(metadata, Mapping) else None
+        self._supports_session_steering = (
+            isinstance(steering, Mapping) and steering.get("supported") is True
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -4174,6 +4230,7 @@ class ACPAgent(AgentBase):
                     )
                 else:
                     init_response = await conn.initialize(protocol_version=1)
+                client.record_initialize_metadata(init_response.field_meta)
                 agent_name = ""
                 agent_version = ""
                 if init_response.agent_info is not None:
