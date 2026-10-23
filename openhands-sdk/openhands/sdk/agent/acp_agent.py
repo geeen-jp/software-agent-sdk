@@ -1619,39 +1619,10 @@ def _concrete_provider_model(value: Any) -> str | None:
     return model
 
 
-def _is_claude_transcript_prompt(entry: Mapping[str, Any]) -> bool:
-    if (
-        entry.get("type") != "user"
-        or entry.get("isSidechain") is True
-        or not entry.get("promptId")
-    ):
-        return False
-    message = entry.get("message")
-    content = message.get("content") if isinstance(message, Mapping) else None
-    if isinstance(content, list) and content:
-        block_types = [
-            block.get("type") for block in content if isinstance(block, Mapping)
-        ]
-        if block_types and all(
-            isinstance(block_type, str)
-            and (block_type == "tool_result" or block_type.endswith("_tool_result"))
-            for block_type in block_types
-        ):
-            return False
-    return True
-
-
-def _read_claude_transcript_root_models(
-    config_dir: Path,
-    session_id: str | None,
-    user_message_uuid: str | None = None,
-) -> tuple[str, ...] | None:
-    """Read root assistant models for one prompt from Claude Code's transcript.
-
-    Transcript files are internal Claude Code state, so malformed or missing
-    data is treated as unavailable evidence. The session UUID is used as a
-    filename only after rejecting path and glob syntax.
-    """
+def _claude_transcript_paths(
+    config_dir: Path, session_id: str | None
+) -> tuple[Path, ...] | None:
+    """Find transcript files for a session, rejecting unsafe session ids."""
     if (
         not isinstance(session_id, str)
         or not session_id
@@ -1662,21 +1633,74 @@ def _read_claude_transcript_root_models(
 
     try:
         projects_dir = config_dir / "projects"
-        transcripts = [
+        return tuple(
             project_dir / f"{session_id}.jsonl"
             for project_dir in projects_dir.iterdir()
             if project_dir.is_dir() and (project_dir / f"{session_id}.jsonl").is_file()
-        ]
+        )
+    except FileNotFoundError:
+        return ()
     except OSError:
         return None
+
+
+def _claude_transcript_start_offset(
+    config_dir: Path, session_id: str | None
+) -> int | None:
+    """Return a pre-dispatch transcript boundary when it can be established."""
+    transcripts = _claude_transcript_paths(config_dir, session_id)
+    if transcripts is None or len(transcripts) > 1:
+        return None
+    if not transcripts:
+        return 0
+    try:
+        return transcripts[0].stat().st_size
+    except OSError:
+        return None
+
+
+def _is_claude_transcript_prompt(entry: Mapping[str, Any]) -> bool:
+    if (
+        entry.get("type") != "user"
+        or entry.get("isSidechain") is True
+        or not entry.get("promptId")
+    ):
+        return False
+    return _raw_user_message_scope(entry) == "prompt"
+
+
+def _read_claude_transcript_root_models(
+    config_dir: Path,
+    session_id: str | None,
+    user_message_uuid: str | None = None,
+    transcript_start_offset: int | None = None,
+) -> tuple[str, ...] | None:
+    """Read root assistant models for one prompt from Claude Code's transcript.
+
+    Transcript files are internal Claude Code state, so malformed or missing
+    data is treated as unavailable evidence. The session UUID is used as a
+    filename only after rejecting path and glob syntax.
+    """
+    transcripts = _claude_transcript_paths(config_dir, session_id)
+    if transcripts is None:
+        return None
     if len(transcripts) != 1:
+        return None
+    if user_message_uuid is None and transcript_start_offset is None:
         return None
 
     active = False
     root_models: list[str] = []
     try:
-        with transcripts[0].open(encoding="utf-8") as transcript:
-            for line in transcript:
+        with transcripts[0].open("rb") as transcript:
+            while line := transcript.readline():
+                line_offset = transcript.tell() - len(line)
+                if (
+                    user_message_uuid is None
+                    and transcript_start_offset is not None
+                    and line_offset < transcript_start_offset
+                ):
+                    continue
                 try:
                     entry = json.loads(line)
                 except (TypeError, ValueError):
@@ -1687,11 +1711,7 @@ def _read_claude_transcript_root_models(
                 is_prompt = _is_claude_transcript_prompt(entry)
                 if user_message_uuid is not None:
                     if not active:
-                        if (
-                            entry.get("type") == "user"
-                            and entry.get("isSidechain") is not True
-                            and entry.get("uuid") == user_message_uuid
-                        ):
+                        if is_prompt and entry.get("uuid") == user_message_uuid:
                             active = True
                             root_models.clear()
                             continue
@@ -3027,6 +3047,7 @@ class ACPAgent(AgentBase):
     )
     _claude_config_runtime_dir: Path | None = PrivateAttr(default=None)
     _claude_transcript_config_dir: Path | None = PrivateAttr(default=None)
+    _claude_transcript_boundary: tuple[str, int] | None = PrivateAttr(default=None)
     _claude_oauth_source_digest: str | None = PrivateAttr(default=None)
     _secret_registry_for_masking: SecretRegistry | None = PrivateAttr(default=None)
     _startup_phase: str = PrivateAttr(default="not-started")
@@ -4637,6 +4658,7 @@ class ACPAgent(AgentBase):
         state: ConversationState | None = None,
     ) -> None:
         """Reset per-turn client state and (re)wire live callbacks."""
+        self._capture_claude_transcript_boundary()
         self._restore_selector_model_surface(state)
         self._served_model_id = None
         self._client.trace.abandon()
@@ -4651,6 +4673,21 @@ class ACPAgent(AgentBase):
         self._client.on_event = on_event
         self._client.on_activity = self._on_activity
         self._client.arm_activity_clock()
+
+    def _capture_claude_transcript_boundary(self) -> None:
+        """Snapshot transcript size before dispatch so old turns cannot verify."""
+        self._claude_transcript_boundary = None
+        session_id = self._session_id
+        config_dir = self._claude_transcript_config_dir
+        if (
+            not self._post_turn_model_verification_required
+            or session_id is None
+            or config_dir is None
+        ):
+            return
+        offset = _claude_transcript_start_offset(config_dir, session_id)
+        if offset is not None:
+            self._claude_transcript_boundary = (session_id, offset)
 
     def _verify_served_model_for_turn(
         self,
@@ -4698,13 +4735,37 @@ class ACPAgent(AgentBase):
             and bool(observed_models)
         )
         evidence_source = "stream"
+        if requested_model is not None:
+            stream_mismatch = next(
+                (model for model in observed_models if model != requested_model), None
+            )
+            if stream_mismatch is not None:
+                if not preserve_published_surface:
+                    self._served_model_id = None
+                    self._restore_selector_model_surface(state)
+                    self._restart_session_on_next_turn = True
+                raise ACPSessionModelError(
+                    "Claude ACP turn served a model different from the request "
+                    f"(requested={requested_model!r}, selector={selector_model!r}, "
+                    f"served={stream_mismatch!r}, "
+                    f"root_models={list(root_models)!r})."
+                )
+
         if not stream_evidence_is_complete:
             transcript_config_dir = self._claude_transcript_config_dir
+            transcript_boundary = self._claude_transcript_boundary
+            transcript_start_offset = (
+                transcript_boundary[1]
+                if transcript_boundary is not None
+                and transcript_boundary[0] == evidence_session_id
+                else None
+            )
             transcript_models = (
                 _read_claude_transcript_root_models(
                     transcript_config_dir,
                     evidence_session_id,
                     evidence.user_message_uuid if evidence is not None else None,
+                    transcript_start_offset,
                 )
                 if transcript_config_dir is not None
                 else None

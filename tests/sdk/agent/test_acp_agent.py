@@ -5482,6 +5482,7 @@ class TestServedModelGate:
         agent = self._agent(model="claude-sonnet-5-5", selector="default")
         agent._claude_transcript_config_dir = tmp_path
         state = _make_state(tmp_path)
+        agent._capture_claude_transcript_boundary()
         self._write_transcript(
             tmp_path,
             [
@@ -5529,6 +5530,7 @@ class TestServedModelGate:
     def test_transcript_fallback_model_mismatch_is_not_unavailable(self, tmp_path):
         agent = self._agent()
         agent._claude_transcript_config_dir = tmp_path
+        agent._capture_claude_transcript_boundary()
         self._write_transcript(
             tmp_path,
             [
@@ -5542,6 +5544,61 @@ class TestServedModelGate:
 
         assert not isinstance(exc_info.value, ACPModelEvidenceUnavailable)
         assert "served='claude-sonnet-5-5'" in str(exc_info.value)
+        assert agent._served_model_id is None
+        assert agent._restart_session_on_next_turn is True
+
+    @pytest.mark.parametrize("has_prompt_uuid", [False, True])
+    @pytest.mark.parametrize("mismatch_before_meta", [False, True])
+    @pytest.mark.parametrize(
+        "meta_marker", ["isMeta", "isCompactSummary", "isSynthetic"]
+    )
+    def test_transcript_provider_metadata_does_not_split_prompt(
+        self, tmp_path, has_prompt_uuid, mismatch_before_meta, meta_marker
+    ):
+        agent = self._agent(model="claude-sonnet-5-5", selector="default")
+        agent._claude_transcript_config_dir = tmp_path
+        if has_prompt_uuid:
+            client = agent._client
+            client.begin_turn_model_evidence("session-1")
+            client._record_raw_sdk_message(TestTurnModelEvidence._user("session-1"))
+            client.finish_turn_model_evidence("session-1")
+        agent._capture_claude_transcript_boundary()
+
+        models = (
+            ("claude-opus-5-5", "claude-sonnet-5-5")
+            if mismatch_before_meta
+            else ("claude-sonnet-5-5", "claude-opus-5-5")
+        )
+        provider_meta = self._transcript_user("user-1", "current-prompt")
+        provider_meta[meta_marker] = True
+        self._write_transcript(
+            tmp_path,
+            [
+                self._transcript_user("user-1", "current-prompt"),
+                self._transcript_assistant(models[0]),
+                provider_meta,
+                self._transcript_assistant(models[1]),
+            ],
+        )
+
+        with pytest.raises(ACPSessionModelError, match="served='claude-opus-5-5'"):
+            agent._verify_served_model_for_turn()
+
+    def test_stale_transcript_without_prompt_uuid_is_unavailable(self, tmp_path):
+        agent = self._agent(model="claude-sonnet-5-5", selector="default")
+        agent._claude_transcript_config_dir = tmp_path
+        self._write_transcript(
+            tmp_path,
+            [
+                self._transcript_user("previous-user", "previous-prompt"),
+                self._transcript_assistant("claude-sonnet-5-5"),
+            ],
+        )
+        agent._capture_claude_transcript_boundary()
+
+        with pytest.raises(ACPModelEvidenceUnavailable, match="served='UNKNOWN'"):
+            agent._verify_served_model_for_turn()
+
         assert agent._served_model_id is None
         assert agent._restart_session_on_next_turn is True
 
@@ -5580,6 +5637,26 @@ class TestServedModelGate:
         assert "served='UNKNOWN'" in str(exc_info.value)
         assert agent._served_model_id is None
         assert agent._restart_session_on_next_turn is True
+
+    def test_confirmed_stream_mismatch_precedes_missing_transcript(self, tmp_path):
+        agent = self._agent(model="claude-sonnet-5-5", selector="default")
+        agent._claude_transcript_config_dir = tmp_path
+        client = agent._client
+        client.begin_turn_model_evidence("session-1")
+        client._record_raw_sdk_message(TestTurnModelEvidence._user("session-1"))
+        client._record_raw_sdk_message(
+            TestTurnModelEvidence._assistant("session-1", "claude-opus-5-5")
+        )
+        client._record_raw_sdk_message(
+            TestTurnModelEvidence._assistant("session-1", None)
+        )
+        client.finish_turn_model_evidence("session-1")
+
+        evidence = client._completed_model_evidence_by_session["session-1"]
+        assert evidence.root_models == ("claude-opus-5-5",)
+        assert evidence.invalid_root_evidence is True
+        with pytest.raises(ACPSessionModelError, match="served='claude-opus-5-5'"):
+            agent._verify_served_model_for_turn()
 
     def test_passing_turn_publishes_model_and_failed_next_turn_restores_selector(
         self, tmp_path
